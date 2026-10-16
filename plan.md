@@ -204,6 +204,7 @@ LLM_API_KEY=sk-...
 | 2 | 加 `Empty` / `NotUnicode` 变体；`match` 拆开 `VarError` 两态；加 `format_url` | 空值原本会**放行到发请求才 401**；"非 UTF-8"与"未设置"被揉成一种 |
 | 3 | 加 `impl Display for Config`，把 key 打 `"***"` | ← **没解决问题**，见下 |
 | 4 | 去掉 `#[derive(Debug)]`，**手写 `Debug`**；变体名 `NotAllowed` → `NotUnicode` | ✔ 这才是对的 |
+| 5 | 新增**无字段**的两态 `ValueError` 作为注入边界；`get_env` 改返回它；`from_env` 委托 `from_map` | 方案 C 落地，两条链收敛（撞到 HRTB 坑，见下） |
 
 #### ⚠️ 版 3 的教训：`Display` 不能代替 `Debug`
 
@@ -247,12 +248,39 @@ Debug    Config { ..., llm_api_key: "sk-REAL-..." }   ← 漏
 
 **C 的关键（唯一一处改动）**：把注入边界的返回类型从 `Option<String>` 改成 `Result<String, 小枚举>`。
 ⇒ `get_map` 自己 match 出 `Missing` / `NotUnicode`，`name: &'static str` **完全不用动**；
-`from_env` 传一个**纯适配器**（`VarError → 小枚举`，连 `name` 参数都不需要）→ **`from_env` 就此走内核**；
-测试闭包不碰 `std::env`，**三个变体全都能造**。（C 已实测：脱离真实环境变量时三态全部可构造。）
+`from_env` 传一个**纯适配器**进去 —— 这个适配器只做一件事：把 `std::env::var` 的 `VarError` 翻译成那个两态小枚举；
+它**不认识 `ConfigError`**（造 `ConfigError`、拼 `name` 是内核的事），所以它的错误类型**只有两个不带字段的变体**
+→ **`from_env` 就此走内核**；测试闭包不碰 `std::env`，**三个变体全都能造**。（C 已实测：脱离真实环境变量时三态全部可构造。）
 
 > ⚠️ 上一版给的 A/B 二选一是**框窄了**：B 之所以要级联把 `name` 改成 `String`，
-> 是因为让**闭包去构造 `ConfigError`**。只要闭包只报告"**为什么没有**"、`ConfigError` 的构造留在内核，级联就消失。
+> 是因为让**闭包去构造 `ConfigError`**（闭包参数是自然的 `&str`，撞上 `ConfigError` 要的 `&'static str`）。
+> 只要闭包只报告"**为什么没有**"、`ConfigError` 的构造留在内核，级联就消失。
 > **教训：注入边界的类型决定了内核能知道多少 —— 选 `Option` 就是主动丢信息。**
+
+##### 为什么边界不复用 `ConfigError` 本身（第 4 次追问，已实测）
+
+直接用**能编译、行为也一样**（同一组用例两条路输出完全相同）。代价在类型说了什么：
+
+1. **边界错误集 ≠ 内核错误集** —— 边界只可能遭遇 `std::env::var` 的两态（没这个变量 / 不是 UTF-8），
+   而 `ConfigError` 还有 `Empty`。**"空"不是读取失败，是值的属性** —— 只有内核（拿到 `String` 之后）才可能知道。
+   ⇒ 内核要么 `Err(e) => Err(e)`（**交出"造哪个错误"的决定权**，退化成一个透传管道），
+   要么穷尽 match 出**一个永不可达的分支**。
+   **实测**：把那个分支写成 `unreachable!()`，再喂一个"乱来的"闭包（返回 `Empty`）→ **真的 panic 了**。
+   ⇒ **契约靠自觉，不靠类型**。换成两态枚举后，那个非法实现**根本写不出来**（编译器直接拒绝）。
+2. **领域知识被迫下放** —— 适配器得知道 `NotPresent` 该翻译成 `Missing`，还得把 `name` 抄进错误。
+   两态版的适配器输出里**连"是哪个配置项"都不含**，是纯中立的读取结果。
+3. **`ConfigError` 被提升成公共注入协议** —— `from_map` 签名一写 `Fn(&str) -> Result<String, ConfigError>`，
+   任何实现者（测试 / mock / 以后的别的配置源）都必须 `use` 它，还得各自判断 `Empty` 该不该返回。
+
+**也否决"直接用 `std::env::VarError`"**（std 现成，实测 `Clone + PartialEq + Debug` 都有，测试里造得出来）：
+它会把 **`std::env` 的类型泄漏进内核签名**（内核的 match 变成 `VarError::NotPresent`）⇒ **内核也"认识 `std::env`"了**，
+而 `from_map` 存在的**全部理由**就是让内核不认识全局态 —— 等于自毁动机。
+
+> 判据：**边界的错误类型应 1:1 对应它可能遭遇的失败**。两个集合不等（2 个无字段 vs 3 个带 `&'static str`）
+> 就该是两个类型。用大的那个 = 让边界承诺一件它做不到的事。
+> 对称地，那个两态小枚举描述的是"`std::env::var` 的失败模式"，跟配置无关 → 它是可复用的通用小类型，
+> 不算"为配置特设"，也谈不上过度设计（过度设计是"每个函数配一个专属 Error"）。
+> 类比 `my_api`：`sqlx::Error → ApiError` 的转换在 repo / handler 层，不在 sqlx 内部。
 
 #### 两条硬事实（已实测）
 
@@ -260,6 +288,110 @@ Debug    Config { ..., llm_api_key: "sk-REAL-..." }   ← 漏
   与并行跑的测试互撞。**这正是 `from_map` 存在的理由**：把全局态换成注入。
 - **`use std::fmt::Debug;` 在本文件里是冗余的**（`impl std::fmt::Debug for Config` 写的是全限定路径），
   但 `rustc` **不会报**——因为 `#[derive(Debug)]` 出现在 `ConfigError` 上，同名解析让 lint 认为它被用了。可删，纯清理。
+
+#### ⚠️ 落地 C 的坑：闭包参数不能留 `'static`（HRTB，已实测）
+
+第 5 版落 C 时撞到的报错**不是**常见的类型不匹配，而是：
+
+```
+error: implementation of `Fn` is not general enough
+   = note: closure with signature `fn(&'2 str) -> _` must implement `Fn<(&'1 str,)>`, for any lifetime `'1`...
+   = note: ...but it actually implements `Fn<(&'2 str,)>`, for some specific lifetime `'2`
+```
+
+关键词是 **`for any lifetime` vs `for some specific lifetime`**。
+`impl Fn(&str)` 脱糖为 **`for<'a> Fn(&'a str)`**（HRTB），承诺"**对任意生命周期**都能调用"；
+而 `get_env(name: &'static str)` 只承诺"对 `'static` 能调用" ⇒ **承诺少的实现不了承诺多的接口**。
+
+> 方向（实测）：把上游 bound 写成 `Fn(&'static str)` 时，泛化 fn / 泛化闭包 / `'static` 闭包**三个全过**；
+> 反之不行。⇒ **作为 trait bound，`&str` 比 `&'static str` 更严格** —— 和"`&str` 更通用"的直觉相反。
+
+**为什么 `get_env` 的 `'static` 是多余的**：它内部只把 `name` 交给 `std::env::var`，而
+`var<K: AsRef<OsStr>>(key: K)` 接受任意生命周期的 `&str`，没有 `'static` 需求。那个 `'static` 是
+**第 1 版遗留**（当时 `get_env` 直接返回 `ConfigError`，被 `Missing { name: &'static str }` 逼的）；
+C 落地后返回类型换成无字段的 `ValueError`，**约束已失去存在理由却没被清掉**。
+对比 `get_map(name: &'static str)` —— 那个是**真必需**（它要往 `ConfigError::Missing { name }` 里塞）。
+⇒ **教训：改了返回类型要回头检查参数上的生命周期约束是否还站得住。**
+
+**修复**：`fn get_env(name: &str) -> Result<String, ValueError>`。之后 `from_env` 可以直接
+`Self::from_map(&get_env)` —— fn item 本身满足 `Fn(&str) -> Result<String, ValueError>`，**连闭包都不用写**。
+✅ **已按此修复（用户当晚改好，`cargo check --all-targets` 通过）。**
+
+**附带一个坑**（实测）：若保留闭包写法，**参数类型必须显式写 `&str`**，编译器不会替你推 HRTB ——
+`let c = |n| get_env(n);` ✗（推成某个固定生命周期）；`let c = |n: &str| get_env(n);` ✔。
+rustc 会直接把答案写在 help 里：`consider adding an explicit type annotation to the closure's argument`。
+
+**实测验证**：改成 `&str` 后四种写法全过 —— fn item / 显式闭包 / 测试夹具闭包 / 生产路径 `from_env`。
+
+#### ⚠️ 第 5 版新暴露：`pub fn from_map` 的参数里藏着私有类型（`private_bounds`）
+
+```
+warning: type `ValueError` is more private than the item `Config::from_map`
+  --> src\config.rs:74:5
+note: but type `ValueError` is only usable at visibility `pub(self)`
+```
+
+`pub fn from_map(get: &impl Fn(&str) -> Result<String, ValueError>)` —— **声明了 `pub`，签名里却是私有类型**
+⇒ 外部调用者**写不出**一个返回 `ValueError` 的闭包（要 `Err(ValueError::Missing)` 就得够得着它）
+⇒ **这个 `pub` 是空头支票**，实际只对 crate 内可用。
+
+这恰好是"边界用哪个错误类型"那个决策的**镜像**：
+**把它塞进公开签名 ⇒ 它成了公共协议；不塞又不改可见性 ⇒ 公开签名成了空头支票。**
+⇒ **`from_map` 应为 `pub(crate)`**（它只服务 `from_env` 与 `tests`，没有任何外部调用者）；`from_env` 保持 `pub` 是对的。
+（若哪天真要对外支持"自定义配置源"，再把 `ValueError` 提升为 `pub`，并按正式 API 设计，加 `#[non_exhaustive]`。）
+
+#### `ValueError` 要不要 `thiserror::Error`？—— 可以不要（已实测）
+
+`thiserror` 给三样东西，**`ValueError` 一样都没用上**：
+
+| 它给什么 | 用到了吗 |
+|---|---|
+| `impl Display`（`#[error("...")]` 生成） | ✘ **从未被打印** |
+| `impl std::error::Error`（能进 `Box<dyn Error>` / 当 `source`） | ✘ **从未传播出去** |
+| `#[from]` 生成 `From` 转换 | ✘ **用的是手写 `match`** |
+
+grep 整个 crate：`ValueError` 只出现在 config.rs 的 5 处（定义 / `get_env` 返回 / `get_map` 参数 / 两处 `match` 臂）；
+`dyn Error`、`.source()`、`#[from]`、`#[source]`、`bail!`、`.context()` **一个都没有**。
+
+**`?` 也不需要它**：`get_env` 里那个 `?` 是**恒等**转换（`map_err` 之后 E 已经是 `ValueError`，函数返回也是 `ValueError`）。
+真需要 `From` 的写法长这样 —— 实测报错：
+
+```
+error[E0277]: `?` couldn't convert the error to `ConfigError`
+note: `ConfigError` needs to implement `From<ValueError>`
+= note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+```
+
+而 **`From<ValueError> for ConfigError` 造不出来** —— `ConfigError::Missing` 需要 `name`，`From` 手里没有。
+⇒ **C 的代价就是"必须手写 `match`"，收益是"内核掌握造错的全部信息"。**
+"要不要 thiserror"跟这是同一件事的两面：**既然永远用不上 `Error` 的机制，就别实现它。**
+
+**建议**：`#[derive(Debug, Clone, Copy, PartialEq, Eq)]`。
+（`Debug` 必需 —— `unwrap` / `expect` 要求 `E: Debug`，`assert_eq!` 失败信息也走 `Debug`；
+`PartialEq` 供测试断言；零字段枚举 `Copy` 免费。）
+顺手删掉 `#[error("值不存在")]` / `#[error("值不是utf-8")]` —— **永不打印**，且文案本身含糊（哪个值？）。
+（实测：去掉后全部代码路径 + 断言照常工作。）
+
+**诚实的一句**：留着**也不算错**。thiserror 已在依赖里（`ConfigError` 在用），**零依赖增量**；
+两个变体展开约 10 行，编译成本可忽略。真正的成本是**认知成本** ——
+读者看到 `thiserror::Error` 会默认"这是个会向外传播的错误"，而它其实是一个**活不过一行的中间值**。
+
+**判据**：**这个类型会不会被 `?` 抛出函数边界，或被别人当 `source` 包起来？**
+会 → `Display` + `Error` 值得（thiserror 就该上）；不会（在同一函数里被 `match` 消费掉）→ 只要 `Debug`（+ 断言用 `PartialEq`）。
+
+| | `ConfigError` | `ValueError` |
+|---|---|---|
+| 跨函数边界传播 | ✔（→ `main`） | ✘（活不过 `get_map` 一行） |
+| 被 `Display` 打印 | ✔（给用户看的错误信息） | ✘ |
+| 进 `source` 链（anyhow） | ✔ | ✘ |
+| 字段插值 `{name}` | ✔ | ✘（无字段） |
+| `#[from]` | 可用 | **用不上**（缺 `name`） |
+| 结论 | **留 thiserror** | **可退到 `#[derive(Debug, PartialEq)]`** |
+
+**顺手两条**：
+- `src/scratch/` 是空目录 —— 按 §3.5，`scratch/` 应在**项目根**（`my_agent/scratch/`），不在 `src/` 下。
+- `ConfigError` 目前**没有 `PartialEq`**。测试里想 `assert_eq!` 就得加；更好的选择是用 **`matches!`**
+  （不要求 `PartialEq`，也不必给生产类型加测试专用的 derive）。
 
 #### 下一步：`config.rs` 的测试（先不写代码）
 

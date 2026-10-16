@@ -1,5 +1,3 @@
-use std::fmt::Debug;
-
 use dotenvy::dotenv;
 
 #[derive(Debug, thiserror::Error)]
@@ -14,15 +12,17 @@ pub enum ConfigError {
     Empty { name: &'static str },
 }
 
-fn get_env(name: &'static str) -> Result<String, ConfigError> {
-    let value = std::env::var(name).map_err(|err| match err {
-        std::env::VarError::NotPresent => ConfigError::Missing { name },
-        std::env::VarError::NotUnicode(_) => ConfigError::NotUnicode { name },
-    })?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueError {
+    Missing,
+    NotUnicode,
+}
 
-    if value.is_empty() {
-        return Err(ConfigError::Empty { name });
-    };
+fn get_env(name: &str) -> Result<String, ValueError> {
+    let value = std::env::var(name).map_err(|err| match err {
+        std::env::VarError::NotPresent => ValueError::Missing,
+        std::env::VarError::NotUnicode(_) => ValueError::NotUnicode,
+    })?;
     Ok(value)
 }
 
@@ -32,9 +32,12 @@ fn format_url(url: String) -> String {
 
 fn get_map(
     name: &'static str,
-    get: &impl Fn(&str) -> Option<String>,
+    get: &impl Fn(&str) -> Result<String, ValueError>,
 ) -> Result<String, ConfigError> {
-    let value = get(name).ok_or(ConfigError::Missing { name })?;
+    let value = get(name).map_err(|err| match err {
+        ValueError::Missing => ConfigError::Missing { name },
+        ValueError::NotUnicode => ConfigError::NotUnicode { name },
+    })?;
     if value.is_empty() {
         return Err(ConfigError::Empty { name });
     }
@@ -62,18 +65,10 @@ impl std::fmt::Debug for Config {
 impl Config {
     pub fn from_env() -> anyhow::Result<Config> {
         dotenv().ok();
-
-        let llm_base_url = format_url(get_env("LLM_BASE_URL")?);
-        let llm_model = get_env("LLM_MODEL")?;
-        let llm_api_key = get_env("LLM_API_KEY")?;
-        Ok(Self {
-            llm_base_url,
-            llm_model,
-            llm_api_key,
-        })
+        Self::from_map(&get_env)
     }
 
-    pub fn from_map(get: &impl Fn(&str) -> Option<String>) -> anyhow::Result<Config> {
+    fn from_map(get: &impl Fn(&str) -> Result<String, ValueError>) -> anyhow::Result<Config> {
         let llm_base_url = format_url(get_map("LLM_BASE_URL", get)?);
         let llm_model = get_map("LLM_MODEL", get)?;
         let llm_api_key = get_map("LLM_API_KEY", get)?;
