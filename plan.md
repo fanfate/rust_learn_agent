@@ -17,6 +17,11 @@
   `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY`，用 `dotenvy` 读取 —— 详见 **§3.3.1**。
 - ⏳ **唯一待定项**：用哪家 API / 什么模型名 → 只需填 `.env` 的两个值，**代码不用改**（这正是三变量抽象的目的）。
 - ✅ **scratch 目录已定位（2026-10-16）**：`my_agent/scratch/`，语义是 **agent 的沙箱根**，不是"测试目录"—— 详见 **§3.5**。
+- ✅ **`src/config.rs` 已成型（2026-10-16，**四版迭代**）**：`ConfigError`（thiserror，3 变体 `Missing` / `NotUnicode` / `Empty`）
+  + 私有 `get_env` / `format_url` / `get_map` + `Config`（**手写 `Debug` 把 key 打 `"***"`**）+ `from_env()` / `from_map()`。
+  `cargo check --all-targets` **零代码告警**（只剩 `target/` 增量锁文件噪音）。
+  ⚠️ **仍留一处结构问题**：`from_env` / `from_map` 两条取值链从未交汇 → 见 **§3.3.2**。
+- ⏳ `main.rs` 仍是模板（`fn main() -> anyhow::Result<()>`）。**下一个动作 = §3.9**：先发最朴素的 chat 请求、打印原始 JSON。
 
 ---
 
@@ -99,6 +104,37 @@ Python 改一行 prompt 直接跑；Rust 要等编译，还要跟所有权较劲
 3. **`LlmClient` 用哪种分发？**
    `trait` + 泛型（静态分发）还是 `Box<dyn LlmClient>`（动态分发）？—— 这正好对上 doc §5.2 的「**trait object 动态分发**」。
 
+### 3.2.1 先把这条想清楚：`impl` / `dyn` / `Box` **不是三个并列选项**（2026-10-16）
+
+§3.2 ③ 问"`LlmClient` 用哪种分发"，答案取决于**两个正交维度**，别当成三选一：
+
+- **分派方式**：`impl Trait`（泛型单态化 → 静态分派、可内联）↔ `dyn Trait`（虚表 → 动态分派）
+- **所有权**：`&T`（借）↔ `Box<T>` / `T`（拥有）
+
+四格都有名字：`&impl Fn(..)` · `&dyn Fn(..)` · `impl Fn(..)`（按值）· `Box<dyn Fn(..)>`。
+**`Box` 那个字母解决的是"所有权"，不是"分派"。** 判据只有一句话：
+
+> 先问「**我需要拥有它吗**」。需要（要存进 struct 字段 / `Vec`、要当返回值从函数里吐出来）才谈 `Box`；
+> 不需要，就只在 `impl` 与 `dyn` 之间选。
+
+⚠️ **`Box<dyn Trait>` 省略时默认就是 `+ 'static`**（对象生命周期默认规则）——实测报错原文：
+
+```
+note: due to object lifetime defaults, `Box<dyn Fn(&str) -> Option<String>>`
+      actually means `Box<(dyn Fn(&str) -> Option<String> + 'static)>`
+```
+
+后果：想借一个局部 `HashMap` 当测试夹具会直接 `E0597`，必须 `move` 拷进去、或手写 `+ '_`。
+而**借引用（`&impl` / `&dyn`）时闭包类型无需 `'static`** —— 这也正是 §3.3.2 里 `from_map` 能收 `&impl Fn` 的原因。
+
+代价对照（实测）：`impl` 走单态化，**每多一种闭包类型就多一份机器码**（两个不同闭包类型调同一个泛型函数，
+`--emit=llvm-ir` 里出现 **2 个 `define`**）；`dyn` 只编译一份。函数体小时忽略不计；
+**函数体大、且调用方闭包种类多**，才值得换 `&dyn`（注意：`&dyn` 同样不需要 `Box`）。
+
+> **映射到本项目**：§3.7 那句"把 LLM 调用藏在一个 trait 后面"——若只是**调用**它，`&dyn LlmClient` 甚至泛型就够；
+> `Box<dyn LlmClient>` 只在**要把它存进结构体字段**时才必要。反之 §1.1 里 `Box<dyn Tool>` 的**工具注册表**
+> 确实需要拥有（要放进 `Vec`），那里 `Box` 是对的。**同一个 `dyn`，两个场合两个答案。**
+
 ### 3.3 依赖（版本已实测核实，非记忆）
 
 ```toml
@@ -157,6 +193,82 @@ LLM_API_KEY=sk-...
 
 > ⚠️ **第一件该做的事**：`.gitignore` 里**原本没有 `.env`** —— 一旦 `git add .` 就永久进历史。
 > **已代为加上**（同时加了 `scratch/`）。key 泄漏是这类项目最常见的翻车方式。
+
+### 3.3.2 `config.rs` 的四版演化与遗留决策（2026-10-16）
+
+实际写下来的过程比预想曲折，**四版的差异本身就是这一节最值钱的部分**：
+
+| 版 | 改了什么 | 为什么 |
+|---|---|---|
+| 1 | `ConfigError::Missing` + `get_env` + `get_map` + `from_env` / `from_map` | 骨架 |
+| 2 | 加 `Empty` / `NotUnicode` 变体；`match` 拆开 `VarError` 两态；加 `format_url` | 空值原本会**放行到发请求才 401**；"非 UTF-8"与"未设置"被揉成一种 |
+| 3 | 加 `impl Display for Config`，把 key 打 `"***"` | ← **没解决问题**，见下 |
+| 4 | 去掉 `#[derive(Debug)]`，**手写 `Debug`**；变体名 `NotAllowed` → `NotUnicode` | ✔ 这才是对的 |
+
+#### ⚠️ 版 3 的教训：`Display` 不能代替 `Debug`
+
+`Display` 与 `Debug` 是**两个独立 trait、两个独立调用点**。给 `Config` 加 `impl Display` 把 key 打 `"***"`，
+`{:?}` 照样原样打印真 key —— 实测（把结构原样搬出来跑）：
+
+```
+Display  Config { ..., llm_api_key: "***" }
+Debug    Config { ..., llm_api_key: "sk-REAL-..." }   ← 漏
+```
+
+而**日志生态里最常用的是 `{:?}`**：日志宏惯例、`dbg!`、`assert_eq!` 失败信息、`unwrap` / `expect` 对 `E` 的
+`Debug` 要求，全走 `Debug`；`{}` 反而少见。⇒ **"绝不打 key 进日志"要遮的是 `Debug`。**
+版 4 的手写 `Debug` 是正解；更彻底的做法是把 key 包成 `Secret(String)`，两个 impl 都遮 `"***"`，
+以后别的结构体带 key 直接复用。
+
+#### ✅ `format_url` 不是死代码（AI 曾判错，此处更正）
+
+`format_url` 是**边界归一化器**：判据不是"happy path 里有没有被触发"，而是"**对任何合法输入都产出唯一规范形式**"。
+`.env` 是用户手写的输入面（`.../v1/` 带尾斜杠是从文档、curl 例子里抄下来的常见写法），归一化放在加载边界、
+存成唯一内部形式，位置正确。**别把"测试覆盖"的标尺套到"输入归一化"上。**
+（边界行为已实测：`"http://x/v1//"` → `"http://x/v1"`；`"/"` → `""`，边角可不管。）
+
+#### ⚠️ 遗留：两条取值链从未交汇（当前唯一实质问题）
+
+`from_env` → `get_env` → `std::env`；`from_map` → 闭包。**两份独立实现** ⇒ **生产路径不经过可测内核**，
+`from_map` 的测试全绿也**证明不了** `from_env` 对。
+
+第 3 次迭代把这个代价变成了**具体可见的不一致**：`NotUnicode` **只有 `get_env` 能产生** ——
+因为 `get_map` 的闭包边界 `Fn(&str) -> Option<String>` 已经把"为什么没有"**擦除**成了 `Option`。
+⇒ **同一个非 UTF-8 环境变量走两条链得到不同变体**（`NotUnicode` vs `Missing`）；
+⇒ **一旦把 `from_env` 委托给 `from_map`，`NotUnicode` 会静默失效**。
+
+三条路，**推荐 C**：
+
+| 方案 | 保住 `NotUnicode` | 单一内核（生产走被测内核） | 额外成本 |
+|---|---|---|---|
+| A 委托 + 删掉该变体 | ✗ | ✔ | 无 |
+| **C 把"原因"带过边界** | ✔ | ✔ | 一个小两态枚举 |
+| D 什么都不改 | ✔ | ✗ | 把分叉写成注释 / 一条测试钉住 |
+
+**C 的关键（唯一一处改动）**：把注入边界的返回类型从 `Option<String>` 改成 `Result<String, 小枚举>`。
+⇒ `get_map` 自己 match 出 `Missing` / `NotUnicode`，`name: &'static str` **完全不用动**；
+`from_env` 传一个**纯适配器**（`VarError → 小枚举`，连 `name` 参数都不需要）→ **`from_env` 就此走内核**；
+测试闭包不碰 `std::env`，**三个变体全都能造**。（C 已实测：脱离真实环境变量时三态全部可构造。）
+
+> ⚠️ 上一版给的 A/B 二选一是**框窄了**：B 之所以要级联把 `name` 改成 `String`，
+> 是因为让**闭包去构造 `ConfigError`**。只要闭包只报告"**为什么没有**"、`ConfigError` 的构造留在内核，级联就消失。
+> **教训：注入边界的类型决定了内核能知道多少 —— 选 `Option` 就是主动丢信息。**
+
+#### 两条硬事实（已实测）
+
+- **`std::env::set_var` 在 `edition 2024` 要求 `unsafe`** —— 编译器在用类型系统提醒你它会**污染整个进程**、
+  与并行跑的测试互撞。**这正是 `from_map` 存在的理由**：把全局态换成注入。
+- **`use std::fmt::Debug;` 在本文件里是冗余的**（`impl std::fmt::Debug for Config` 写的是全限定路径），
+  但 `rustc` **不会报**——因为 `#[derive(Debug)]` 出现在 `ConfigError` 上，同名解析让 lint 认为它被用了。可删，纯清理。
+
+#### 下一步：`config.rs` 的测试（先不写代码）
+
+`#[cfg(test)] mod tests` 正是 `from_map` 这条缝的用途。先自答：
+
+1. 测 `from_map` 时闭包从哪拿数据？为什么这里**不能**用 `env::set_var` 造场景？
+2. `Missing` / `Empty` 各一条测试就够，那 **`NotUnicode` 怎么测**？（答不出来，就是在告诉你该选 A 还是 C）
+3. `format_url` 的行为边界：`"http://x/v1"`、`"http://x/v1/"`、`"http://x/v1//"`、`"/"` 分别得到什么？
+4. `from_env` 要怎么写、测什么，才算"这条测试真的覆盖了生产路径"？
 
 ### 3.4 协议备忘：`tool_calls` 报文解剖
 
@@ -229,7 +341,7 @@ Agent 能 `write_file` + `run_command`，等于把「任意文件写入 + 任意
 
 | 档 | 内容 |
 |---|---|
-| **V0 就做** | 错误分层（领域错误 `thiserror` + 出口 `anyhow`）· 结构化日志 · 超时与重试 · **把 LLM 调用藏在一个 trait 后面** · 路径沙箱 · 命令白名单 · dry-run 确认 · 工具输出截断 · token / 成本统计 |
+| **V0 就做** | 错误分层（领域错误 `thiserror` + 出口 `anyhow`，**结论见 §3.7.1**）· 结构化日志 · 超时与重试 · **把 LLM 调用藏在一个 trait 后面**（分发选择见 §3.2.1）· 路径沙箱 · 命令白名单 · dry-run 确认 · 工具输出截断 · token / 成本统计 |
 | **V1–V2 再做** | 会话持久化 · 上下文压缩 · 流式输出 · 多后端抽象 · MCP（**等真实需求出现，不提前设计**） |
 | **对本目标不做** | 多 agent 编排 · 插件系统 · GUI · 打包分发 · 可观测性后端（每小时学到的 Rust 最少） |
 
@@ -245,6 +357,42 @@ trait LlmClient {
 否则 agent 的核心逻辑永远无法自动化测试）· 换模型只改一处 · 成本/token 埋点有统一入口。
 
 > 这是整个 V0 里**唯一建议"提前"引入**的抽象。其余一律等第二处需要出现时再加。
+
+### 3.7.1 错误策略分层（2026-10-16 定案，`config.rs` 已练过一遍）
+
+#### 分界线：「**这个错误有没有人能处理**」
+
+- `expect` / `unwrap` = **终止（panic）**，不是"报告"；`?` + `.context()` = 把错误**当值**交给上层。
+- **可以 panic**：`Config` 加载失败、CLI 参数解析失败、**测试代码**（panic 就是测试的失败信号）。
+- **绝不可 panic**：**agent 循环内部** —— LLM 调用 / 工具执行 / JSON 解析。三条理由：
+  ① panic 掉之后**模型永远看不到失败信息，无法自我纠正**（这直接毁掉 §3.8 第 2 问的答案）；
+  ② async 里的 panic 更糟（变成 `JoinError`，可观测性差）；
+  ③ panic 不可测（那个分支测不出来）。
+
+#### `thiserror` 与 `anyhow` 的分工：**库用 thiserror，二进制用 anyhow**
+
+| | `thiserror` | `anyhow` |
+|---|---|---|
+| 用途 | **内核 / 领域错误**：可 `match`、可分类、可穷尽 | **二进制出口层**：类型擦除，只能 `downcast` |
+| 形状 | `enum`（`ConfigError` 就是） | `anyhow::Error` + `.context()` |
+
+两者**可共存**，机制是 `anyhow::Error` 对 `E: std::error::Error` 的 blanket `From` ——
+所以签名叫 `anyhow::Result<T>` 的内部照样能用 typed error，`?` 自动转换。
+本项目已落地：`ConfigError`（thiserror）在里，`from_env() -> anyhow::Result<Config>` 在外。
+
+#### 几个容易踩的点
+
+- **`.ok()` 会静默吞错**（`Result` → `Option`，错误丢掉；反向是 `.ok_or(e)`）。
+  用它之前必须能回答「**这个错误真的可以不管吗**」。`dotenvy::dotenv().ok()` 属正当（没有 `.env` 也该能跑）。
+  §3.3.2 里 `from_map` 的闭包用 `Option` 就是这类"主动丢信息"付学费的真实案例。
+- **`anyhow::Ok` 是真实存在的自由函数**（带 `#[allow(non_snake_case)]`），是 `E` 推断失效（**E0282**）时的备用写法，
+  等价于 `Ok::<_, anyhow::Error>(v)`，常见于闭包 / iterator 链。
+  **别 `use anyhow::Ok;`** —— 会遮蔽 prelude 的 `Ok`，报错位置离根因很远。需要时写限定路径。
+- **错误要结构化，不要字符串**：`Missing { name }` 让人一眼知道缺哪个变量；拼成
+  `"缺少环境变量 LLM_API_KEY"` 就丢了可编程性（`ConfigError` 已经做对了）。
+- ⚠️ **全局态是测试的敌人**：`std::env::set_var` 在 edition 2024 是 `unsafe`（它会污染整个进程、
+  与并行跑的测试互撞）。凡是依赖全局态的函数都难可靠测试 ——
+  **这才是"依赖注入"（§3.3.2 的 `from_map`）的真实动机**，不是什么优雅癖。
 
 ### 3.8 要自答的 4 个问题（答完再动手）
 
@@ -292,7 +440,11 @@ Python 教程（21.9k★）。**当"协议参照 + 概念词典 + 失败模式�
 
 **V0**
 
-- [ ] 建 `.env` + `.env.example`（后者入库），用 `dotenvy` 把三变量读进 `Config`（§3.3.1）
+- [x] `.env.example` 入库（三变量空壳）+ `.gitignore` 加 `.env` / `.env.local` / `scratch/`（§3.3.1）
+- [x] `Config` / `ConfigError` 成型，`dotenvy` 读三变量（§3.3.1 / §3.3.2，**四版迭代**；`cargo check` 零代码告警）
+- [ ] **收敛 `from_env` / `from_map` 两条链**（§3.3.2 → 方案 **C**，推荐）
+- [ ] `config.rs` 的 `#[cfg(test)] mod tests`：三变体 + `format_url` 边界（§3.3.2 末 4 问）
+- [ ] 建 `.env` 本体，填入真实 `base_url` / `model` / `key`
 - [ ] 发一个最朴素的 chat 请求，打印原始 JSON 响应（§3.9）
 - [ ] 确定 API 的 `base_url` + `model`（填进 `.env`，代码不动），跑通一次带 `tools` 声明的调用
 - [ ] `Message` 类型的决定落定（§3.2 ①）
