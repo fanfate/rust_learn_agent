@@ -1,0 +1,8 @@
+# 换行符约定：仓库里一律 LF，checkout 时也强制 LF。
+# 属性优先于各机器的 core.autocrlf，所以任何机器（含 core.autocrlf=true 的 Windows）
+# 检出结果都一致 —— 不必逐台改 git 配置，也不会再出现 rust-analyzer 补全带 ^M 的问题。
+* text=auto eol=lf
+
+# 少数确实需要 CRLF 的文件类型，在仓库里点名声明（目前本仓库未使用，留作约定）
+*.bat text eol=crlf
+*.cmd text eol=crlf
