@@ -1,0 +1,332 @@
+# my_agent · 学习计划
+
+> 建立：2026-10-16　｜　目标：**一边深入 Rust，一边真正理解 Agent 是怎么运作的**
+> 上游文档：`../my_api/auth_refactor_progress.md`（收工复盘见其 §3.4；本项目路线源自其 **§五 / §六**）
+> 约定：**代码自己写**，本文件只负责"别漏"和"别想错"——不含可复制的完整实现。
+
+---
+
+## 〇、当前状态
+
+- ✅ 项目已 `cargo init`（`edition = "2024"`，`src/main.rs` 还是模板）
+- ✅ 前置能力已在 `my_api` 练过，**V2 阶段直接复用**：Axum 路由/中间件 · SQLx + 迁移 · JWT 鉴权 · 错误分层 · 集成测试
+- ✅ 本机工具链：`rustc 1.99.1` / `cargo 1.99.1`
+- ⚠️ **前提已变更（2026-10-16）**：**放弃本地模型**（本机无 NVIDIA GPU、无 llama.cpp），**改用在线模型**——API key 已有。
+  ⇒ `my_api` doc §5.1 那句"本地模型条件已具备"**作废**；§5.3 第 2 条"先云端验证再切本地"也随之简化（全程云端）。
+- ✅ **配置方式已定案（2026-10-16）**：`.env`（不入库）+ `.env.example`（空壳入库），三变量
+  `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY`，用 `dotenvy` 读取 —— 详见 **§3.3.1**。
+- ⏳ **唯一待定项**：用哪家 API / 什么模型名 → 只需填 `.env` 的两个值，**代码不用改**（这正是三变量抽象的目的）。
+- ✅ **scratch 目录已定位（2026-10-16）**：`my_agent/scratch/`，语义是 **agent 的沙箱根**，不是"测试目录"—— 详见 **§3.5**。
+
+---
+
+## 一、为什么要做这个（双目标，以及它们为什么不冲突）
+
+### 1.1 两个目标是同一件事
+
+| 这个项目**真在练 Rust** | 换 Python / TS 写是同一件事 |
+|---|---|
+| `Tool` trait 动态分发（`Box<dyn Tool>` + 注册表） | 调 LLM 的 HTTP 请求 |
+| **serde tagged enum 表达工具参数**（最体现 Rust 表达力） | prompt 拼装 |
+| 错误类型设计（**工具失败也要回灌给模型**） | JSON Schema 描述 |
+| `Arc` / 共享状态（工具注册表、会话状态） | 流式 chunk 的字符串处理 |
+| 取消与超时（`CancellationToken` + `tokio::select!`） | |
+| async 生命周期、跨 await 的借用 | |
+
+### 1.2 关键论据：Agent 引擎**不是 ML**
+
+它没有矩阵运算、没有 CUDA、没有训练循环 —— 全是 **HTTP 协议 + 异步编排 + 类型建模 + 错误处理**。
+也就是说，**Rust 生态最弱的那块（数据科学 / 深度学习）在这里根本不参与**，你正好落在它最强的那块：
+
+- tagged enum 让「未知工具」在**编译期**就不可能出现（Python 是运行时查不到才报错）
+- `match` 穷尽匹配 role / 状态，漏一个分支编译不过
+- `Result` 把「工具失败了」变成类型，而不是被忽略的异常
+
+### 1.3 顺便：语言选择不是劣势
+
+"agent 都用 TS 写"只对了一半 —— **TS 主导应用 / 框架 / UI / 分发层，引擎层反而 Rust 强势**：
+
+| 项目 | 语言 | 备注 |
+|---|---|---|
+| **OpenAI Codex CLI** | **Rust ≈95.7%** | 2025-04 首发是 **React + TS + Node**，两个月后宣布 "going native"；`codex-rs/` ≈70 crates，`codex-cli/` 只剩 npm 薄壳 |
+| **Block Goose** | **Rust ≈58% + TS ≈34%** | TS 那份**只做桌面 UI**；已捐给 Linux Foundation AAIF |
+| Claude Code / Cline / Vercel AI SDK | TS | 应用层 |
+| Aider / OpenHands | Python | 研究 / 脚本层 |
+
+Codex CLI 重写的三条理由**全是引擎层理由**：① 零依赖安装（Node v22+ 是硬依赖）② **无 GC 停顿**（长时运行的 agent 累积 history / 工具结果 / diff，堆持续膨胀）③ **原生沙箱**（想直接调 macOS Seatbelt / Linux Landlock，而非 FFI shim）。第三条对**本项目 §3.5 的安全边界**尤其对味。
+
+### 1.4 唯一的代价：迭代速度
+
+Python 改一行 prompt 直接跑；Rust 要等编译，还要跟所有权较劲。这段摩擦是**练习成本**，不是设计缺陷。
+**实用对策**：把"发现设计"和"实现设计"分开 —— 想快速试一种循环变体时，先用 Python 打个草稿，想法确认后再用 Rust 写一遍。别让编译错误变成探索的瓶颈。
+
+---
+
+## 二、路线 V0 → V3
+
+| 版本 | 范围 | 交付物 | 退出标准 |
+|---|---|---|---|
+| **V0** | 无框架 · 非流式 · CLI · 单文件约 300 行 | 一个能用的命令行 agent | 见 §三·3.6（含 **dogfooding 一次真实修复**） |
+| **V1** | 手写 SSE 流式 + 取消/超时 + 上下文管理 | 可 Ctrl-C 中断、不撑爆上下文的版本 | 流式分片能正确跨 chunk 累积 `tool_calls` |
+| **V2** | 接回 `my_api`：会话落 sqlite + Axum 包一层 | `POST /chat` + SSE / WebSocket | 复用 `CurrentUser` 做到会话按用户隔离 |
+| **V3** | MCP · 多后端抽象 | — | 到这一步才真正知道抽象该划在哪 |
+
+**当前唯一在做的：V0。** V1 之后的事不提前设计。
+
+---
+
+## 三、V0 详细
+
+### 3.1 范围
+
+**做**：
+- 单文件 `main.rs`（约 300 行），CLI，**非流式**，**不用任何 agent 框架**
+- **4 个工具**：`list_files` / `read_file` / `write_file` / `run_command`
+- 核心循环：`Vec<Message>` → `POST /v1/chat/completions` → `tool_calls` 非空则逐个执行、结果 push 回 messages → 继续；为空则输出文本、结束
+- 安全边界（§3.5）——**不是可选项**
+
+**不做（明确留到后面）**：流式、持久化、多会话、多后端抽象、MCP、重试/限流、UI。
+
+### 3.2 要自己定的三个类型决定（只列选项，不给结论）
+
+这三处是这个项目**最值钱的 Rust 练习点**，值得先想清楚再动手：
+
+1. **`Message` 怎么建模？**
+   `struct Message { role: Role, content: ..., tool_calls: ... }` 还是 tagged `enum Message`？两种都能走到终点 —— **各自在序列化、匹配、默认值上的代价是什么？**
+2. **工具参数怎么建模？**
+   `enum ToolCall`（每个变体带自己的参数结构）还是 `struct ToolCall { name: String, args: serde_json::Value }`？
+   后者好写，前者才是 doc §5.2 里"最能体现 Rust 表达力"的那一条。**先想清楚一个问题：「未知工具」该在编译期挡掉，还是运行期挡掉？**
+3. **`LlmClient` 用哪种分发？**
+   `trait` + 泛型（静态分发）还是 `Box<dyn LlmClient>`（动态分发）？—— 这正好对上 doc §5.2 的「**trait object 动态分发**」。
+
+### 3.3 依赖（版本已实测核实，非记忆）
+
+```toml
+[dependencies]
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time"] }
+reqwest = { version = "0.13", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"          # 应用层错误收口
+thiserror = "2.0"       # 领域错误（工具失败那种）分层用
+dotenvy = "0.15"        # 读 .env 拿 API key
+clap = { version = "4.6", features = ["derive"] }   # CLI 参数
+```
+
+V0 后半段再加：`tracing` + `tracing-subscriber`（结构化日志）。
+流式相关的 `eventsource-stream` / `futures-util` **留到 V1**。
+
+> ⚠️ **`reqwest 0.13` 的 TLS 与 0.12 不同，注意这个坑**（已查 crates.io 上的 feature 表）：
+> `default-tls = ["rustls"]`，而 `rustls = ["__rustls-aws-lc-rs", ...]` ⇒ **默认走 rustls + aws-lc-rs**，
+> 后者在 Windows 上可能要求 **CMake / NASM** 才能编过。
+> 如果 `cargo build` 卡在 TLS 依赖上，**换系统 TLS 后端**（Windows = schannel，零额外工具链）：
+> ```toml
+> reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
+> ```
+> （`rustls-tls` 这个 feature 名**在 0.13 里已不存在**，别照抄 0.12 的写法。）
+> 选型原则与 `jsonwebtoken` 那次一致：**优先无 C 工具链的方案**。
+
+### 3.3.1 配置：`.env` + `.env.example`（2026-10-16 定案）
+
+成熟且通用的一套（12-factor 的本地化写法，Hello-Agents 也是这么做的）：
+
+| 文件 | 入库 | 内容 |
+|---|---|---|
+| `.env` | ❌ **必须 gitignore** | 真实值（含 key） |
+| `.env.example` | ✅ **入库** | **空壳 / 占位**，只列变量名 —— 它本身就是"需要配哪些"的文档 |
+| 真实环境变量 | — | CI / 部署时直接注入，**优先级高于 `.env`** |
+
+**三个变量（够用，不再加）**：
+
+```
+LLM_BASE_URL=https://<host>/v1     # ← 建议含 /v1，见下面约定 ①
+LLM_MODEL=<model-name>
+LLM_API_KEY=sk-...
+```
+
+⚠️ **两个约定要先定死，否则后面全是隐性耦合**：
+
+1. **`LLM_BASE_URL` 是否含 `/v1`？** —— 建议**含**（示例里就带上），**代码里只往后拼 `/chat/completions`**。
+   把"厂商差异"全部压进环境变量，代码只认一种形状。（否则 `base_url` 尾斜杠的有无、`/v1` 的有无，会变成三个 case 的分支。）
+2. **读取顺序**：`dotenvy::dotenv().ok()` —— 用 **`.ok()` 而不是 `?`**：有真实环境变量时没有 `.env` 也能跑。
+   `dotenvy` 默认**不覆盖**已存在的环境变量 ⇒ 天然形成"**真实环境变量 > `.env`**"。
+
+**建议的落地形状**：启动时把三变量读进一个 `Config` 结构体，**缺哪个就带名字报错**（`anyhow::Context`），
+**不要拖到发请求时才 `unwrap`**。这是 V0 第一个真实的 Rust 小练习：**依赖在边界处一次性校验**。
+（顺手一条：**永远不要把 key 打进日志**。）
+
+> ⚠️ **第一件该做的事**：`.gitignore` 里**原本没有 `.env`** —— 一旦 `git add .` 就永久进历史。
+> **已代为加上**（同时加了 `scratch/`）。key 泄漏是这类项目最常见的翻车方式。
+
+### 3.4 协议备忘：`tool_calls` 报文解剖
+
+这是 V0 真正要建模的对象，**先看清形状再定类型**：
+
+```jsonc
+// ① 你发出去的：声明工具（JSON Schema）
+"tools": [{ "type": "function",
+  "function": { "name": "read_file", "description": "…",
+    "parameters": { "type": "object",
+      "properties": { "path": { "type": "string" } },
+      "required": ["path"] } } }]
+
+// ② 模型回给你的：要求调工具
+"message": { "role": "assistant", "content": null,
+  "tool_calls": [{ "id": "call_abc", "type": "function",
+    "function": { "name": "read_file",
+      "arguments": "{\"path\":\"src/main.rs\"}" } }] }   // ← 注意
+
+// ③ 你回灌的：工具结果
+{ "role": "tool", "tool_call_id": "call_abc", "content": "…" }
+```
+
+**`arguments` 是 JSON 字符串，不是对象。** 这是最常见的坑，也是你在 Rust 里必须**二次反序列化**的原因 ——
+外层解出 `tool_calls`，内层再 `from_str` 成你的枚举。它正好就是 §3.2 第 2 条那个类型决定的落点。
+
+### 3.5 安全边界（V0 必须，不是可选项）
+
+Agent 能 `write_file` + `run_command`，等于把「任意文件写入 + 任意命令执行」交给一个**概率模型**。
+
+#### scratch 是什么（先说清，否则"沙箱"只是个词）
+
+`my_agent/scratch/` = **agent 被允许操作的文件系统的根**（sandbox root）—— 它**不是**"测试运行目录"这么轻。三个身份：
+
+1. **安全边界（执行点）** —— 工具里**所有**路径（`read_file` / `write_file` / `list_files`）都以它为根解析，
+   **拒绝一切逃逸**（`../`、绝对路径、符号链接）；`run_command` 的 **`cwd` 也钉死在这里**。
+   下面那几条（白名单 / 确认 / 截断）是**机制**，scratch 是这个机制**生效的地方**。
+2. **靶场** —— 要修的目标代码**放进去**（`git clone <my_api> scratch/my_api`），agent 在这份**副本**上动手。
+3. **一次性的** —— 里面全是可弃物（克隆来的嵌套 `.git`、agent 改烂的文件），**已加进 `.gitignore`**。
+
+> 别和另两个"目录"混：`my_agent/` 是你写 **agent 本体**的地方；`tests/` 里若需要临时工作区，
+> 用 `tempfile` **现造现删** —— 那是测试夹具，**和 scratch 不是一回事**。
+
+⚠️ **路径沙箱在 Rust 里的一个真坑**：别用**字符串** `starts_with` 判前缀 ——
+`scratch = /a/b` 而路径 `/a/bc/x` 会被**误判为"在内部"**。
+正确做法：先 `std::fs::canonicalize`（**顺带解掉 `..` 与符号链接**），再用 **`Path::starts_with`**
+（按**路径分量**比较，不是子串）判断。这条值得自己写一遍、再故意撞一次。
+
+- ⚠️ **只在 scratch 里跑**，**绝不指向真实项目**
+  - ⚠️ **修正上一轮的说法**：dogfooding 的靶子是 **`my_api` 的副本**（`git clone` 到 scratch 下），**不是本体**。
+    拿一个还在调试的实验性 agent 去写 `my_api`，风险与收益不成比例。
+- **写操作与 shell 走人工确认**：先打印 diff / 待执行命令，回车才执行（这也是真实 agent 的标准设计）
+- **工具白名单**，不做万能 shell；命令限定在 `cargo check` / `cargo test` 这类
+- **工具输出截断**，别把整个文件塞回上下文
+
+### 3.6 验收标准
+
+**功能**：在 scratch 里放一段编译不过的代码（用 `my_api` 的副本），对 agent 说"让它通过编译"，它自主完成
+**读文件 → 改 → `cargo check` → 读报错 → 再改**，**中途不需要你介入**。
+
+**"能真实用起来"是验收标准，不是范围驱动** —— 它只问一件事：**做完之后，你愿不愿意每天真的打开它？**
+门槛比想象的低：**比的不是功能数，是可靠性**。一个只会做一件事但每次做对的 agent，胜过 20 个工具却总改错文件的框架。
+
+> 需求的正确来源是 **dogfooding，不是设计**。三个小时之内你会亲自撞到真正的需求：上下文塞不下、它改了错的文件、
+> 它在同一个错误上循环。**这些是设计不出来的。**（就像你在 T2 里第三次才撞到"提权时序"一样。）
+
+### 3.7 工程化分档
+
+判据只有一条：**这项工程化，每小时能让你学到多少 Rust，以及是否直接提升可靠性 / 可测性 / 安全性。**
+
+| 档 | 内容 |
+|---|---|
+| **V0 就做** | 错误分层（领域错误 `thiserror` + 出口 `anyhow`）· 结构化日志 · 超时与重试 · **把 LLM 调用藏在一个 trait 后面** · 路径沙箱 · 命令白名单 · dry-run 确认 · 工具输出截断 · token / 成本统计 |
+| **V1–V2 再做** | 会话持久化 · 上下文压缩 · 流式输出 · 多后端抽象 · MCP（**等真实需求出现，不提前设计**） |
+| **对本目标不做** | 多 agent 编排 · 插件系统 · GUI · 打包分发 · 可观测性后端（每小时学到的 Rust 最少） |
+
+**其中一项回报特别大，值得单独点出来 —— 把 LLM 调用藏在一个 trait 后面**：
+
+```rust
+trait LlmClient {
+    async fn chat(&self, msgs: &[Message], tools: &[ToolSpec]) -> Result<Response>;
+}
+```
+
+一个抽象换来三样东西：**单测不用联网**（喂一个 scripted 假 client，就能确定性地测「模型要求调工具 → 你正确执行 → 结果正确回填」，
+否则 agent 的核心逻辑永远无法自动化测试）· 换模型只改一处 · 成本/token 埋点有统一入口。
+
+> 这是整个 V0 里**唯一建议"提前"引入**的抽象。其余一律等第二处需要出现时再加。
+
+### 3.8 要自答的 4 个问题（答完再动手）
+
+1. `tool_calls` **为空**和模型返回**纯文本**，哪个才算"结束"？两者一定会一起出现吗？
+2. 工具执行返回 `Err` 时，回灌给模型的 `content` **应该长什么样**？（这决定模型能不能自己纠正）
+3. `run_command` 的白名单，怎么表达才算"**不靠字符串判断就安全**"？
+4. 历史每轮全量重发 —— 什么时候会撑爆上下文？**V0 要不要先不管这件事？**（先想清楚"为什么可以先不管"）
+
+### 3.9 第一动作
+
+**不要**先建 `Tool` trait。先只写一件事：
+
+> 发一个最朴素的 chat 请求，把**响应的 JSON 原样打印出来**。
+
+理由：你得先**亲眼看到** `tool_calls` 那个字段长什么样、`arguments` 到底是字符串还是对象、`finish_reason` 有哪些值，
+才知道 trait 该怎么定义。**这一步和上个项目里"先写 `GET /health` 那一条"是同一个套路。**
+
+---
+
+## 四、外部资料怎么用：Datawhale《Hello-Agents》
+
+Python 教程（21.9k★）。**当"协议参照 + 概念词典 + 失败模式清单"，不当教程跟做。**
+
+| 部分 | 内容 | 用法 |
+|---|---|---|
+| ch1-3 概念 / LLM 基础 | 术语、范式谱系 | 当词典用（对齐术语） |
+| **ch4 手写 ReAct** | 循环、工具声明、结果回填 | **V0 直接参照** |
+| ch5-7 低代码与框架 | Coze / Dify / LangGraph / 自研框架 | **跳过** |
+| ch8-12 高级机制 | Memory / 上下文工程 / MCP / 训练 | V1–V2 再回来（RL 跳过） |
+| ch13-16 案例与毕设 | 旅行助手 / 深度研究 / 赛博小镇 | 只当灵感 |
+
+**两个必须警惕的地方**：
+
+1. **看清它用的是哪种 ReAct。** 老写法是在 prompt 里要求模型输出 `Thought: … / Action: …` 再**正则解析**；
+   新写法用原生 **`tools` 参数**。⚠️ 前者不要学 —— 那是 function calling 普及前的过渡方案。
+2. **框架章跳过。** 它教的是「怎么把循环抽象掉」，而本项目的价值恰恰在**不抽象**（这也是为什么不用 `async-openai` 而手写 `reqwest`）。
+   更要紧的是：它的 Python OOP 设计（`class Agent` / `class Tool`）会把你带向**错误的 Rust 类型设计** ——
+   Rust 侧该是 `enum` + `trait`，而不是照抄那套分层。
+
+**教程给不了的（这才是本项目的意义）**：教程教"**要什么**"，Rust 教"**怎么保证**"。
+
+---
+
+## 五、进度记录
+
+**V0**
+
+- [ ] 建 `.env` + `.env.example`（后者入库），用 `dotenvy` 把三变量读进 `Config`（§3.3.1）
+- [ ] 发一个最朴素的 chat 请求，打印原始 JSON 响应（§3.9）
+- [ ] 确定 API 的 `base_url` + `model`（填进 `.env`，代码不动），跑通一次带 `tools` 声明的调用
+- [ ] `Message` 类型的决定落定（§3.2 ①）
+- [ ] 工具参数类型的决定落定（§3.2 ②）
+- [ ] `LlmClient` trait 立起来（§3.7）
+- [ ] 4 个工具实现：`list_files` / `read_file` / `write_file` / `run_command`
+- [ ] 循环接上：`tool_calls` 非空 → 执行 → 回灌 → 继续
+- [ ] 终止条件 + 步骤上限（防死循环）
+- [ ] 安全边界落地：scratch 目录 + 写/shell 确认 + 命令白名单 + 输出截断
+- [ ] 自答 §3.8 的 4 个问题
+- [ ] **验收**：拿 `my_api` 副本跑通一次真实修复（§3.6）
+
+**V1**
+
+- [ ] 手写 SSE 流式解析（含 `tool_calls` 跨 chunk 累积）
+- [ ] `CancellationToken` 取消 + `tokio::select!` 超时（Ctrl-C 可中断）
+- [ ] 上下文管理：历史裁剪 / assistant·tool 消息配对协议
+
+**V2**
+
+- [ ] 会话与消息落 sqlite（复用 `my_api` 的 sqlx 层 + 迁移工作流）
+- [ ] Axum 包一层：`POST /chat` + SSE / WebSocket
+- [ ] 鉴权复用 `CurrentUser` → 会话按用户隔离
+
+**V3**
+
+- [ ] MCP
+- [ ] 多后端抽象
+
+---
+
+## 六、通用提醒
+
+- **对"新版库 API"的断言不可靠时**：直接 grep 本机 registry 源码（`D:\Rust\.cargo\registry\src\`），
+  编译器和源码不会说谎。这条上个项目已经验证过多次。
+- **时间预期**：doc §5.3 那句仍然成立 —— "核心代码也就这么一个循环"是极度乐观的说法，
+  真正的活在流式、可靠性、上下文那一圈。**按两周以上算，不是"一个周末"。**
