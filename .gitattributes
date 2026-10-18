@@ -1,6 +1,12 @@
 # 换行符约定：仓库里一律 LF，checkout 时也强制 LF。
 # 属性优先于各机器的 core.autocrlf，所以任何机器（含 core.autocrlf=true 的 Windows）
-# 检出结果都一致 —— 不必逐台改 git 配置，也不会再出现 rust-analyzer 补全带 ^M 的问题。
+# 检出结果都一致 —— 不必逐台改 git 配置。
+#
+# ⚠️ 作用范围仅限 git 的进出（git add / git checkout），**不参与"编辑器写盘"**：
+#    nvim 新建文件时按 fileformat 写 CRLF，这里管不到；于是可能出现
+#    「i/lf w/crlf」——索引是 LF、工作区仍是 CRLF，而 git status 显示干净。
+#    编辑器侧要靠 `vim.opt.fileformats = "unix,dos"` 去约束（见 nvim 的 options.lua）。
+#    本文件能保证的是：**入库历史里不会混进 CRLF**（sqlx migration checksum 那类事故的根因）。
 * text=auto eol=lf
 
 # 少数确实需要 CRLF 的文件类型，在仓库里点名声明（目前本仓库未使用，留作约定）

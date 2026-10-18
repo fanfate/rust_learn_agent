@@ -1,27 +1,36 @@
 # my_agent · 学习计划
 
 > 建立：2026-10-16　｜　目标：**一边深入 Rust，一边真正理解 Agent 是怎么运作的**
-> 上游文档：`../my_api/auth_refactor_progress.md`（收工复盘见其 §3.4；本项目路线源自其 **§五 / §六**）
+> 上游：前一个练习项目 `rust_learn_my_api` 的收工复盘（本项目路线源自其 **§五 / §六**）
 > 约定：**代码自己写**，本文件只负责"别漏"和"别想错"——不含可复制的完整实现。
 
 ---
 
 ## 〇、当前状态
 
-- ✅ 项目已 `cargo init`（`edition = "2024"`，`src/main.rs` 还是模板）
+- ✅ 项目已 `cargo init`（`edition = "2024"`）
 - ✅ 前置能力已在 `my_api` 练过，**V2 阶段直接复用**：Axum 路由/中间件 · SQLx + 迁移 · JWT 鉴权 · 错误分层 · 集成测试
 - ✅ 本机工具链：`rustc 1.99.1` / `cargo 1.99.1`
-- ⚠️ **前提已变更（2026-10-16）**：**放弃本地模型**（本机无 NVIDIA GPU、无 llama.cpp），**改用在线模型**——API key 已有。
-  ⇒ `my_api` doc §5.1 那句"本地模型条件已具备"**作废**；§5.3 第 2 条"先云端验证再切本地"也随之简化（全程云端）。
+- ✅ **接入方式已定案（2026-10-16）**：**统一走 OpenAI 兼容接口** —— `POST {LLM_BASE_URL}/chat/completions`。
+  这是线上各家与本地推理服务（llama.cpp / Ollama / vLLM…）的**公约数**，所以 **"线上还是本地"不是一道取舍题**：
+  换 `.env` 里那两个值即可，**代码一个字都不用改**。选它的理由：省掉部署与权重管理，把精力放在 agent 循环本身；
+  本地推理随时能当"换个 base_url"接回来，留作 V3+ 的可选项。API key 已有。
+  ⇒ `my_api` doc §5.1「本地模型条件已具备」与 §5.3 第 2 条「先云端验证再切本地」**就此作废** ——
+  这件事已退化成一条环境变量，不再需要"迁移"决策。
 - ✅ **配置方式已定案（2026-10-16）**：`.env`（不入库）+ `.env.example`（空壳入库），三变量
   `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY`，用 `dotenvy` 读取 —— 详见 **§3.3.1**。
-- ⏳ **唯一待定项**：用哪家 API / 什么模型名 → 只需填 `.env` 的两个值，**代码不用改**（这正是三变量抽象的目的）。
+- ✅ **API 已选定并跑通（2026-10-18）**：OpenCode **Go** 通道 —— `LLM_BASE_URL=https://opencode.ai/zen/go/v1`、
+  `LLM_MODEL=deepseek-v4.1-flash`（`GET /models` 实测该 id 存在）。三变量抽象生效：全程只改 `.env`，`config.rs` 与请求代码零改动。
+  ⚠️ 该通道有**两条私有要求**（属 provider 私有约定，**未写进通用规范**，换家时可删）：`User-Agent` 必须自定义（否则 Cloudflare `403 / error code 1010`）、
+  `x-opencode-session` 必须带（否则 `400 MissingSessionID`）。→ 详见 **§3.9**。
 - ✅ **scratch 目录已定位（2026-10-16）**：`my_agent/scratch/`，语义是 **agent 的沙箱根**，不是"测试目录"—— 详见 **§3.5**。
-- ✅ **`src/config.rs` 已成型（2026-10-16，**四版迭代**）**：`ConfigError`（thiserror，3 变体 `Missing` / `NotUnicode` / `Empty`）
+- ✅ **`src/config.rs` 已成型（2026-10-16，**五版迭代**）**：`ConfigError`（thiserror，3 变体 `Missing` / `NotUnicode` / `Empty`）
   + 私有 `get_env` / `format_url` / `get_map` + `Config`（**手写 `Debug` 把 key 打 `"***"`**）+ `from_env()` / `from_map()`。
   `cargo check --all-targets` **零代码告警**（只剩 `target/` 增量锁文件噪音）。
-  ⚠️ **仍留一处结构问题**：`from_env` / `from_map` 两条取值链从未交汇 → 见 **§3.3.2**。
-- ⏳ `main.rs` 仍是模板（`fn main() -> anyhow::Result<()>`）。**下一个动作 = §3.9**：先发最朴素的 chat 请求、打印原始 JSON。
+  ✅ **两条取值链已交汇（方案 C 已落地）**：`from_env` 直接 `Self::from_map(&get_env)`，**生产路径经过被测内核** → 详见 **§3.3.2**。
+  ⏳ **唯一欠账**：`#[cfg(test)] mod tests` 还没写（§3.3.2 末 4 问）—— 有意留到 V0 跑通后再补。
+- ✅ **`main.rs` 已能发真实请求并拿到 200（2026-10-18）**：裸 POST 打通，`status` + `resp.text()` 打印原始报文。
+  **下一个动作 = §3.9 实验 2**：带一个 dummy `tools` 声明再发一次，看清 `tool_calls` 形状 —— **看完再写 `model.rs`**。
 
 ---
 
@@ -87,7 +96,7 @@ Python 改一行 prompt 直接跑；Rust 要等编译，还要跟所有权较劲
 **做**：
 - 单文件 `main.rs`（约 300 行），CLI，**非流式**，**不用任何 agent 框架**
 - **4 个工具**：`list_files` / `read_file` / `write_file` / `run_command`
-- 核心循环：`Vec<Message>` → `POST /v1/chat/completions` → `tool_calls` 非空则逐个执行、结果 push 回 messages → 继续；为空则输出文本、结束
+- 核心循环：`Vec<Message>` → `POST {LLM_BASE_URL}/chat/completions` → `tool_calls` 非空则逐个执行、结果 push 回 messages → 继续；为空则输出文本、结束
 - 安全边界（§3.5）——**不是可选项**
 
 **不做（明确留到后面）**：流式、持久化、多会话、多后端抽象、MCP、重试/限流、UI。
@@ -175,7 +184,7 @@ V0 后半段再加：`tracing` + `tracing-subscriber`（结构化日志）。
 **三个变量（够用，不再加）**：
 
 ```
-LLM_BASE_URL=https://<host>/v1     # ← 建议含 /v1，见下面约定 ①
+LLM_BASE_URL=https://<host>/v1     # ← 线上/本地同一个形状；是否含 /v1 见约定 ①
 LLM_MODEL=<model-name>
 LLM_API_KEY=sk-...
 ```
@@ -184,19 +193,23 @@ LLM_API_KEY=sk-...
 
 1. **`LLM_BASE_URL` 是否含 `/v1`？** —— 建议**含**（示例里就带上），**代码里只往后拼 `/chat/completions`**。
    把"厂商差异"全部压进环境变量，代码只认一种形状。（否则 `base_url` 尾斜杠的有无、`/v1` 的有无，会变成三个 case 的分支。）
+   ⇒ 按 **OpenAI 兼容接口**的通行形状来 —— 线上各家与本地 llama.cpp / Ollama / vLLM 基本都是这个形状；
+   少数不带 `/v1` 的端点，改 `.env` 一行即可，**代码永远只拼 `/chat/completions`**。
 2. **读取顺序**：`dotenvy::dotenv().ok()` —— 用 **`.ok()` 而不是 `?`**：有真实环境变量时没有 `.env` 也能跑。
    `dotenvy` 默认**不覆盖**已存在的环境变量 ⇒ 天然形成"**真实环境变量 > `.env`**"。
 
-**建议的落地形状**：启动时把三变量读进一个 `Config` 结构体，**缺哪个就带名字报错**（`anyhow::Context`），
+**建议的落地形状**：启动时把三变量读进一个 `Config` 结构体，**缺哪个就带名字报错** ——
+名字要进**类型字段**（`Missing { name }`），**不是**进 `anyhow::Context` 的字符串：前者能 `match`、能断言，
+后者只能打印（与 §3.7.1「错误要结构化，不要字符串」是同一件事）。
 **不要拖到发请求时才 `unwrap`**。这是 V0 第一个真实的 Rust 小练习：**依赖在边界处一次性校验**。
 （顺手一条：**永远不要把 key 打进日志**。）
 
 > ⚠️ **第一件该做的事**：`.gitignore` 里**原本没有 `.env`** —— 一旦 `git add .` 就永久进历史。
 > **已代为加上**（同时加了 `scratch/`）。key 泄漏是这类项目最常见的翻车方式。
 
-### 3.3.2 `config.rs` 的四版演化与遗留决策（2026-10-16）
+### 3.3.2 `config.rs` 的五版演化与决策日志（2026-10-16）
 
-实际写下来的过程比预想曲折，**四版的差异本身就是这一节最值钱的部分**：
+实际写下来的过程比预想曲折，**五版的差异本身就是这一节最值钱的部分**：
 
 | 版 | 改了什么 | 为什么 |
 |---|---|---|
@@ -228,7 +241,10 @@ Debug    Config { ..., llm_api_key: "sk-REAL-..." }   ← 漏
 存成唯一内部形式，位置正确。**别把"测试覆盖"的标尺套到"输入归一化"上。**
 （边界行为已实测：`"http://x/v1//"` → `"http://x/v1"`；`"/"` → `""`，边角可不管。）
 
-#### ⚠️ 遗留：两条取值链从未交汇（当前唯一实质问题）
+#### ✅ 已解决：两条取值链曾未交汇（方案 C 已落地，以下是决策过程）
+
+> 状态：**2026-10-16 已按方案 C 落地**（`from_env` 直接 `Self::from_map(&get_env)`，`get_env` 返回 `Result<String, ValueError>`）。
+> 下面保留的是**当时为什么这么选**的完整推导 —— 结论看表格，过程看后面几小节。
 
 `from_env` → `get_env` → `std::env`；`from_map` → 闭包。**两份独立实现** ⇒ **生产路径不经过可测内核**，
 `from_map` 的测试全绿也**证明不了** `from_env` 对。
@@ -238,7 +254,7 @@ Debug    Config { ..., llm_api_key: "sk-REAL-..." }   ← 漏
 ⇒ **同一个非 UTF-8 环境变量走两条链得到不同变体**（`NotUnicode` vs `Missing`）；
 ⇒ **一旦把 `from_env` 委托给 `from_map`，`NotUnicode` 会静默失效**。
 
-三条路，**推荐 C**：
+三条路，**选定 C（已落地）**：
 
 | 方案 | 保住 `NotUnicode` | 单一内核（生产走被测内核） | 额外成本 |
 |---|---|---|---|
@@ -338,6 +354,7 @@ note: but type `ValueError` is only usable at visibility `pub(self)`
 这恰好是"边界用哪个错误类型"那个决策的**镜像**：
 **把它塞进公开签名 ⇒ 它成了公共协议；不塞又不改可见性 ⇒ 公开签名成了空头支票。**
 ⇒ **`from_map` 应为 `pub(crate)`**（它只服务 `from_env` 与 `tests`，没有任何外部调用者）；`from_env` 保持 `pub` 是对的。
+✅ **已落地**：实际写成了**私有 `fn`**（比 `pub(crate)` 更严），`private_bounds` 警告随之消失。
 （若哪天真要对外支持"自定义配置源"，再把 `ValueError` 提升为 `pub`，并按正式 API 设计，加 `#[non_exhaustive]`。）
 
 #### `ValueError` 要不要 `thiserror::Error`？—— 可以不要（已实测）
@@ -501,22 +518,41 @@ trait LlmClient {
   ② async 里的 panic 更糟（变成 `JoinError`，可观测性差）；
   ③ panic 不可测（那个分支测不出来）。
 
-#### `thiserror` 与 `anyhow` 的分工：**库用 thiserror，二进制用 anyhow**
+#### `thiserror` 与 `anyhow` 的分工：按「API 边界」而非「crate 类型」
+
+> ⚠️ **2026-10-17 更正**：旧口诀是「**库用 thiserror，二进制用 anyhow**」。它按 **crate 类型**划分，粒度错了 ——
+> 真正的判据是 **`pub` 可见性**：`lib` 里的 `pub fn`，错误类型就是它 API 承诺的一部分（`# Errors` 那一节写的就是它）；
+> `lib` 里的私有函数用 anyhow 完全没问题；`bin` 的 `main` 用 anyhow 也对。
+> `config` 恰好卡在缝上：住在 `lib` 里、且是 `pub` ⇒ **必须具体类型**。
 
 | | `thiserror` | `anyhow` |
 |---|---|---|
-| 用途 | **内核 / 领域错误**：可 `match`、可分类、可穷尽 | **二进制出口层**：类型擦除，只能 `downcast` |
+| 用途 | **内核 / 领域错误**：可 `match`、可分类、可穷尽 | **出口层**：类型擦除，只能 `downcast` |
 | 形状 | `enum`（`ConfigError` 就是） | `anyhow::Error` + `.context()` |
+| 什么时候用 | 调用者要**按类型处理**，或测试要断言变体 | **没人能按类型处理**，只能打印或上抛 |
 
 两者**可共存**，机制是 `anyhow::Error` 对 `E: std::error::Error` 的 blanket `From` ——
-所以签名叫 `anyhow::Result<T>` 的内部照样能用 typed error，`?` 自动转换。
-本项目已落地：`ConfigError`（thiserror）在里，`from_env() -> anyhow::Result<Config>` 在外。
+所以 `main` 里 `Config::from_env()?` 照样能把 `ConfigError` 收进 `anyhow::Result`，**main 一行都不用改**。
+
+⚠️ **本项目原先的示范是错的**：「`ConfigError`（thiserror）在里，`from_env() -> anyhow::Result<Config>` 在外」——
+`from_env` / `from_map` 都应是 `Result<_, ConfigError>`。旧文档还同时写着「`anyhow::Context`」和「错误要结构化，不要字符串」，
+两条本身在打架：`Context` 加的是**字符串**，`Missing { name }` 加的是**类型字段**。
+
+**`anyhow` 一个被低估的用法：它是「延迟设计类型」的工具。**
+V0 第一步根本不知道会失败几次、都有哪些形态（DNS 错 / 401 / 429 / JSON 形状不对 / `choices` 为空…）——
+这时硬定义 `ChatError` 是**在信息不足时做类型设计**，八成要返工。先用 anyhow + `.context()` 跑通，
+等真实失败形态见全了再抽 thiserror。**升级信号：你第一次需要 `match` 它。**
+
+> 实测证据（2026-10-17）：三层调用各加一句 `.context()`，`io::Error` 的原产地不动、类型零改动，
+> `{:#}` 打成一条链 `初始化 agent 失败: 读取工具列表 tools.json 失败: 系统找不到指定的文件。 (os error 2)`，
+> `{:?}` 打出完整 `Caused by:` 列表。thiserror 想获得同样效果，得为每句说明新增一个 enum 变体。
 
 #### 几个容易踩的点
 
 - **`.ok()` 会静默吞错**（`Result` → `Option`，错误丢掉；反向是 `.ok_or(e)`）。
   用它之前必须能回答「**这个错误真的可以不管吗**」。`dotenvy::dotenv().ok()` 属正当（没有 `.env` 也该能跑）。
-  §3.3.2 里 `from_map` 的闭包用 `Option` 就是这类"主动丢信息"付学费的真实案例。
+  §3.3.2 里 `from_map` 的闭包**曾经**返回 `Option`，就是这类"主动丢信息"付学费的真实案例
+  （现已改成 `Result<String, ValueError>` —— 见方案 C）。
 - **`anyhow::Ok` 是真实存在的自由函数**（带 `#[allow(non_snake_case)]`），是 `E` 推断失效（**E0282**）时的备用写法，
   等价于 `Ok::<_, anyhow::Error>(v)`，常见于闭包 / iterator 链。
   **别 `use anyhow::Ok;`** —— 会遮蔽 prelude 的 `Ok`，报错位置离根因很远。需要时写限定路径。
@@ -541,6 +577,60 @@ trait LlmClient {
 
 理由：你得先**亲眼看到** `tool_calls` 那个字段长什么样、`arguments` 到底是字符串还是对象、`finish_reason` 有哪些值，
 才知道 trait 该怎么定义。**这一步和上个项目里"先写 `GET /health` 那一条"是同一个套路。**
+
+#### ✅ 已落地（2026-10-18）：朴素 POST 打通，拿到真实报文
+
+第一版 `main.rs` 踩了三个 bug，全是**报文层**的错，值得留档：
+
+| Bug | 表现 | 原因 |
+|---|---|---|
+| `.get()` 写成 GET | **404**（不是 405） | `/chat/completions` 只挂 POST；CF 对未匹配方法直接 404，body 为空（`content-length: 0`） |
+| `.json(&json_body)` 而 `json_body` 是 `String` | 400 | `.to_string()` 之后再序列化 ⇒ body 成了**带外层引号的 JSON 字符串**，不是对象 |
+| 手写 `Content-Type: application.json` | 415 / 400 | 拼错（正确是 `application/json`）；且 `RequestBuilder::header` 是 **append** 而非覆盖，会与 `.json()` 自动添的那条**并存**，服务端取第一个（错的） |
+
+外加**两条 provider 私有要求**（只作接入备注，**不进通用规范**）：
+
+- **`User-Agent`**：reqwest 默认**不发** UA，缺了被 Cloudflare 拦成 `403`（body: `error code: 1010`）。放 `Client::builder().user_agent(...)`。
+- **`x-opencode-session`**：缺了 `400 MissingSessionID`（用途是上游路由 + prompt cache，要求一次会话内稳定）。放 `default_headers`，**不写进业务代码**。
+  HTTP 允许未知头、服务端一律忽略 ⇒ 换 provider 时**留着也无害**，不构成通用化障碍；要删只是一行。
+
+首次 200 的真实响应（可作为 `model.rs` 的**唯一事实来源**，不要凭记忆写）：
+
+```json
+{
+  "id": "gw-611de3d6ebaf-4f01e3",
+  "object": "chat.completion",
+  "created": 1792326206,
+  "model": "deepseek-v4.1-flash",
+  "choices": [{
+    "index": 0,
+    "finish_reason": "stop",
+    "logprobs": null,
+    "message": {
+      "role": "assistant",
+      "content": "你好！很高兴见到你 …",
+      "reasoning_content": "The user just said \"你好。\" …"
+    }
+  }],
+  "usage": {
+    "prompt_tokens": 38,
+    "completion_tokens": 63,
+    "total_tokens": 101,
+    "prompt_tokens_details": { "cached_tokens": 0 },
+    "completion_tokens_details": { "reasoning_tokens": 27 }
+  }
+}
+```
+
+三条可直接用于类型设计的事实：
+
+1. **`reasoning_content` 与 `content` 同级**（都在 `message` 下），不是嵌套对象 —— 之前"thinking 内容放在哪"的猜测到此为止；
+2. **thinking 默认开启**：只回两个字也产生 27 个 reasoning token，`usage.completion_tokens_details.reasoning_tokens` 是唯一的量化出口；
+3. **`choices` 是数组**（本次单元素）—— 解析不能假设"取第 0 个就完事"，尽管实践中 OpenAI 兼容层基本恒为单元素。
+
+⇒ **下一步（实验 2）**：加一个 dummy `tools` 声明再发一次，专看三件事 ——
+`finish_reason` 是否变 `"tool_calls"`、`tool_calls[].function.arguments` 是**字符串还是对象**、`content` 是否为 `null`。
+**看完再写 `model.rs`**（届时才决定要不要 `deny_unknown_fields`）。
 
 ---
 
@@ -573,12 +663,14 @@ Python 教程（21.9k★）。**当"协议参照 + 概念词典 + 失败模式�
 **V0**
 
 - [x] `.env.example` 入库（三变量空壳）+ `.gitignore` 加 `.env` / `.env.local` / `scratch/`（§3.3.1）
-- [x] `Config` / `ConfigError` 成型，`dotenvy` 读三变量（§3.3.1 / §3.3.2，**四版迭代**；`cargo check` 零代码告警）
-- [ ] **收敛 `from_env` / `from_map` 两条链**（§3.3.2 → 方案 **C**，推荐）
+- [x] `Config` / `ConfigError` 成型，`dotenvy` 读三变量（§3.3.1 / §3.3.2，**五版迭代**；`cargo check` 零代码告警）
+- [x] **收敛 `from_env` / `from_map` 两条链**（§3.3.2 → 方案 **C**，已落地）
 - [ ] `config.rs` 的 `#[cfg(test)] mod tests`：三变体 + `format_url` 边界（§3.3.2 末 4 问）
-- [ ] 建 `.env` 本体，填入真实 `base_url` / `model` / `key`
-- [ ] 发一个最朴素的 chat 请求，打印原始 JSON 响应（§3.9）
-- [ ] 确定 API 的 `base_url` + `model`（填进 `.env`，代码不动），跑通一次带 `tools` 声明的调用
+- [x] 确定 API 的 `base_url` + `model`（OpenCode Go / `deepseek-v4.1-flash`，只填 `.env`，代码不动）
+- [x] 建 `.env` 本体，填入真实三值
+- [x] 发一个最朴素的 chat 请求，打印原始 JSON 响应（§3.9，**200**）
+- [x] 摸清该通道的两条私有 header：`User-Agent` / `x-opencode-session`（§3.9）
+- [ ] **实验 2**：带 dummy `tools` 跑通一次，看清 `tool_calls` 形状（§3.9）
 - [ ] `Message` 类型的决定落定（§3.2 ①）
 - [ ] 工具参数类型的决定落定（§3.2 ②）
 - [ ] `LlmClient` trait 立起来（§3.7）

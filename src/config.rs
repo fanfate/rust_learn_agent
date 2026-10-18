@@ -63,12 +63,12 @@ impl std::fmt::Debug for Config {
 }
 
 impl Config {
-    pub fn from_env() -> anyhow::Result<Config> {
+    pub fn from_env() -> Result<Config, ConfigError> {
         dotenv().ok();
         Self::from_map(&get_env)
     }
 
-    fn from_map(get: &impl Fn(&str) -> Result<String, ValueError>) -> anyhow::Result<Config> {
+    fn from_map(get: &impl Fn(&str) -> Result<String, ValueError>) -> Result<Config, ConfigError> {
         let llm_base_url = format_url(get_map("LLM_BASE_URL", get)?);
         let llm_model = get_map("LLM_MODEL", get)?;
         let llm_api_key = get_map("LLM_API_KEY", get)?;
