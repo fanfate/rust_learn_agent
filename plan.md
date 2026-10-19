@@ -444,6 +444,55 @@ note: `ConfigError` needs to implement `From<ValueError>`
 **`arguments` 是 JSON 字符串，不是对象。** 这是最常见的坑，也是你在 Rust 里必须**二次反序列化**的原因 ——
 外层解出 `tool_calls`，内层再 `from_str` 成你的枚举。它正好就是 §3.2 第 2 条那个类型决定的落点。
 
+#### 3.4.1 规范核对（2026-10-19 查证）
+
+> **结论先行**：路线不用改。OpenAI 自家新项目推荐 Responses API，但**所有第三方"OpenAI 兼容"网关
+> （含本项目这条 OpenCode Go 通道）实现的都是 Chat Completions**。V0 只按 Chat Completions 来。
+
+**请求侧**
+
+| 字段 | 取值 | 备注 |
+|---|---|---|
+| `tools[]` | `{"type":"function","function":{name,description,parameters,strict?}}` | `parameters` 是 **JSON Schema 对象**（不是字符串） |
+| `tool_choice` | `"none"`（无 `tools` 时默认）/ `"auto"`（有 `tools` 时默认）/ `"required"` / `{"type":"function","function":{"name":"…"}}` / `{"type":"allowed_tools",…}`（新） | V0 用 `"auto"` |
+| `parallel_tool_calls` | bool，**默认 `true`** | 一次可回**多个** tool_call ⇒ 回灌必须**按 id 逐个**回应 |
+| `strict` | bool，**默认 false** | 开启需 `additionalProperties:false` 且**所有**属性进 `required`；第三方常不支持 |
+
+**响应侧**（`choices[i]`）
+
+- `finish_reason`：`"stop"` / `"length"` / `"tool_calls"` / `"content_filter"`（旧接口另有 `"function_call"`）
+- `message.tool_calls[]` = `{ "id": "call_…", "type": "function", "function": { "name": …, "arguments": "…" } }`
+  - **`arguments` 是 JSON 字符串**（官方文档与实测一致）⇒ Rust 侧必须二次 `from_str`
+  - **`content` 可能是 `null`**（只有调用、没有正文）⇒ serde 必须 `Option<String>`，**不能裸 `String`**
+  - 推理模型可能**额外**带 `reasoning_content`（本通道已实测，与 `content` 同级）
+- ⚠️ **`tool_calls` 非空与 `finish_reason == "tool_calls"` 不保证同时成立**。判"要不要调工具"看
+  **`message.tool_calls` 是否非空**，`finish_reason` 只当旁证 —— 兼容层实现质量参差。
+
+**回灌侧**
+
+```jsonc
+// ① 必须先把 assistant 那条【原样】放回历史（含 tool_calls 与 id），不能只存正文
+{ "role": "assistant", "content": null, "tool_calls": [ … ] }
+// ② 再为每个 id 各回一条，且紧跟其后（并行调用时缺任何一条 → 400 / 行为未定义）
+{ "role": "tool", "tool_call_id": "call_…", "content": "<工具输出，字符串>" }
+```
+
+- `content` 是**字符串**（新版也接受 `[{"type":"text","text":…}]` 数组）；要回对象就自己 `to_string()`
+- `tool_call_id` 必须与 `id` **逐字一致**，且 id **不许自己编**（它是模型侧的关联键，不是你的编号）
+
+**两处新版变化**（V0 用不上，知道即可）
+
+1. `tool_choice` 新增 `{"type":"allowed_tools", "mode": …, "tools": […]}`（声明 N 个、只允许用其中 M 个）
+2. `tools[].type` 新增 `"custom"` —— 自由文本入参，可选 Lark/regex 文法约束（GPT-5 系专属）
+
+**Responses API（另一套消息模型，不是本项目的路线）**
+
+`output[]` 里是 `{"type":"function_call","id":"fc_…","call_id":"call_…","name":…,"arguments":"…"}`，
+回灌 `{"type":"function_call_output","call_id":…,"output":"…"}` —— **认 `call_id` 不是 `id`**；
+推理模型还要求把 `reasoning` item 一并回放。⇒ 换路线等于**换整套消息模型**，不是改几个字段。
+
+**已废弃**：`functions` / `function_call` 参数、`role:"function"` → 用 `tools` / `tool_calls` / `role:"tool"`。
+
 ### 3.5 安全边界（V0 必须，不是可选项）
 
 Agent 能 `write_file` + `run_command`，等于把「任意文件写入 + 任意命令执行」交给一个**概率模型**。
@@ -628,9 +677,112 @@ V0 第一步根本不知道会失败几次、都有哪些形态（DNS 错 / 401 
 2. **thinking 默认开启**：只回两个字也产生 27 个 reasoning token，`usage.completion_tokens_details.reasoning_tokens` 是唯一的量化出口；
 3. **`choices` 是数组**（本次单元素）—— 解析不能假设"取第 0 个就完事"，尽管实践中 OpenAI 兼容层基本恒为单元素。
 
-⇒ **下一步（实验 2）**：加一个 dummy `tools` 声明再发一次，专看三件事 ——
-`finish_reason` 是否变 `"tool_calls"`、`tool_calls[].function.arguments` 是**字符串还是对象**、`content` 是否为 `null`。
+⇒ **下一步（实验 2）**：加一个 dummy `tools` 声明再发一次。**要看的清单**（§3.4.1 给了"应该是什么"）：
+
+1. `finish_reason` 是否变 `"tool_calls"`
+2. `tool_calls[].function.arguments` 是**字符串还是对象**
+3. `content` 是否为 `null`；`reasoning_content` 还在不在（与 `content` 同级）
+4. 该通道**接不接受** `tool_choice` / `strict`（不支持时是 400 还是静默忽略）
+5. **回灌一轮**：assistant 原样 + `role:"tool"` 各一条 → 是否 200，且模型改用正文回答
+   （第 5 条才是"循环能转"的最小验证；1–4 只是形状）
+
 **看完再写 `model.rs`**（届时才决定要不要 `deny_unknown_fields`）。
+
+> 提示：题面必须**只能用工具完成**（例如声明 `read_file(path)` 后问"读 src/main.rs 并告诉我行数"），
+> 否则模型仍可能只回文本 → `tool_calls` 为空，实验白跑。
+> 另一条通道备忘：DeepSeek 官方 API 现在把模型名写作 `deepseek-flash`（服务 V4.1-Flash-1017），
+> 本项目走的是 OpenCode 网关的 `deepseek-v4.1-flash`，两者**不可混用**。
+
+#### ✅ 实验 2 已落地（2026-10-19）：拿到真实 `tool_calls` 报文
+
+`model.rs` 的**第二份事实来源**（第一份是上面的纯文本响应）：
+
+```json
+{
+  "id": "gw-a70a2abc01d3-4b1f50", "object": "chat.completion", "created": 1792391459,
+  "model": "deepseek-v4.1-flash",
+  "choices": [{
+    "index": 0,
+    "finish_reason": "tool_calls",
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "reasoning_content": "The user wants me to read the scratch/readme.md file. Let me do that.",
+      "tool_calls": [{
+        "id": "call_7c4d7ca56b784e7da63c67ee",
+        "type": "function",
+        "function": { "name": "read_file", "arguments": "{\"path\":\"scratch/readme.md\"}" }
+      }]
+    }
+  }],
+  "usage": { "prompt_tokens": 308, "completion_tokens": 63, "total_tokens": 371,
+    "prompt_tokens_details": { "cached_tokens": 256 },
+    "completion_tokens_details": { "reasoning_tokens": 19 } }
+}
+```
+
+**清单核对**
+
+| # | 要看 | 实测 | 结论 |
+|---|---|---|---|
+| 1 | `finish_reason` | `"tool_calls"`，且与 `tool_calls` **同时出现** | 与 §3.4.1 一致 |
+| 2 | `arguments` 类型 | **字符串** `"{\"path\":\"…\"}"` | 必须二次 `from_str` |
+| 3 | `content` / `reasoning_content` | `content: null`（键在、值为 null），`reasoning_content` 仍在 | 两个都得 `Option<String>` |
+| 4 | `tool_choice` / `strict` | 本次报文手写，**未带** | 仍未验证 |
+| 5 | 回灌一轮 | **未做** | ⬅ 这才是循环能否转的判据 |
+
+**五条只有见过真实报文才知道的设计事实**
+
+1. **`id` 是 `call_` + 32 位小写 hex**（网关生成）⇒ 当**不透明 `String`**，不校验格式、不做前缀假设。
+2. **非流式响应里 `tool_calls[]` 没有 `index`** —— 那是**流式 delta 专用**字段。别把它写进非流式的 `ToolCall`。
+3. **`arguments` 必须存原始 `String`**。一旦解析成 `Value` 就拼不回原样（键序、空白都变）；而 assistant 消息要
+   **原样回灌**，且 `cached_tokens: 256` 证明 prompt cache 真的在命中。
+   ⚠️ **更正（同日）**：cache 命中与否取决于**消息内容 / 条数 / 顺序**，**不是 JSON 字节** —— 服务端解析后按
+   chat template 重新渲染成 token 序列，对象里的键序到此已不存在。所以"原样"= **语义原样**（字段不丢、值不改、
+   顺序不变），不是"逐字节一致"。存 `String` 的真实理由是**不必重建**：你手里只有原文时，重序列化只是多此一举。
+4. **`cached_tokens` 是 `x-opencode-session` 稳定的直接回报**（308 里 256 命中）⇒ **历史顺序必须稳定**，
+   别每轮重建时打乱；这也说明"消息历史"该是有序 `Vec`，不是 `HashMap`/`HashSet`。
+5. **同一个网关，两次响应的字段集不一样**：第一次有 `"logprobs": null`，这次整条缺失
+   ⇒ **外层响应结构绝对不能 `deny_unknown_fields`**（这条原来还只是"怕以后加字段"，现在有实证了）。
+
+**`model.rs` 的 6 个决定点**（形状已定，代码自己写）：
+
+| 字段 | 建议类型 | 理由 |
+|---|---|---|
+| `content` | `Option<String>` + `#[serde(default)]` | 显式 `null` 与缺键都要吃下，二者都应映射成 `None` |
+| `reasoning_content` | `Option<String>` + `default`，**可以回灌** | 实验 2.5 已带上且 200（网关不拒）；"原样复制"最省事。注意它**不是**协议字段，换 provider 后可能消失/无意义 |
+| `tool_calls` | **`Vec<ToolCall>` + `#[serde(default)]`**（**不用 `Option<Vec<_>>`**） | `Option<Vec>` 有 4 态（缺/`null`/空/非空），语义只有 2 态 ⇒ 让**非法状态不可表达**（§3.8 第 1 问的答案就在这） |
+| `arguments` | `String`，执行前才 `from_str` | 原样保留（见事实 3） |
+| `finish_reason` | `Option<String>`，或 enum + `#[serde(other)]` 兜底 | 别穷尽，provider 会加新值 |
+| `deny_unknown_fields` | **禁用** | 见事实 5 |
+
+⇒ **下一步不是写 `model.rs`，是补做清单第 5 条**（实验 2.5）：把 assistant 那条**原样**塞回 + 一条
+`{"role":"tool","tool_call_id":"call_7c4d…","content":"…"}` 再发一次，看是否 200 且模型改用正文收尾。
+**这一步过了，循环的最小闭环才算被验证。**
+
+#### ✅ 实验 2.5 已落地（2026-10-19）：闭环成立
+
+第二轮返回 **200**、`finish_reason: "stop"`、`content` 变成正文（还按内容做了总结）。**"发送 → 收调用 → 回灌 → 收尾"整条链路打通。**
+
+四条新事实（**修正/强化了上面的判断**）：
+
+1. **带 `tool_calls` 时 `content` 也可以是正文，不是恒 `null`。** 本轮 `content = "我来阅读这个文件。"` —— 模型先说了句话再调工具。
+   ⇒ ① `Option<String>` 的判断不变，但**别假设"有 tool_calls 就 content 为 null"**；
+   ② 这段 preamble 正好可以直接打给用户看（CLI 的进度提示免费拿到了）。
+2. **收官那轮的 `message` **完全没有 `tool_calls` 键**（不是 `null`、不是 `[]`）** ⇒ 这是 `Vec<ToolCall>` + `#[serde(default)]`
+   的**直接实证**：`Option<Vec<_>>` 遇到"键不存在"还要多一条 `unwrap_or_default()`。
+3. **`strict: true` / `tool_choice: "auto"` / `parallel_tool_calls: true` 全被接受（200）** —— 清单第 4 条答了一半：
+   网关**不拒绝**它们。但"接受"≠"强制约束"，`strict` 是否真按 schema 约束仍未验证（V0 不依赖它）。
+4. **cache 跨轮稳定**：`prompt_tokens` 308 → 387（+79，正好是 assistant+tool 两条），`cached_tokens` 仍是 **256**。
+   ⇒ **"只追加、不改写"** 这个约束得到验证：往尾部追加不影响前缀缓存，只有动老消息才会打掉。
+
+**当前 `main.rs` 的定位**：它是**协议探针**，不是 agent。两处"假"的地方要清楚：
+- 工具结果是**硬编码**的 `"## 你好\n\n你好\n"`，并没有真读文件（模型"读到"的内容是假的）；
+- 只有**两轮**，写死的顺序，没有循环、没有终止条件、没有 `max_steps`。
+
+⇒ **下一个动作 = 写 `model.rs`**（6 个决定点已定），然后才是 `llm.rs` + 真正的循环。
+
+
 
 ---
 
@@ -670,7 +822,8 @@ Python 教程（21.9k★）。**当"协议参照 + 概念词典 + 失败模式�
 - [x] 建 `.env` 本体，填入真实三值
 - [x] 发一个最朴素的 chat 请求，打印原始 JSON 响应（§3.9，**200**）
 - [x] 摸清该通道的两条私有 header：`User-Agent` / `x-opencode-session`（§3.9）
-- [ ] **实验 2**：带 dummy `tools` 跑通一次，看清 `tool_calls` 形状（§3.9）
+- [x] **实验 2**：带 dummy `tools` 跑通一次，看清 `tool_calls` 形状（§3.9，**2026-10-19 拿到 `finish_reason:"tool_calls"`**）
+- [x] **实验 2.5（回灌）**：assistant 原样 + `role:"tool"` 回灌一轮 → 200 且模型改用正文（§3.9，**2026-10-19 闭环成立**）
 - [ ] `Message` 类型的决定落定（§3.2 ①）
 - [ ] 工具参数类型的决定落定（§3.2 ②）
 - [ ] `LlmClient` trait 立起来（§3.7）
