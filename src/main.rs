@@ -1,10 +1,39 @@
-use my_agent::config::Config;
+use my_agent::{
+    config::Config,
+    llm::OpencodeGoClient,
+    model::{Message, ToolKind},
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config: Config = Config::from_env()?;
     println!("LLM config : {:?}", config);
 
+    let client = OpencodeGoClient::new("v1-session", &config)?;
+
+    test_loop_chat(&client, "请阅读下scratch/readme.md文件").await?;
+
+    Ok(())
+}
+
+async fn test_loop_chat(client: &OpencodeGoClient, question: &str) -> anyhow::Result<()> {
+    let mut messages = vec![];
+    messages.push(Message::System {
+        content: "你是一个有用的助手。".to_string(),
+    });
+    messages.push(Message::User {
+        content: question.to_string(),
+    });
+
+    let tools = ToolKind::tools();
+
+    let resp = client.chat(&messages, &tools).await?;
+    print!("response is {:?}", resp);
+
+    Ok(())
+}
+
+async fn test_chat(config: &Config) -> anyhow::Result<()> {
     let chat_url = format!("{}/chat/completions", config.llm_base_url);
 
     // for opencode go
@@ -50,7 +79,7 @@ async fn get_chat(
     messages.push(system_prompt);
     messages.push(user_message);
 
-    let fuctions_value = serde_json::json!({
+    let functions_value = serde_json::json!({
         "type" : "function",
         "function" : {
             "name" : "read_file",
@@ -65,7 +94,7 @@ async fn get_chat(
         }
     });
 
-    let tools = vec![fuctions_value];
+    let tools = vec![functions_value];
 
     let json_value = serde_json::json!({
         "model" : llm_model,
