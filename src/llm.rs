@@ -1,5 +1,4 @@
 use serde::Serialize;
-use serde_json::Value;
 use std::fmt::Debug;
 
 use crate::{
@@ -66,10 +65,16 @@ impl OpencodeGoClient {
             .send()
             .await?;
 
-        println!("res is \n{:?}", resp);
         let status = resp.status();
         let body = resp.text().await?;
-        println!("status = {status}\nbody = {body}");
+
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "status is {:?}\nbody is {}\n",
+                status,
+                body
+            ));
+        }
 
         let chat_response: ChatResponse = serde_json::from_str(&body)?;
         Ok(chat_response)

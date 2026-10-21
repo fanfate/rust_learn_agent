@@ -125,7 +125,7 @@ Python 改一行 prompt 直接跑；Rust 要等编译，还要跟所有权较劲
 | §3.4 / 3.4.1–3.4.14 | **协议备忘**：`tool_calls` 解剖 · serde 四种 tag 策略 · `arguments` 为何是字符串 · **两层建模** · 请求侧 ≠ 响应侧 · `type` 是判别标签（还有 `custom`）· `#[serde(default)]` 精确语义 · **`tools` 单一来源 / 注册表三级** · **注册表与执行层两个 enum** · **字段用 `&'static str` 还是 `String`** · **`args` 交给 Args struct 解析（别 untagged）** · **Args struct 成本核算（7 处改动 / 2 处静默）** · **`content` 不是处处可选（`user:null` 会幻觉）** · **请求/响应体缺什么** | 写 `model.rs` / `llm.rs` 时的主要依据 |
 | §3.5 | 安全边界：scratch 是**沙箱根**（执行点 + 靶场 + 一次性） | 落地工具实现前必读 |
 | §3.6 | 验收标准：比的不是功能数，是可靠性 | 定义"V0 做完了" |
-| §3.7 / 3.7.1–3.7.6 | 工程化分档 · 错误策略分层（**可以 panic / 绝不可 panic**）· **`LlmClient` 什么时候抽（跑通后抽，先留缝）** · **`Config` 字段归谁 + api_key 必须走 `bearer_auth`（自动 `Sensitive`）** · **「用接口」vs「用 JSON 拼」是两件事** · **`Debug` 写不写（手写 / newtype / 不实现；`unwrap` 不受影响）** · **`chat()` 收参数列表还是 `ChatRequest`** | 决定某项要不要在 V0 做；写错误类型时；写循环/client 时 |
+| §3.7 / 3.7.1–3.7.6 | 工程化分档 · 错误策略分层（**可以 panic / 绝不可 panic**）· **`LlmClient` 什么时候抽（跑通后抽，先留缝）** · **`Config` 字段归谁 + api_key 必须走 `bearer_auth`（自动 `Sensitive`）** · **「用接口」vs「用 JSON 拼」是两件事** · **`Debug` 写不写（手写 / newtype / 不实现；`unwrap` 不受影响）** · **`chat()` 收参数列表还是 `ChatRequest`** · **循环要不要写成状态机（判据：一条出边就不算状态）** | 决定某项要不要在 V0 做；写错误类型时；写循环/client 时 |
 | §3.8 | 要自答的 4 个问题（空 `tool_calls` vs 纯文本、`Err` 怎么回灌、白名单怎么不靠字符串判断、上下文何时撑爆） | 动手前过一遍，仍然有效 |
 | §3.9 | 第一动作 → **实验 1 / 2 / 2.5 的完整报文** · provider 两条私有 header · 请求侧 `FunctionDecl` | **写类型前先回来核对真实报文**，别凭记忆 |
 

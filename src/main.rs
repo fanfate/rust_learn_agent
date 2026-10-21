@@ -2,16 +2,22 @@ use my_agent::{
     config::Config,
     llm::OpencodeGoClient,
     model::{Message, ToolKind},
+    tool::list_files,
+    tool::read_file,
 };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config: Config = Config::from_env()?;
-    println!("LLM config : {:?}", config);
+    // let config: Config = Config::from_env()?;
+    // println!("LLM config : {:?}", config);
+    //
+    // let client = OpencodeGoClient::new("v1-session", &config)?;
+    //
+    // test_loop_chat(&client, "请阅读下scratch/readme.md文件").await?;
 
-    let client = OpencodeGoClient::new("v1-session", &config)?;
+    println!("read plan is {}", &read_file("plan.md")?[0..20]);
 
-    test_loop_chat(&client, "请阅读下scratch/readme.md文件").await?;
+    println!("list files is {}", list_files("src/")?);
 
     Ok(())
 }

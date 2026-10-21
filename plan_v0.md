@@ -1707,6 +1707,51 @@ Agent 能 `write_file` + `run_command`，等于把「任意文件写入 + 任意
 - **工具白名单**，不做万能 shell；命令限定在 `cargo check` / `cargo test` 这类
 - **工具输出截断**，别把整个文件塞回上下文
 
+#### 工具实现层：三条横切关注点应该只有一处（2026-10-21，评审 `read_file`/`list_files` 后）
+
+`read_file` / `list_files` / `write_file` / `run_command` 里**每个都要做**三件事：
+**① 路径沙箱检查 ② 输出截断 ③ 分派**。如果写在各自的函数里，加第 4 个工具时忘一次就漏一次
+（同 §3.4.8「`tools` 单一来源」那条道理：**能靠结构保证的，别靠记性**）。
+
+推荐：把它们收进**一个** `impl Invocation { pub fn invoke(&self) -> anyhow::Result<String> }`，
+**写在 `tool.rs`（执行层），不能写回 `model.rs`**：
+
+- **依赖方向**：执行层可以认识协议类型，协议层不该认识执行 —— 同 §3.4.9「`Invocation::parse` 而不是 `ToolKind::parse`」。
+- **所有权**：`match &self` 拿到 `&ReadFileArg`，`&str` 直接可用，**一次 move 都不需要**
+  （正是 §3.7.2 那个 `Turn<'a>` 借用问题的正解：执行只需要借，不需要拥有）。
+- **不加 `async`**：V0 的四个工具全是阻塞 IO，CLI 里只有一个任务，占一个 worker 无所谓；
+  V1 要并发调工具时再换 `tokio::fs` / `spawn_blocking`。
+
+⚠️ **工具输出必须确定性（实测 2026-10-21）**：`fs::read_dir` **不保证任何顺序**，NTFS 按**不区分大小写**的
+索引序返回：
+
+```
+read_dir 原始序 : ["apple.txt", "Beta.txt", "Zebra.txt", "_x.txt", "中文.txt"]
+sort() 之后     : ["Beta.txt", "Zebra.txt", "_x.txt", "apple.txt", "中文.txt"]
+两者相同吗      : false
+```
+
+Linux ext4 是 hash 序，跨机器更不一致。后果不是"看着乱"，而是**同一目录两次运行给模型不同的 context**
+⇒ 回答不稳定 + prompt cache 命中率掉（MCP 硬要求 `tools/list` 确定性顺序，理由是同一个）。加一行 `sort()`
+即可；**要的不是"符合人类排序"，是"每次一样"**。同理 `Path::to_str()` 失败时若 `if let` 静默跳过，
+那个文件在列表里凭空消失（而 `read_file` 对同一路径会报错）。
+
+**非 UTF-8 路径怎么办（2026-10-21 实测）**：三种转换不是"好/坏"，是失败语义不同：
+
+| 调用 | 输入 | 输出 | 失败时 | 丢信息 |
+|---|---|---|---|---|
+| `OsStr::to_str()` | `&OsStr` | `Option<&str>` | `None` | 不丢（值还在） |
+| `OsStr::to_string_lossy()` | `&OsStr` | `Cow<str>`（合法时 `Borrowed`，零分配） | 替换成 `U+FFFD` | **丢了，不可逆** |
+| `OsString::into_string()` | **`OsString`（消耗）** | `Result<String, OsString>` | `Err` 里**原值还给你** | 不丢 |
+
+实测（Windows，孤立代理 `0xD800`）：`OsStr` 内部是 **WTF-8**，非法码元存成 3 字节 `ED A0 80`；
+`to_string_lossy` 把它换成 `EF BF BD`（`U+FFFD`）⇒ 字节不同、**原路径再也打不开**；
+`into_string()` 的 `Err` 分支仍持有原值（`as_encoded_bytes() == 原始字节`，逐字节相同）。
+
+⇒ `list_files` 里 `entry.path()` 本来就是 **owned 的 `PathBuf`**，走 `.into_os_string().into_string()`
+不额外花钱且**无损**；`Err` 再降级成 lossy 并**显式标注**（如 `… （非 UTF-8，可能打不开）`）。
+**核心要求不是选哪个，是"不许静默"** —— 对模型来说，"有个文件但名字读不出来" 和 "没有这个文件" 是两条完全不同的信息。
+
 ### 3.6 验收标准
 
 **功能**：在 scratch 里放一段编译不过的代码（用 `my_api` 的副本），对 agent 说"让它通过编译"，它自主完成
@@ -1796,6 +1841,47 @@ V0 第一步根本不知道会失败几次、都有哪些形态（DNS 错 / 401 
   与并行跑的测试互撞）。凡是依赖全局态的函数都难可靠测试 ——
   **这才是"依赖注入"（§3.3.2 的 `from_map`）的真实动机**，不是什么优雅癖。
 
+#### ⚠️ anyhow 不是"万能错误类型"（2026-10-21，用户报 E0308 后实测）
+
+**报错**：`expected Result<String, anyhow::Error>, found Result<String, std::io::Error>`
+出现在 `pub fn read_file(path: &str) -> anyhow::Result<String> { fs::read_to_string(path) }`。
+
+**根因：`From` 只在 `?` 处触发，函数返回值是精确类型匹配。** 这三处**都不会**转换：
+
+| 位置 | 会不会 `From::from` |
+|---|---|
+| `expr?` | ✅ 会（`?` 的语义就是「失败时 `From::from` 后 return」）|
+| 尾表达式 / `return expr` | ❌ 不会，必须与声明类型**逐字相同** |
+| `match` 各分支、闭包体、`unwrap_or_else` 的实参 | ❌ 不会 |
+
+anyhow 的"魔法"只有一条：`impl<E> From<E> for Error where E: StdError + Send + Sync + 'static`
+（`anyhow-1.0.104/src/error.rs:674`）。它是**一个 `From` 实现**，不是超类型关系；
+Rust 没有隐式转换（coercion 只覆盖 `&T`→`&U`、unsize、deref、fn 指针这几种，
+`Result<_, io::Error> → Result<_, anyhow::Error>` 是"改类型参数"，不在其列）。
+
+**三种合法写法，按场景选**：
+
+| 写法 | 什么时候用 |
+|---|---|
+| `Ok(fs::read_to_string(path)?)` | 编译器 `help` 直接给的方案；最小改动 |
+| `fs::read_to_string(path).map_err(anyhow::Error::from)` | 不想多包一层 `Ok`，但也没赚到什么 |
+| **`fs::read_to_string(path).with_context(\|\| format!("读取 {path} 失败"))`** | **推荐给工具实现**：尾表达式直接是 `anyhow::Result`（类型精确匹配），且带上"哪个路径失败"—— 这条信息正是回灌给模型让它自纠的依据 |
+
+**`anyhow::Error` 不实现 `std::error::Error`（实测 E0277）**：
+`fn need<T: std::error::Error>(_: &T)` 传 `&anyhow::Error` 直接编译失败。
+原因是一致的（coherence）：若它 `impl StdError`，上面那条 blanket `From` 就会与 core 的自反
+`impl<T> From<T> for T` 撞车。⇒ 任何 `T: std::error::Error` 的约束**都不接受** `anyhow::Error`。
+
+**三条对循环的直接影响**：
+
+1. 🔴 **`agent.rs` 里对 `ToolError` 用 `?` 是 bug，不是编译错误** —— 它会被 blanket `From` 悄悄收成
+   `anyhow::Error` 然后**中止整轮 agent**，而正确行为是把错误**字符串回灌给模型继续**。
+   编译器不会拦你，这条只能靠记。
+2. **`tool.rs` 用 `anyhow::Result` 可以**（执行失败只需要一段人话），
+   但**协议层错误（未知工具 / 参数坏）必须留在 `ToolError`**，否则"模型能据此自纠"的变体信息被抹平。
+3. **回灌字符串用 `format!("{e:#}")` 而不是 `e.to_string()`**（实测见上：`Display` 只打最外层
+   context，`{:#}` 才是 `外层: 根因` 一条链；`{:?}` 是多行 `Caused by:`）。
+
 ### 3.7.2 `trait LlmClient` 什么时候抽：**跑通之后再抽，但先把缝留好**
 
 **问**：「数据层够了吗？接下来先写循环还是先写 `LlmClient`？」
@@ -1869,6 +1955,46 @@ async fn run_loop<C: LlmClient>(client: &C, cfg: &Config, question: &str) -> any
 - **`for step in 0..max_steps` 比 `loop` + 手动计数安全**：天然不可能死循环，也不用自己维护计数器。
 - **并行的 `tool_calls` 每条都要回一条 `role:"tool"`**（§3.4.3）。漏一条，下一轮请求直接 400 —— 
   这类错误网关会明确报 `tool_call_id`，算幸运的。
+
+#### 循环要不要写成"状态机"（2026-10-21）
+
+**问**：「这个 loop 是不是应该按状态机的写法来？」
+
+**答：它本来就是状态机 —— 但状态是 `Vec<Message>`，不是一个 `enum State`。**
+把状态再抽成一个 enum 是**第三次"两个真相"**（前两次是 `tools` 双写、owned `ChatRequest`）。
+
+**判据一句话：一个状态只有一条出边，它就不该是状态，它该是一行代码。**
+V0 全程只有 **1 个决策点**：拿到 `message` 后分成「Final」/「Tools」两条出边。
+「执行工具」「push 消息」各自只有**唯一**的下一跳 ⇒ 它们是步骤，不是状态。
+一个只有单决策点的状态机，展开后就等于一个 `if`。
+
+**为什么 LangGraph / OpenAI Agents SDK 真有 FSM**：它们要 **checkpoint / interrupt / resume** ——
+状态得能**序列化落盘**、能从"等人批准"那一刻**重启**。本项目 V2 才落库，且那时要存的是
+**消息行 + 游标**（最后一条已处理的下标），不是"阶段名"：`AwaitingApproval` 是可以从
+`messages` 派生的（末尾是带 `tool_calls` 的 assistant，且缺对应的 `tool` 回复）⇒ 存同义词 = 双写。
+
+**四种写法，什么时候用哪种**：
+
+| 写法 | 状态住哪 | 适用 |
+|---|---|---|
+| `for step in 0..max_steps` + `if/else` | `messages` | **V0 选它**：1 个决策点、无中断、不落盘 |
+| 转移函数 + 借用 `enum Turn<'a> { Final(&'a str), Tools(&'a [ToolCall]) }` | `messages` | 想给分支**命名**、想给分类逻辑**单测**时 |
+| `enum State` + `match` 自持转移 | 一个 enum 字段 | 有**"等外部事件"**或**多条出边**（重试/批准/取消） |
+| typestate `Agent<Thinking>` | 类型参数 | **不可能**用于此处：循环次数来自 argv，编译期未知；typestate 只能表达编译期已知的固定序列（builder） |
+
+**实测（两方向都验过）**：借用型 `Turn` 在 `Tools` 分支里"先 `collect` 结果、再 `push(msg)`"**能编译**
+（NLL：`calls` 最后一次使用后借用即结束）；一旦 `push` 之后再碰 `calls` →
+`error[E0505]: cannot move out of 'msg' because it is borrowed`，且编译器会建议"给 `Msg` 实现 `Clone` 就能过"——
+**那条建议正是要避免的浪费**。⇒ 借用 enum 可用，但 V0 里 `if msg.tool_calls.is_empty()` 更短、且不贴着 E0505 的边。
+
+两个容易写错的地方：
+
+- **别拿 `finish_reason` 当转移条件**。它不参与控制流（§3.4.14），判据永远是 `tool_calls` 是否为空 ——
+  各家 provider 在"有 tool_calls"时也可能报 `stop`。
+- **`max_steps` 不是状态**，它是 fold 的次数上限，对应 `Iterator::take`。
+
+**什么时候再回来改**：V1 出现"等外部事件"（流式半成品 / 人工确认 / Ctrl-C 取消），
+或者给网络错误加"退避重试 vs 放弃"（**两条出边**）—— 那时才配一个 `enum State`。
 
 ### 3.7.3 `Config` 的字段归谁：client / `ChatRequest` / loop
 
@@ -2517,7 +2643,8 @@ loop {
 - [ ] 循环接上：`tool_calls` 非空 → 执行 → 回灌 → 继续（**§3.7.2** 六分支表；`client` 从参数进来、返回值不出现 `reqwest` 类型）
 - [ ] 终止条件 + 步骤上限（防死循环；用 `for step in 0..max_steps`）
 - [ ] `LlmClient` trait 立起来 —— **排在循环跑通之后**，签名从实际代码抄（§3.7.2）
-- [ ] 4 个工具实现：`list_files` / `read_file` / `write_file` / `run_command`
+- [ ] 4 个工具实现：`list_files` / `read_file` 🟡（2/4 已写，2026-10-21：`read_file` 用 `.with_context` ✔ / `list_files` 用 `_list_files` 内层 + 外层 context ✔；**待补**：`sort()` 确定序、`to_string_lossy` 别静默丢项、`join` 代替 `fold+format!`、截断、沙箱） / `write_file` / `run_command`
+- [ ] `impl Invocation { fn invoke(&self) -> anyhow::Result<String> }` 放 **`tool.rs`**（执行层认识协议、协议层不认识执行；`match &self` 免 move），里面按序做「沙箱 → 分派 → 截断」（**§3.5**，2026-10-21 新增）
 - [ ] 安全边界落地：scratch 目录 + 写/shell 确认 + 命令白名单 + 输出截断
 - [ ] 自答 §3.8 的 4 个问题
 - [ ] **验收**：拿 `my_api` 副本跑通一次真实修复（§3.6）
