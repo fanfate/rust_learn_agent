@@ -41,6 +41,15 @@
   **真实 200 跑通，`finish_reason:"tool_calls"`、`read_file{"path":"scratch/readme.md"}` 解析进类型**。
   **下一个动作 = 循环**（先补 3 处小债：删 `to_value` 二段序列化 / 先判状态码 / 删 `ChatRequest` 与 `main.rs` 旧探针），
   然后 4 个真工具 + `max_steps`。
+- ✅ **循环已跑通（2026-10-22）**：`agent.rs::run_agent` —— `for step in 1..=max_steps` + 六分支 + 工具结果/错误
+  **回灌**（`Error: {e:#}`）+ `tool_calls` 为空即收尾。`tool.rs` 已有 `Executor{root,max_bytes}` 不变量载体、
+  `resolve_in`（canon + `starts_with`，**返回 PathBuf 供 IO 直接使用**）、`truncates`（字符边界回退 + 总大小报告）。
+  真实任务跑通两轮：`list_files(".")` → `read_file("readme.md")` → 收尾。
+  **实测「缺工具」任务（改名）暴露的四条**见 `plan_v0.md` §3.7.2 末 —— 核心是
+  **`write_file` 已在 `ALL` 里但 `raw_invoke` 走 `_ => bail!`** ⇒ 模型看得见却调不通，白烧 2 步；
+  以及**步数用尽时模型想说的结论会丢**（V1 需补一次 `tool_choice:"none"` 收尾）。
+  **下一个动作 = ① 把 `ALL` 缩到 read/list（或立刻实现 `write_file`）② 日志从 `read_file`/`list_files`
+  内部挪到 `Executor::run` ③ 补 `truncates` / `resolve_in` 两条单测。**
 
 ---
 

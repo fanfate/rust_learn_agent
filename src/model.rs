@@ -149,7 +149,7 @@ impl ToolKind {
         match self {
             ToolKind::ReadFile => FunctionDecl {
                 name: "read_file",
-                description: "读取文件内容",
+                description: "读取文件内容，路径相对沙箱根目录",
                 parameters: serde_json::json!({
                 "type": "object",
                 "properties": { "path": { "type": "string" } },
@@ -160,7 +160,7 @@ impl ToolKind {
             },
             ToolKind::ListFiles => FunctionDecl {
                 name: "list_files",
-                description: "列出路径下的所有文件",
+                description: "列出路径下的所有文件，路径相对沙箱根目录，前缀DIR代表路径，FILE代表文件",
                 parameters: serde_json::json!({
                 "type": "object",
                 "properties": { "path": { "type": "string" } },
@@ -171,7 +171,7 @@ impl ToolKind {
             },
             ToolKind::WriteFile => FunctionDecl {
                 name: "write_file",
-                description: "写入文件内容",
+                description: "写入文件内容，路径相对沙箱根目录",
                 parameters: serde_json::json!({
                 "type": "object",
                 "properties": { "path": { "type": "string" }, "content" : { "type" : "string" } },

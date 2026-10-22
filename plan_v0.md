@@ -1752,6 +1752,359 @@ Linux ext4 是 hash 序，跨机器更不一致。后果不是"看着乱"，而�
 不额外花钱且**无损**；`Err` 再降级成 lossy 并**显式标注**（如 `… （非 UTF-8，可能打不开）`）。
 **核心要求不是选哪个，是"不许静默"** —— 对模型来说，"有个文件但名字读不出来" 和 "没有这个文件" 是两条完全不同的信息。
 
+#### 决策：先打通循环，工具层只保留「一处分派」（2026-10-22）
+
+用户问：*"工具方面先这样，先考虑打通的问题？现在这两个 Tool 也并没有修改的能力所以应该不会造成危害"*。
+
+**结论：同意先打通，但"没危害"这个理由要换掉** —— 它成立得不完整，有两条真实代价在打通第一天就会撞上：
+
+| 直觉中的风险 | 真实情况 |
+|---|---|
+| 「只读工具不会改坏文件」 | ✅ 成立。V0 的失败模式是**浪费一次请求**，不是数据丢失 |
+| 「所以可以不管安全边界」 | ❌ **`read_file(".env")` 是通的**（CWD 就是 `my_agent`）⇒ key 进了 `messages`、进了每一次请求、进了你贴出来的日志。**这不是"改坏"，是泄漏**，而且不会报错 |
+| 「所以也不急着截断」 | ❌ `plan_v0.md` 现在 2600+ 行 ≈ 100 KB ≈ 3 万 token。模型一次 `read_file("plan_v0.md")` 就吃掉大半上下文 ⇒ 后续 400 或答案质量塌陷 |
+
+但**代价极小**：这两件加起来 ≈ 20 行，而且 `truncates` 已经写好了。所以顺序是
+**「写 `invoke`（沙箱 + 分派 + 截断三行）→ 立刻写循环」**，不是「先跳过它们」。
+
+**真正可以推后的是这些**（都不影响"打通"这件事本身）：
+`write_file` / `run_command` 的**人工确认**（工具都还没实现）· `run_command` 的 head+tail 策略 ·
+错误分类细化 · `trait Tool` 抽象 · 每工具独立上限 · 精确到行的截断报告。
+
+🔴 **现有 `tool.rs::truncates` 有一个必 panic 的分支（2026-10-22 实测）**：
+```rust
+let mut end = max_bytes;
+if let Some(pos) = text.as_bytes()[..end].iter().rposition(|&b| b == b'\n') {
+    end = pos + 1;          // 找到换行：end 是 ASCII 位置，永远合法
+}
+text[..end].to_string()     // ← 没找到换行时 end 仍是 max_bytes，可能落在字符内部
+```
+
+```
+[有换行]        原 10892 字节 -> 8186 字节, 以换行结尾=true
+[无换行中文]    PANIC: end byte index 8192 is not a char boundary;
+                       it is inside '中' (bytes 8190..8193 of string)
+[8190 是 3 的倍数] OK, 8190 字节      ← 陷阱：换个上限值就"看起来没问题"
+```
+
+触发条件 = **整份文件没有 `\n`（或第一行就超 8KB）+ 中文/emoji**。真实场景：压缩后的 JSON、minified JS、
+单个巨大 base64。最后一行实测很关键 —— **它证明这个 bug 会随上限数值时隐时现**，所以"我手动试过一次没崩"不算验证。
+修法就是补回退：
+
+```rust
+while !text.is_char_boundary(end) { end -= 1; }   // 最多退 3 次，0 必然是边界
+```
+
+另外两条顺手要改的（不阻塞打通，但一起做更省事）：
+
+- **截断结果要自解释**：`…（已截断，共 1240 行 / 96 KB）`。同"空目录"那条道理 —— 模型会把"只有 8KB"当成"文件就这么长"。
+- **签名改成吃 owned `String`**：`fn truncate(mut s: String, max_bytes: usize) -> String`，
+  算出 `end` 后 `s.truncate(end)` **原地零分配**；现在 `&str -> String` 等于把前 8KB 再整串拷一遍。
+  （`raw_invoke()` 返回的本来就是 owned，天然匹配。）
+
+#### `invoke` / `raw_invoke` 都写成 `impl Invocation` 的方法？（2026-10-22，实测）
+
+问：横切层和分派层是不是都该挂在 `impl Invocation` 上。**答：位置可以，但可见性必须不同 —— 这是唯一有编译器保证的一条。**
+
+```rust
+impl Invocation {                      // 写在 tool.rs
+    pub fn invoke(&self, sandbox: &Path, max_bytes: usize) -> anyhow::Result<String> { .. }
+    fn raw_invoke(&self) -> anyhow::Result<String> { .. }     // ← 不带 pub
+}
+```
+
+实测（`.probe_impl/`，已删）：
+
+| `raw_invoke` 的可见性 | `agent.rs` 里调 `i.raw_invoke()` |
+|---|---|
+| `fn`（私有） | `error[E0624]: method 'raw_invoke' is private` ✅ |
+| `pub(crate)` | **编译通过** ❌ 沙箱形同虚设 |
+
+⇒ **`raw_invoke` 绝不能 `pub(crate)`**。它不是"内部辅助函数"，它是**绕过所有横切约束的后门**；`pub(crate)` 在别处看起来无害，在这里等于把沙箱拆了。
+
+**跨模块 inherent impl 合法**（`Invocation` 定义在 `model.rs`、实现写在 `tool.rs`，同 crate 任意模块都行，可分散成多个 `impl` 块，已实测）。代价：在 `model.rs` 读 enum 定义时看不到它有哪些方法，跳转定义要跳两次。这个代价正是"依赖方向"要付的 —— 反过来把 `invoke` 写回 `model.rs` 才是真错（协议层认识执行层）。
+
+**但"能不能挂方法"和"该不该"是两件事，判据是这个层有没有外部状态**：
+
+| 层 | 依赖 | 形状 |
+|---|---|---|
+| 分派层 `raw_invoke` | 只有 `self`（`match &self` 就知道调谁） | **天生的方法** |
+| 横切层 `invoke` | `self` + `sandbox` + `max_bytes`（**从外面传进来的执行策略**） | 方法可以，但已经有点勉强 |
+
+横切层的参数是"执行策略"，不是 `Invocation` 的固有属性 —— 同一个 `Invocation` 在不同 sandbox 下合法/非法。**一旦参数涨到第三个（`allow_write` / `dry_run` / 人工确认），就该收成一个 `Executor`/`Policy` struct**，那时 `invoke` 搬到它身上：
+
+```rust
+struct Executor<'a> { sandbox: &'a Path, max_bytes: usize }
+impl Executor<'_> { fn run(&self, inv: &Invocation) -> anyhow::Result<String> { .. } }
+```
+
+V0 两个参数、一个调用点，为它多一个 struct 不值（同 §3.2.3：闭合集合、四个工具，别提前上 trait/装饰器）。
+
+**沙箱检查需要 per-variant 的"这次会碰哪些路径"**，那是各变体自己的知识，所以 `match self` 要写在横切层里（`check_paths` 第一行），漏臂编译器报 E0004。**别给 `Invocation` 加 `fn path(&self) -> &str` 这种统一 getter** —— 它假设"每个工具恰好只有一个待读写路径"，而 `run_command` 有 cwd 却没有文件；`WriteFile` 还要检查**父目录**（`canonicalize` 要求路径存在，见下）。
+
+#### 路径用相对还是绝对？沙箱检查用哪个（2026-10-22，实测）
+
+**两层不同形式，转换只发生在 `invoke` 一处**：
+
+| 层 | 形式 | 为什么 |
+|---|---|---|
+| **接口层**（模型看到、模型传的） | **相对沙箱根** | 闭环 + 可重放 |
+| **检查层**（沙箱内部） | **绝对 + `canonicalize` 过** | 唯一能可靠比较的形式 |
+
+接口层用相对的三个理由：
+
+1. **闭环自洽**：`list_files(".")` 的输出就是模型能原样回传给 `read_file` 的路径。若输出绝对路径，模型要抄一长串 `D:\WorkSpace\rust\rust\web_learn\my_agent\scratch\...`，抄错、浪费 token，而且下一次 `list_files` 又给一遍。
+2. **历史可重放**：context 里一旦出现宿主机绝对路径，换目录/换机器后同一段历史就不可重放，prompt cache 也不同。
+3. **少泄漏环境**（用户名目录等）。
+
+⚠️ **但不能靠"拒绝绝对路径"来保证安全**。安全只能靠 `canonicalize + starts_with`。V0 建议**接受**绝对路径、但必须落在沙箱内 —— 模型有时会从系统提示/错误信息里学到绝对路径，直接拒会让它陷入试错循环。
+
+**检查层四条实测铁律**（`.probe_path/`，已删，Windows）：
+
+```
+canonicalize("sb")            = "\\?\D:\...\sb"          ← ① 带 verbatim 前缀
+raw_abs                       = "D:\...\sb"
+raw_abs == sandbox            = false
+sandbox.starts_with(raw_abs)  = false                    ← ② 一边 canon 一边不 canon 必失败
+```
+
+① **`\\?\` 前缀是 Windows 上 `canonicalize` 的固定产物**，对 `read_to_string` 透明（实测能直接读）。别去 strip 它，两边都带就一致。
+② **必须两边都 `canonicalize`**。混着比一定 `false` —— 这是最阴的坑，因为代码看起来完全正确。
+③ **`Path::starts_with` 逐字节比较、不折叠大小写**：`D:\WORKSPACE\...`.starts_with(`D:\WorkSpace\...`) = `false`。但 canon 会解析并归一成**真实大小写**（实测 `canon("SB/Sub/../A.TXT")` → `...\sb\a.txt`），所以两边都 canon 就一致。
+④ **组件比较没有字符串前缀陷阱**：`sb2`.starts_with(`sb`) = `false`（`/a/b` vs `/a/bc` 那条老坑在这里天然不成立，因为 `Path` 按分量比）。
+
+🔴 **`Path::join` 遇到绝对路径会静默替换整个路径**（Rust 既定语义）：
+
+```
+Path::new("sb").join("D:\\Windows")     = "D:\\Windows"      ← 绝对路径 → 直接替换
+Path::new("sb").join("\\Windows")       = "\\Windows"        ← 根相对 → 也替换
+Path::new("sb").join("../../outside.txt")= "sb\\../../outside.txt"   ← .. 保留，canon 时才解
+Path::new("sb").join(".")               = "sb\\."            ← 所以 list_files(".") 会带 "./" 前缀
+```
+
+⇒ **`sandbox.join(model_path)` 本身不提供任何保护**。顺序必须是 **join → canon → starts_with**，一步都不能省。
+
+**分工具策略**（`canonicalize` 要求路径存在）：
+
+| 工具 | 目标存在？ | 检查方式 |
+|---|---|---|
+| `read_file` / `list_files` | 必须存在 | target `canon` → `starts_with(root)` |
+| `write_file` | **可能不存在** | **父目录 `canon` → `starts_with`**，文件名单独校验（不含分隔符、不是 `.`/`..`） |
+| `run_command` | 不管路径 | 命令白名单，另说 |
+
+**`list_files` 的输出天然是相对路径**：`entry.path()` = `join(传入的 path, name)`，传入的是沙箱相对 ⇒ 输出也是沙箱相对，模型可直接回传 ✅。（`list_files(".")` 会产出 `./a.txt`，剥掉 `./` 前缀更干净。）
+
+**由此改判：`Executor` 现在就该建**（推翻上一轮"两个参数不值一个 struct"）。理由换了 —— 不是"参数个数涨了"，而是 **`root` 必须是"已 canon 的"这条不变量需要一个载体**：
+
+```rust
+struct Executor { root: PathBuf, max_bytes: usize }   // root 在 new() 里 canon 一次
+impl Executor {
+    fn run(&self, inv: &Invocation) -> anyhow::Result<String> {
+        // ① 校验（match self 在 Invocation 侧，见上节）
+        // ② inv.raw_invoke()  —— 私有分派，仍在 impl Invocation
+        // ③ truncate(raw, self.max_bytes)
+    }
+}
+```
+
+`invoke(&self, sandbox: &Path)` 收裸 `&Path` 的话，"它已 canon 吗"全靠调用方记性 ⇒ 和 §3.5 的主题（能靠结构保证的别靠记性）直接冲突。这也顺带解决了"参数迟早涨到三个"。
+
+`raw_invoke` 依然留在 `impl Invocation`（私有，见上节），横切层归 `Executor` —— 两层的归属本来就不同，只是 V0 之前凑在一个方法里。
+
+#### 🔴 校验函数必须**返回**要用的路径，不能返回 `()`（2026-10-22，用户质疑"是否会修改参数"）
+
+用户问：对 target 做 canon 再 `starts_with`，"是否会修改参数？"**—— 问到点子上了：`&self` 改不了参数，但这恰恰是危险的来源。**
+
+先回答字面问题：
+
+- **不修改 `Invocation` 里的字段**：`raw_invoke(&self, ..)` 是 `&self`，本来也改不了；而且 `Invocation` 是协议层数据，执行层不该回写（同 §3.4.4「执行层只在执行那一刻存在」）。
+- **但必须让实际 IO 使用 canon 之后那个值**。canon 结果作为**局部变量 / 返回值**流动，不落回数据结构。
+
+**如果写成"先统一预检、再分派执行"，就是经典的"检查 A、使用 B"**：
+
+```rust
+self.check_paths(root)?;                     // 检查 root/a.txt → 通过
+match self { Invocation::ReadFile(a) => read_file(&a.path) }   // ← 用的是 "a.txt"，相对 CWD 解析
+```
+
+实测（`.probe_chk/`，已删：CWD 放一份 `a.txt`、`sb/` 里放另一份内容不同的 `a.txt`）：
+
+```
+检查的路径 = \\?\D:\...\.probe_chk\sb\a.txt
+实际读的   = \\?\D:\...\.probe_chk\a.txt          ← 相对 CWD，不是沙箱
+是同一个吗 = false
+read_to_string(模型给的 "a.txt") = Ok("CWD 里的 a.txt")
+read_to_string(检查过的路径)     = Ok("沙箱里的 a.txt")
+```
+
+**这不是理论问题**：V0 里 CWD = `my_agent`，root = `my_agent/scratch`，两者天然不同 ⇒ 每一个相对路径都会读错文件，且**沙箱检查全部通过**（检查的是 scratch 里的，读的是 CWD 里的）。更糟的是这个 bug 在"CWD 恰好等于 root"的测试里永远看不见。
+
+⇒ **定案：`check_paths(&self) -> Result<()>` 这种预检式写法不要用**，改成**返回式**：
+
+```rust
+fn resolve_in(root: &Path, user_path: &str) -> anyhow::Result<PathBuf> {
+    let target = if Path::new(user_path).is_absolute() { user_path.into() } else { root.join(user_path) };
+    let canon = std::fs::canonicalize(&target)?;      // 解 ..、符号链接、大小写归一、加 \\?\ 前缀
+    if !canon.starts_with(root) { bail!("路径越界: {user_path}"); }
+    Ok(canon)                                          // ← 返回的就是要用的值
+}
+
+impl Invocation {
+    fn raw_invoke(&self, root: &Path) -> anyhow::Result<String> {
+        match self {
+            Invocation::ReadFile(a) => { let p = resolve_in(root, &a.path)?; read_file(&p) }
+            Invocation::ListFiles(a) => { let p = resolve_in(root, &a.path)?; list_files(&p) }
+        }
+    }
+}
+```
+
+**判据（可复用到任何安全场景）：校验函数的输出必须是后续真正被使用的那个值，而不是一个 `bool`/`()`。** 返回 `()` 的 `check_*` 把"再拼一次路径"的机会留给调用方，而那次拼接就是漏洞本身。
+
+顺带两条：
+
+- **`read_file` / `list_files` 建议改成收 `&Path`**：`resolve_in` 返回 `PathBuf`，`&str` 还得 `to_str()` 多转一次；而且 `&Path` 能表示**非 UTF-8 路径**（之前"非 UTF-8 名字永远打不开"的限制就此解除 —— 模型侧仍是 `String`，但链路内部不再人为加一道限制）。
+- **`list_files` 不需要 `root` 参数，也不需要 `strip_prefix`**：`DirEntry::path()` 的定义就是 `dir.join(file_name())`（std 文档原话），所以 **`entry.file_name()` 已经就是"剥掉 `dir` 那一段"的结果**，与 `full.strip_prefix(&dir)` **逐项相等**（2026-10-22 实测）。
+  即：`root` 只该出现在 `raw_invoke`（做 `resolve_in`，安全职责），不该出现在 `list_files`（做 IO）。
+  ```
+  path()       = "\\?\D:\...\sb\a.txt"
+  file_name()  = "a.txt"
+  strip_prefix = "a.txt"          两者相等 = true
+  path()       = "\\?\D:\...\sb\sub"
+  file_name()  = "sub"            是目录 = true     ← entry.file_type() 免费给出类型
+  ```
+  顺带：**`entry.file_type()` 能区分目录/文件且不需要额外 `stat`**（Unix 上 dirent 自带 `d_type`，未知时 std 才 fallback）。输出里给目录加 `/` 后缀，模型就不会对着目录调 `read_file` 白烧一轮。参考实现 MCP filesystem 的 `list_directory` 正是这个形状：`[DIR] name` / `[FILE] name`，**只有名字，没有全路径**。
+- `Executor` 就退化成 `{ root, max_bytes }` + 转调，`run` 里只剩 `raw_invoke` → `truncate` 两行。这反而更干净：**横切层是"包一层"，校验层是"每臂自己 resolve"**，因为路径是 per-variant 的知识。
+
+#### 参数归属：一个参数只服务一件事（2026-10-22）
+
+| 函数 | 收什么 | 为什么 |
+|---|---|---|
+| `Invocation::raw_invoke(&self, root)` | **root** | 每臂先 `resolve_in(root, &args.path)?` |
+| `read_file(&Path)` | resolve 后的绝对路径 | 纯 IO，不认识沙箱 |
+| `list_files(&Path)` | resolve 后的目录 | 纯 IO；条目名靠 `entry.file_name()` |
+
+判据：**收 `root` 的那个函数必须是"做安全检查"的，不能是"做 IO"的**。写成 `list_files(root, dir)` 等于让 IO 函数知道沙箱边界，代价有两个：① 加第二个调用点（不带沙箱的单测）就得伪造一个 root；② 两个参数里的 `dir` 必须是 `root` 派生出来的，这个不变量没人强制。而 `file_name()` 把它变成"结构上不需要"。
+
+**实测：`entry.path()` vs `entry.file_name()` 的输出差（2026-10-22，`scratch/` 只有 `readme.md`）**
+
+```
+[FILE] \\?\D:\WorkSpace\rust\rust\web_learn\my_agent\scratch\readme.md     70 字节
+[FILE] readme.md                                                            16 字节
+```
+
+4.4 倍，而且这还是**单文件目录**；8 个文件的目录会多出 400~500 字节，全是同一个前缀。JSON 里每个 `\` 还要转义成 `\\`，实际 token 消耗再涨一截。三个后果：
+
+1. **`\\?\` 是 Windows 内部形式，模型不认识**。实测它能被回传并跑通（`is_absolute() = true`、`canonicalize` 成功），所以不是功能坏掉，是**纯粹的浪费 + 困惑**。
+2. **历史不可重放**：context 里带上宿主机绝对路径，换目录/换机器同一段历史就失效，prompt cache 也跟着掉。
+3. 和「接口层用相对路径」的定案直接冲突 —— 上一轮刚定的，这里漏了。
+
+**注意排序键**：`files.sort()` 作用在 `format!("[{t}] {name}")` 上时，`[DIR]` < `[FILE]` ⇒ **目录天然排前面**，组内再按名字。这个效果不错，但它是渲染顺序的副产品 —— 如果要按 name 排再渲染，就得显式排 `(is_dir, name)` 元组，否则目录和文件会混在一起。
+
+#### 调研：主流 agent 怎么处理工具路径（2026-10-22，外部资料）
+
+用户要求「调研常见 agent 做法，而非自己在这里改来改去」。查了 6 个实现（含源码/官方文档）：
+
+| 实现 | 工具收的路径 | 检查方式 | 检查后返回什么 | 安全边界放在哪 |
+|---|---|---|---|---|
+| **MCP filesystem server**（参考实现，`src/filesystem/lib.ts::validatePath`） | 相对**和**绝对都收；相对路径**在每个 allowed dir 下逐一 `path.resolve`，取第一个落在白名单内的** | `normalizePath` → `isPathWithinAllowedDirectories`（前缀判断）→ `fs.realpath` 后**再检查一次** | **返回 `realPath`**，后续所有 IO 都用它 | 路径白名单（多根） |
+| **Claude Code**（官方 permissions 文档） | 两者都收；规则里四种前缀：`//path` 绝对、`~/path` home、`/path` **相对 settings 来源**、`path` 相对 cwd | 权限规则（gitignore 语法）+ 工作目录 + `additionalDirectories`；**symlink 检两个路径**：请求路径 + 解析目标 | 官方原文：工具打开文件时「**confirms that the path still resolves to the location the permission check approved**」 | 路径白名单 + 可选 OS 沙箱 |
+| **OpenAI Codex CLI**（`codex-rs/core/src/safety.rs`） | 相对 cwd；`writable_roots` 配绝对 | `assess_patch_safety` → `AutoApprove / AskUser / Reject`；逐 target `can_write_path` | 判定结果（不是路径），真正执行仍走沙箱 | **OS 级沙箱**（bubblewrap / seatbelt / landlock）为主 |
+| **Aider** | 交互/提示里**仓库相对**（"in-chat file paths are all relative to the git repo"） | `/add` 检查在 git repo 内 | **内部一律存绝对**（`abs_fnames`、`abs_root_path()`） | 仓库边界 |
+| **Cline** | VS Code 给的绝对 URI；多根用 `@workspace:path` | 默认限制在 workspace 内；`.clineignore` 做访问控制 | 绝对 | workspace 边界 |
+| **SWE-agent / mini-SWE-agent** | **纯相对**（repo 根） | **不做路径检查** | — | **容器**（`cwd: /testbed`） |
+
+**三条共识**（4+ 家一致，可直接照抄）：
+
+1. **内部一律规范化成绝对路径再比较**（MCP `realpath`、Aider `safe_abs_path`、Codex `PathUri`）。没有一家是拿两个字符串直接比的。
+2. **检查通过后，后续 IO 用的是「解析后的那个路径」，不是原始请求串**。MCP 明确 `return realPath`；Claude Code 明确"打开时再确认一次仍是批准的位置"。⇒ **上一节「校验函数要返回路径」是这个行业的标准做法，不是我自己推的。**
+3. **相对路径的基准必须显式定义**。Aider 的历史里就有这个 bug（issue #1080：在子目录启动，`/read /project/server/x` 被拼成 `/project/server/server/x`）—— 基准含糊时必然出现。
+
+**两处分歧，以及我们怎么选**：
+
+| 分歧 | 各家做法 | V0 选择 |
+|---|---|---|
+| 接口收相对还是绝对 | Claude Code/MCP 两者都收；Aider 内部绝对、展示相对；SWE 类纯相对 | **相对沙箱根 + 接受绝对但必须在沙箱内**（= MCP 的做法，且单根不需要"逐一尝试"） |
+| 安全边界放哪 | 路径白名单（MCP/Cline/Aider）vs OS 沙箱（Codex）vs 容器（SWE） | V0 路径白名单；`run_command` 上线时**必须**换 OS 级或白名单命令，理由见下 |
+
+⚠️ **一个必须知道的负面结论（两家官方都写明）**：
+
+- Codex `safety.rs` 注释：*"Even though the patch appears to be constrained to writable paths, it is possible that paths in the patch are **hard links** to files outside the writable roots, so we should still run `apply_patch` in a sandbox"*
+- Claude Code 文档：Read/Edit 规则 *"don't apply to a command that reads files without naming them, such as `grep -r pattern .`"*，也不管 *"arbitrary subprocesses that read or write files indirectly"*
+
+⇒ **路径检查只能约束「我们自己实现的工具」，管不住子进程和硬链接。** 所以：V0 只有 `read_file`/`list_files` 两个自己实现的工具，路径白名单**足够**；一旦上 `run_command`，路径检查就失效了，那时必须靠 OS 沙箱 / 命令白名单 / 容器 —— 这也是 Codex 和 SWE-agent 都跳过路径检查、直接上沙箱的原因。
+
+**一处需要补的细节**：Claude Code 对 symlink 检**两个**路径（请求路径 + 解析目标），allow 规则要求**两者都匹配**。我们只检 canon 后的目标，等价于允许「沙箱外的 symlink 指向沙箱内」。因为模型给的是相对沙箱根的路径（请求路径必然在沙箱内），这个差别在 V0 无实际影响；但要知道它是个已知的宽松点。
+
+#### 参数类型：`&Path`，不是 `PathBuf`（2026-10-22，全链路实测）
+
+**签名**：
+
+```rust
+fn resolve_in(root: &Path, user: &str) -> anyhow::Result<PathBuf>;   // 返回 owned
+pub fn read_file(path: &Path) -> anyhow::Result<String>;             // 只借用
+pub fn list_files(root: &Path, dir: &Path) -> anyhow::Result<String>;
+```
+
+**为什么是 `&Path` 而不是 `PathBuf`**：`resolve_in` 交出的 `PathBuf` 由调用方持有，工具只需要**借用**——收 `PathBuf` 就是按值消耗，函数返回后调用方再也拿不到这个路径（打日志、`strip_prefix`、错误信息都要用它）。`&PathBuf` 会自动 deref 成 `&Path`，所以 `read_file(&p)` 直接可用（实测通过）。
+
+⚠️ **改成 `&Path` 后 `format!` 会挂**：`Path` 没有 `Display`，`format!("读取 {path} 失败")` 编译不过，要用 `path.display()`。这是唯一必须同步改的地方。
+
+实测（`.probe_pb/`，已删，`resolve_in` + `read_file(&Path)` + `list_files` + `strip_prefix` 全链路）：
+
+```
+root = \\?\D:\...\sb
+[read_file(&Path)] Ok("沙箱里的 a.txt")        ← &PathBuf → &Path 自动 deref
+[list_files(".")]   a.txt / sub                ← 注意：没有 "./" 前缀
+[list_files("sub")] sub\b.txt
+[逃逸 ../outside.txt]  Err("路径越界: ../outside.txt")
+[绝对但在内]           true
+```
+
+两个意外收获：
+
+1. **canon 顺带把 `.` 归一了** ⇒ `list_files(".")` 直接输出 `a.txt`，上一轮说的"剥掉 `./` 前缀"这一步**不需要了**（`resolve_in(root, ".")` 的 canon 结果就是 root 本身）。
+2. **`PathBuf::into_string() -> Result<String, PathBuf>` 确实存在**（rustc 1.99 实测，Err 里回的是 `PathBuf` 不是 `OsString`）⇒ `list_files` 里现有那句 `path.into_string().unwrap_or_else(|p| p.to_string_lossy()...)` **不用改**，比 `into_os_string().into_string()` 少一层。
+
+**`resolve_in` 的两种失败必须文案分开**（实测都会发生）：
+
+| 情况 | 现象 | 该报什么 |
+|---|---|---|
+| `canonicalize` 报 ENOENT | 路径不存在 / 父目录不存在 | “读取 `x` 失败: 系统找不到指定的文件” → 模型换路径 |
+| canon 成功但 `starts_with` 失败 | 存在但在沙箱外 | “路径越界: `x`（沙箱根 `root`）” → 模型别试了 |
+
+两者混成一句，模型就会去改一个「本来没错、只是出界」的路径，白烧几轮。
+
+🔴 **但 `canonicalize` 那一支现在连路径都没带**（2026-10-22 实测，`resolve_in` 原样跑）：
+
+```
+[不存在的文件.txt]   系统找不到指定的文件。 (os error 2)      chain = 1
+[../plan.md]        路径越界: ../plan.md                  chain = 1   ← 存在且在沙箱外，正确
+[../.env]           路径越界: ../.env                     chain = 1   ← 同上
+[D:\Windows\win.ini] 系统找不到指定的路径。 (os error 3)      chain = 1
+```
+
+`chain = 1` 说明**整条错误里没有任何"是哪个路径"的信息**。而 `read_file` 里那句 `.with_context(|| format!("读取 {} 失败", ..))` **永远不会触发** —— `resolve_in` 在 `read_file` 之前就失败了，那个 context 挂在更后面的一层。
+
+更要紧的是模型的反应：只有一个 `os error 2`，它不知道是路径写错、还是目录不对、还是文件被删 —— 只能瞎试。修法是一行：
+
+```rust
+let canon = std::fs::canonicalize(&target)
+    .with_context(|| format!("无法解析路径 {p}（沙箱根 {}；可用 list_files \"\" 查看目录）", root.display()))?;
+```
+
+对照实测（加了 context 之后）：
+
+```
+无法解析路径 nope.txt（沙箱根 \\?\D:\...\scratch）: 系统找不到指定的文件。 (os error 2)
+```
+
+⚠️ 顺带一个**已知点**：`starts_with` 检查在 canon 之后 ⇒ **越界且目标不存在**的路径报的是"找不到"而不是"越界"。模型探 `../../etc/passwd`（不存在）时会以为路径写错、继续试别的。MCP 参考实现是"先 normalize + 前缀判断，再 realpath"，正好相反。V0 接受这个顺序（先 canon 才能可靠判断越界，词法判断挡不住 `..` 和符号链接），但要知道它是**已知的文案错配**，不是 bug。
+
+🔴 **`Invocation` 里的 `path` 字段仍是 `String`**，绝不能改 `PathBuf`：它是协议层数据，要和模型 JSON 里的 `arguments` 逐字往返（§3.4.4）。`PathBuf` 只出现在**执行层内部**，从 `resolve_in` 的返回值开始到 IO 结束。
+
+改签名会连带这几处：`tool.rs` 的两个函数与签名、`#\[cfg(test)\]` 里的 `read_file("plan.md")` → `read_file(Path::new("plan.md"))`、`main.rs` 里若有直接调用。
+
 ### 3.6 验收标准
 
 **功能**：在 scratch 里放一段编译不过的代码（用 `my_api` 的副本），对 agent 说"让它通过编译"，它自主完成
@@ -1867,10 +2220,25 @@ Rust 没有隐式转换（coercion 只覆盖 `&T`→`&U`、unsize、deref、fn �
 | `fs::read_to_string(path).map_err(anyhow::Error::from)` | 不想多包一层 `Ok`，但也没赚到什么 |
 | **`fs::read_to_string(path).with_context(\|\| format!("读取 {path} 失败"))`** | **推荐给工具实现**：尾表达式直接是 `anyhow::Result`（类型精确匹配），且带上"哪个路径失败"—— 这条信息正是回灌给模型让它自纠的依据 |
 
+#### `Path::display()` vs `to_string_lossy()`：输出一样，中间产物不同（2026-10-22 实测）
+
+用户问两者差别。**输出逐字节相同**（含非法路径），差别只在"有没有中间 `String`"：
+
+| | 合法路径 | 非法 UTF-16（孤立代理） | 输出 |
+|---|---|---|---|
+| `format!("读取 {} 失败", p.display())` | 2 次分配 | **1 次** | `读取 a�b 失败` |
+| `format!("读取 {} 失败", p.to_string_lossy())` | 2 次 | **2 次** | `读取 a�b 失败`（字节完全相同） |
+
+- **非法时差的这一次**：`to_string_lossy()` 必须先造一个 `Cow::Owned(String)`（存 `a U+FFFD b`），再被 `format!` 拷进目标缓冲；
+  `display()` 返回一个轻量包装，**直接写进 `format!` 的缓冲，从不产生中间 `String`**。
+- 两者在非法输入下**都做 `U+FFFD` 替换**（std 文档：`Path` 的 `Display` "may perform lossy conversion"）⇒ **没有正确性差异**。
+- 所以判据是**类型需求，不是性能**：要 `Display`（塞进 `format!`/日志）用 `display()`；
+  要 `&str`/`String`（`.len()`、`.contains()`、存起来）用 `to_string_lossy()`。
+- 附带事实：**`Path` 本身不实现 `Display`**，`format!("{}", path)` 直接编译不过 —— `display()` 就是官方给的那座桥。
+
 **`anyhow::Error` 不实现 `std::error::Error`（实测 E0277）**：
 `fn need<T: std::error::Error>(_: &T)` 传 `&anyhow::Error` 直接编译失败。
-原因是一致的（coherence）：若它 `impl StdError`，上面那条 blanket `From` 就会与 core 的自反
-`impl<T> From<T> for T` 撞车。⇒ 任何 `T: std::error::Error` 的约束**都不接受** `anyhow::Error`。
+原因是一致的（coherence）：若它 `impl StdError`，上面那条 blanket `From` 就会与 core 的自反 `impl<T> From<T> for T` 撞车。⇒ 任何 `T: std::error::Error` 的约束**都不接受** `anyhow::Error`。
 
 **三条对循环的直接影响**：
 
@@ -1881,6 +2249,41 @@ Rust 没有隐式转换（coercion 只覆盖 `&T`→`&U`、unsize、deref、fn �
    但**协议层错误（未知工具 / 参数坏）必须留在 `ToolError`**，否则"模型能据此自纠"的变体信息被抹平。
 3. **回灌字符串用 `format!("{e:#}")` 而不是 `e.to_string()`**（实测见上：`Display` 只打最外层
    context，`{:#}` 才是 `外层: 根因` 一条链；`{:?}` 是多行 `Caused by:`）。
+
+#### 「回灌」不是「打印」：三种处理方式的区别（2026-10-22）
+
+用户问「`run` 报错绝不能 `?`，那是需要把错误打印出来吗」—— **不是打印，是回灌。** 三者的去向完全不同：
+
+| 处理 | 谁看得到 | 循环 | 模型能否自纠 |
+|---|---|---|---|
+| `?`（错误向上冒泡） | 人（`main` 里打印） | **中止** | ❌ 它不知道发生了什么 |
+| `println!` / `eprintln!` | 人 | 继续 | ❌ **模型看不到 stdout** |
+| **回灌成 `role:"tool"` 的 content** | **模型** | 继续 | ✅ 下一轮换路径/换参数 |
+
+代码形状就一行 `match`：
+
+```rust
+let content = match executor.run(&inv) {
+    Ok(out) => out,
+    Err(e) => format!("Error: {e:#}"),      // ← 不是 `?`，是变成字符串
+};
+messages.push(tool_message(call_id, content));
+```
+
+**判据：模型能不能通过改变自己下一次输出来修复这个错误？**
+
+| 错误来源 | 例子 | 处理 |
+|---|---|---|
+| 工具执行（模型可修） | 文件不存在、路径越界、未知工具、参数缺字段 | **回灌 + 继续** |
+| 传输/协议（模型不可修） | 网络断开、401、`choices` 为空、响应 JSON 解析失败 | `?` **中止** |
+
+把 401 回灌给模型只会让它反复重试同一个请求；把「文件不存在」中止掉，等于让模型为一个拼写错误丢掉整轮。
+
+🔴 **协议缺口：OpenAI 的 `role:"tool"` 消息没有 `is_error` 字段**（Anthropic 的 `tool_result` 有 `is_error: true`）。
+所以**只能靠文本前缀区分**，`Error: ` / `[error] ` 这类标记不是风格问题 —— 不加的话，模型会把
+「系统找不到指定的文件」当成**文件内容**继续分析（和 §3.4.13「`content` 每个字都在构成模型的判断」同一条）。
+
+⚠️ 回灌的错误文本同样要**截断**：`executor.run()` 返回 `Err` 时**不经过** `truncates`，serde 报错可能带上整个 JSON。
 
 ### 3.7.2 `trait LlmClient` 什么时候抽：**跑通之后再抽，但先把缝留好**
 
@@ -1955,6 +2358,112 @@ async fn run_loop<C: LlmClient>(client: &C, cfg: &Config, question: &str) -> any
 - **`for step in 0..max_steps` 比 `loop` + 手动计数安全**：天然不可能死循环，也不用自己维护计数器。
 - **并行的 `tool_calls` 每条都要回一条 `role:"tool"`**（§3.4.3）。漏一条，下一轮请求直接 400 —— 
   这类错误网关会明确报 `tool_call_id`，算幸运的。
+
+#### 🔴 实测踩坑：把 `finish_reason` 当开关（2026-10-22，循环第一版跑通时）
+
+用户第一版循环里写了这段（**已确认是 bug**）：
+
+```rust
+match &resp_content.finish_reason.as_deref() {
+    Some("finished") => { finished = true; break; }   // ← "finished" 根本不存在
+    Some("tool_calls") => println!("调用工具..."),
+    Some(reason) => bail!("终止理由 {reason}"),        // ← "stop" 掉进这里
+    None => { finished = true; break; }
+}
+```
+
+实际运行（`run_agent(&client, "看下沙箱根目录'.'有什么文件", 5)`）：
+
+```
+开始第 1 步 → AI 调用 list_files(".")      finish_reason = "tool_calls"
+开始第 2 步 → AI 给出最终答案（无 tool_calls）finish_reason = "stop"
+Error: 终止理由 stop
+error: process didn't exit successfully (exit code: 1)
+```
+
+**模型答得完全正确，是循环把它判成错误。** 两个独立的错叠在一起：
+
+1. **`"finished"` 是猜的**。OpenAI 的取值是 `stop` / `length` / `tool_calls` / `content_filter`（§3.4.1 表里就有）；
+   `finished` 属于 Anthropic 的 `stop_reason` 家族（那边是 `end_turn` / `max_tokens` / `tool_use`），混了。
+   ⇒ **猜字符串常量永远猜不对，因为编译器不查、网关也不报**（它只是返回一个你不认识的值）。
+2. **`Some(reason) => bail!(..)` 把「未知值」当致命错误**。`finish_reason` 的取值集合是**开放**的
+   （§3.4.14 定过：`Option<String>` + 别穷尽，provider 会加新值），所以"兜底分支报错"这条路本身就是错的。
+
+**正确修法不是把 `"finished"` 改成 `"stop"`，而是删掉整个 `match`：**
+
+- **唯一判据是 `tool_calls` 是否为空**（§3.4.4 已定，本次实测再次验证）。`finish_reason` **不进控制流**。
+- 理由不只是"provider 可能不一致"：**语义上该问的问题是「模型还给我活干吗」**，而不是「它自己说它停了吗」。
+- `finish_reason` 留给**日志/诊断**：`Some("length")` 时提示"输出被长度限制截断"（这时 content 是半截话，
+  当成正常结束会让人误以为回答完整）。
+
+顺带这次暴露的另外三处：
+
+| 位置 | 问题 |
+|---|---|
+| `if tool_messages.is_empty() { push(tool_call_id: "") }` | 造出一条 **`tool_call_id` 为空** 的 tool 消息 ⇒ 下一轮必 400。按「`tool_calls` 为空就 break」的新结构，这段是**死代码**，直接删 |
+| `messages.push(resp.choices.pop().unwrap().message)` | `Vec::pop()` 取的是**最后一个**，不是 `choices[0]`。`n=1` 时无害，但语义撒谎；用 `swap_remove(0)` 或 `mem::take` 更准确 |
+| `if !finished { println!("未能在{}步内完成") }` 后面紧跟 `println!("任务完成!")` | 超步数时两句都打。CLI 无所谓，但 V1 要区分「完成」和「耗尽」两种返回 |
+
+#### 🔴 实测：工具清单里出现「声明了但没实现」的工具会怎样（2026-10-22）
+
+**背景**：「改名」这个任务没有对应工具，用户想看看模型会怎么应对。实测发现**模型应对得很好** ——
+但踩到的不是"没有工具"，而是"清单里有、调用却失败"。
+
+当时的代码状态（`tool.rs:94`）：
+
+```rust
+fn raw_invoke(&self, root: &Path) -> anyhow::Result<String> {
+    match self {
+        Invocation::ReadFile(..) => ...,
+        Invocation::ListFiles(..) => ...,
+        _ => bail!("工具尚不支持"),        // ← WriteFile 掉进这里
+    }
+}
+```
+
+而 `ToolKind::ALL` 是**三个**（`ReadFile`/`ListFiles`/`WriteFile`），`spec()` 和 `parse_kind` 的
+`WriteFile` 分支都写好了 ⇒ **`write_file` 通过 `tools: [...]` 真的发给了模型**。
+
+任务：「把沙箱根目录下的 readme.md 改名为 README.md」，`max_steps = 5`。实际轨迹：
+
+| 步 | 模型动作 | 值得注意的点 |
+|---|---|---|
+| 1 | `list_files(".")` | 先看有什么 |
+| 2 | `read_file("readme.md")` | 思考里自己推出了正确结论：*"There's no rename tool. I need to read the file and write README.md. But then can I delete readme.md? No delete tool."* ⇒ **缺工具时模型自己能规划出替代路径** |
+| 3 | `write_file(...)` | `reasoning` 与 `content` 都为空，直接调 |
+| 4 | `write_file(...)` 再试一次 | 收到 `Error: 工具尚不支持`，然后连猜三种假设：*"Maybe transient" / "maybe write_file works only for certain paths" / "maybe case-insensitive filesystem: README.md already exists as readme.md?"* |
+| 5 | `list_files(".")` 再确认一遍 | 耗尽，`未能在5步内完成!` |
+
+**四条结论：**
+
+1. **「没有工具」不是问题，「有工具但坏了」才是。** 第 2 步证明了模型能优雅处理能力缺失（自己推理出没有
+   delete ⇒ 只能 read + write，且明确知道"这不是真正的改名"）。它真正被误导的是**清单里声明了 `write_file`
+   却调不通** —— 于是把一次硬失败解释成"临时故障 / 路径限制 / 文件系统大小写"，白烧 2 步。
+   ⇒ **工具清单必须等于「现在真能用的能力」，不是「计划中的能力」。** 这是 §3.4.8「`tools` 单一来源」
+   的一个新侧面：单一来源保证"清单与派发一致"，**不保证"清单里的都实现了"** —— 而 `raw_invoke` 的
+   `_` 臂恰好把这条缝堵死了（加第三个变体编译器**不报 E0004**）。
+2. **错误文案要带工具名和可用清单。** `工具尚不支持` 让模型只能猜；写成
+   `write_file 尚未实现（当前可用：read_file、list_files）` 它一步就会放弃。
+   （模型这次靠"工具尚不支持"四个字猜对了方向，属于运气好。）
+3. **步数耗尽时，模型想说的话全丢了。** 第 5 步的 `reasoning` 已经写着 *"the conclusion: cannot perform
+   rename; report to user honestly"* —— 但它再没有机会输出这句话，`finished = false` 直接退出。
+   V0 打印状态可接受；**V1 的正确收尾是在 `max_steps` 用尽后补一次 `tool_choice: "none"` 的请求**
+   （不带工具，强制它把结论说完），这是各家 agent 的通行做法。
+4. **日志放在了错误的一层。** `println!("read file : {}")` 写在 `read_file`/`list_files` **内部** ⇒
+   `WriteFile` 走 `_` 臂时**一行日志都没有**（第 3、4 步日志完全空白，看不出它调了什么、参数是什么）。
+   日志应在 `Executor::run` —— 那里同时握有「哪个工具 / 入参 / 输出多少字节」，一次覆盖所有工具，
+   且测试调用内层 IO 时不会被日志噪音污染。
+
+**修法（顺序）：**
+
+- 立刻：`ALL` 先缩到两个（`ReadFile`/`ListFiles`），让模型看到的能力 = 实际能做的。
+  代价是 `ToolKind::WriteFile` 变体暂时 `never constructed`（一条 `dead_code` 告警），
+  `spec()` / `parse_kind` 的 `WriteFile` 分支保留着、等实现好了接上。
+- 写 `write_file` 时：`_ => bail!(..)` **必须换成显式 `Invocation::WriteFile(..)` 臂**。
+  换掉之后，将来再加变体编译器就会报 E0004 —— 那个 `_` 现在是"漏臂静默"的唯一源头。
+- 顺带：`raw_invoke` 里 `WriteFile` 的目标可能**不存在**，`resolve_in(root, &args.path)` 会因
+  `canonicalize` ENOENT 直接失败 ⇒ 必须对**父目录** `canonicalize` + `starts_with`，再 `join(file_name)`，
+  且 `file_name` 要单独校验（不含分隔符、不是 `.`/`..`）。见 §3.5「分工具的策略不一样」。
 
 #### 循环要不要写成"状态机"（2026-10-21）
 
@@ -2625,7 +3134,7 @@ loop {
 - [x] `ToolCall.function` 改 `Option` + `payload()` 收敛（未知 `type` 要能报出类型名，§3.4.6）—— 实测 `custom` 缺键时**无需 `#[serde(default)]`** 也得到 `None`（serde 对 `Option` 字段缺键隐式 `None`）
 - [x] **请求侧 `tools` 声明**：`FunctionDecl` + `ToolKind::ALL` + `spec()` + `tools() -> Vec<WireTool>`（**§3.4.8 / §3.4.10**，`&'static str` 已采用；`tool_json()` 待删，见 §3.7.6）
 - [x] 删掉 `Invocation::to_functioncall` / `from_functioncall`，改 `parse_kind(kind: &ToolKind, args: &str) -> Result<Invocation, ToolError>`（**§3.4.9** 规则 1/2；`Option` 会丢错误信息）
-- [ ] `write_file` 补 `content` 参数（`Invocation` 同步加字段）；`run_command` 的 `cmd` 等白名单设计定案再定（**§3.4.10** 末表）
+- [x] `write_file` 补 `content` 参数（`WriteFileArg{path, content}` 已加）；`run_command` 的 `cmd` 等白名单设计定案再定（**§3.4.10** 末表）
 - [ ] `ToolKind::ALL` 防漂移测试：长度 + 名字唯一 + `from_name` 往返（§3.4.8 实测 ③ / §3.4.12 漏洞 ②；V1 换 `trait Tool` 后此测试可删）
 - [ ] `from_name` 改成 `Self::ALL.iter().copied().find(|t| t.name() == n)`，删掉手写 `match`（**§3.4.12 漏洞 ①**：消掉工具名第二份 + 消掉「`from_name` 认识但 `ALL` 不宣告」的矛盾态）
 - [x] 每个 `Invocation` 变体装箱 `XxxArgs`（`#[serde(deny_unknown_fields)]`），`parse` 用 `from_args::<T>`（**§3.4.11 / §3.4.12**）
@@ -2640,11 +3149,18 @@ loop {
 - [ ] **`chat()` 里删掉 `serde_json::to_value(chat_request)?`**，直接 `.json(&chat_request)`：现在跑的是「结构体 → `Value` → 再序列化」两趟，`to_value` 还会经 `BTreeMap` 把键按字母序重排
 - [ ] **`chat()` 先判状态码再 `text()`**：现在 4xx 会退化成 serde 的 `expected value at line 1 column 1`，body 里的真实报错丢了 ⇒ `if !status.is_success()` 时把 `status` + `body` 一起塞进 `anyhow` 错误
 - [ ] 删 `model.rs` 的 `pub struct ChatRequest`（零调用点，与 `llm.rs::WireRequest` 构成「两个真相」）+ 删 `main.rs` 的 `test_chat` / `get_chat`（协议探针使命已完成，现在是 dead code）
-- [ ] 循环接上：`tool_calls` 非空 → 执行 → 回灌 → 继续（**§3.7.2** 六分支表；`client` 从参数进来、返回值不出现 `reqwest` 类型）
-- [ ] 终止条件 + 步骤上限（防死循环；用 `for step in 0..max_steps`）
+- [x] 循环接上：`tool_calls` 非空 → 执行 → 回灌 → 继续（**§3.7.2** 六分支表；`client` 从参数进来、返回值不出现 `reqwest` 类型）—— **2026-10-22 真实任务跑通**
+- [x] 终止条件 + 步骤上限（`for step in 1..=max_steps`，`tool_calls` 为空即 break；`finish_reason` 只用于 `length` 日志）
+- [ ] **`ToolKind::ALL` 缩到「真能用的工具」**：`WriteFile` 已在 `ALL` 里、`spec()`/`parse_kind` 也全写好了，但 `raw_invoke` 走 `_ => bail!("工具尚不支持")` ⇒ **`write_file` 真的发给了模型**，实测模型白烧 2 步并猜出"临时故障 / 路径限制 / 大小写文件系统"三种错误假设（**§3.7.2 末 2026-10-22 实测**）。要么先缩 `ALL`，要么立刻实现
+- [ ] **`raw_invoke` 的 `_` 臂换成显式 `Invocation::WriteFile(..)`**：那个 `_` 是"漏臂静默"的唯一来源（换掉后加变体才会报 E0004）；顺带错误文案要带工具名 + 可用清单
+- [ ] **日志从 `read_file`/`list_files` 内部挪到 `Executor::run`**：现在写在 IO 函数里 ⇒ `WriteFile` 走 `_` 臂时一行日志都没有（实测第 3、4 步日志全空白），也污染直接调内层 IO 的测试。`run` 里同时握有工具名 / 入参 / 输出字节数
+- [ ] **`max_steps` 用尽后补一次 `tool_choice:"none"` 收尾**（V1）：实测耗尽时模型 `reasoning` 里已经写好结论（"report to user honestly"）却再没机会输出（**§3.7.2 末**）
 - [ ] `LlmClient` trait 立起来 —— **排在循环跑通之后**，签名从实际代码抄（§3.7.2）
-- [ ] 4 个工具实现：`list_files` / `read_file` 🟡（2/4 已写，2026-10-21：`read_file` 用 `.with_context` ✔ / `list_files` 用 `_list_files` 内层 + 外层 context ✔；**待补**：`sort()` 确定序、`to_string_lossy` 别静默丢项、`join` 代替 `fold+format!`、截断、沙箱） / `write_file` / `run_command`
-- [ ] `impl Invocation { fn invoke(&self) -> anyhow::Result<String> }` 放 **`tool.rs`**（执行层认识协议、协议层不认识执行；`match &self` 免 move），里面按序做「沙箱 → 分派 → 截断」（**§3.5**，2026-10-21 新增）
-- [ ] 安全边界落地：scratch 目录 + 写/shell 确认 + 命令白名单 + 输出截断
+- [ ] 4 个工具实现：`list_files` / `read_file` ✔（2026-10-22 完成：`sort()` 确定序、`join` 替 `fold`、`file_name()` 相对路径、`[DIR]`/`[FILE]` 前缀、非 UTF-8 显式标注） / `write_file` / `run_command`
+- [ ] **`write_file` 的沙箱检查要单独写**：目标可能不存在 ⇒ `canonicalize` 会 ENOENT，必须对**父目录** canon + `starts_with`，再 `join(file_name)`；`file_name` 单独校验（无分隔符、不是 `.`/`..`）（**§3.5** 分工具策略表）
+- [x] **`tool.rs::truncates` 修 panic**：`while !text.is_char_boundary(end) { end -= 1 }` 已补，并加了「原文 N 行 / M 字节」报告（2026-10-22）
+- [x] **`Executor` 横切层 + `raw_invoke` 分派层**：`Executor{root, max_bytes}`（`new` 里 `canonicalize` 一次 = 不变量载体）、`run` = `raw_invoke` → `truncates`；`raw_invoke` 私有、每臂先 `resolve_in`（**§3.5**：校验函数必须**返回**后续真正被使用的那个值，不是 `bool`/`()`）
+- [ ] **`truncates` / `resolve_in` 两条单测**（现在测试 0 个）：`truncates("中".repeat(3000), 8192)` 不得 panic；`resolve_in(tmp, "../x")` 必须 `Err`
+- [ ] 安全边界落地：scratch 目录 + 写/shell 确认 + 命令白名单 + 输出截断（**路径沙箱已落地** 2026-10-22；「`run_command` 上线时路径检查即失效，必须换 OS 沙箱/白名单/容器」见 §3.5 调研小节）
 - [ ] 自答 §3.8 的 4 个问题
 - [ ] **验收**：拿 `my_api` 副本跑通一次真实修复（§3.6）
