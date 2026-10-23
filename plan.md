@@ -39,8 +39,7 @@
   · `FunctionDecl`/`ToolKind`/`ALL`/`spec()`/`tools()` · `Invocation` 装箱 `XxxArgs` + `parse_kind` · `ChatResponse`/`Choice`
   · `OpencodeGoClient`（手写 `Debug`、`bearer_auth`、私有 `WireRequest<'a>`）。
   **真实 200 跑通，`finish_reason:"tool_calls"`、`read_file{"path":"scratch/readme.md"}` 解析进类型**。
-  **下一个动作 = 循环**（先补 3 处小债：删 `to_value` 二段序列化 / 先判状态码 / 删 `ChatRequest` 与 `main.rs` 旧探针），
-  然后 4 个真工具 + `max_steps`。
+  ~~下一个动作 = 循环~~（**已完成，见下条**；当时列的 3 处小债**已清两条**，只剩 `model.rs::ChatRequest` 与 `main.rs` dead code，见 `plan_v0.md` §五）。
 - ✅ **循环已跑通（2026-10-22）**：`agent.rs::run_agent` —— `for step in 1..=max_steps` + 六分支 + 工具结果/错误
   **回灌**（`Error: {e:#}`）+ `tool_calls` 为空即收尾。`tool.rs` 已有 `Executor{root,max_bytes}` 不变量载体、
   `resolve_in`（canon + `starts_with`，**返回 PathBuf 供 IO 直接使用**）、`truncates`（字符边界回退 + 总大小报告）。
@@ -48,8 +47,17 @@
   **实测「缺工具」任务（改名）暴露的四条**见 `plan_v0.md` §3.7.2 末 —— 核心是
   **`write_file` 已在 `ALL` 里但 `raw_invoke` 走 `_ => bail!`** ⇒ 模型看得见却调不通，白烧 2 步；
   以及**步数用尽时模型想说的结论会丢**（V1 需补一次 `tool_choice:"none"` 收尾）。
-  **下一个动作 = ① 把 `ALL` 缩到 read/list（或立刻实现 `write_file`）② 日志从 `read_file`/`list_files`
-  内部挪到 `Executor::run` ③ 补 `truncates` / `resolve_in` 两条单测。**
+  **`write_file` 已落地（2026-10-23，v4，`cargo test` 1 passed）**：整文件覆盖 + 自动建父目录（**仅**
+  `NotFound` 才 `create_dir_all` 重试）+ 先 `symlink_metadata` 判非普通文件 + `resolve_for_write`
+  （`normalize` 消 `..` → 往上 `try_exists()` 找最深已存在祖先 → **canon 祖先** + `starts_with`）。
+  四类场景实测：junction 越界（单层 / 多级）已被挡住且沙箱外无副作用、普通相对写 / 覆盖写正常。
+  **下一个动作 = ① 🔴 `resolve_for_write` 改成返回「canon 祖先 + 词法尾巴」** —— 现在返回词法路径 ⇒
+  沙箱内**普通绝对路径**会"写成功了却报 `Err("prefix not found")`"（`strip_prefix` 前缀不匹配；
+  空尾巴还必须单判，否则 `join("")` 加尾分隔符 ⇒ `os error 267`）**② `run_command`**（`{program, args}`
+  无 shell、裸名白名单、退出码 0/1 都算成功）**③ 日志改成 `→ 工具名(参数)` / `← N 字节`**
+  **④ 补 `truncates` / `resolve_in` 两条单测**。
+  设计与实测见 `plan_v0.md` **§3.5 末五节**（2026-10-23：rg/jq 走 prompt 还是专用工具、run_command 六组
+  实测、`write_file` 覆盖语义、错误文案用 `args.path`、junction 写穿 + 复测 v3/v4）。
 
 ---
 
@@ -110,7 +118,7 @@ Python 改一行 prompt 直接跑；Rust 要等编译，还要跟所有权较劲
 
 ## 三、V0 详细 → 已归档到 [`plan_v0.md`](./plan_v0.md)
 
-> 📦 V0 的设计过程、协议实测报文、类型决策日志、安全边界与验收标准，全部搬到了 **`plan_v0.md`**（约 1600 行）。
+> 📦 V0 的设计过程、协议实测报文、类型决策日志、安全边界与验收标准，全部搬到了 **`plan_v0.md`**（约 3500 行）。
 > 章节号**原样保留**（§3.1 … §3.9），所以别处笔记里的「详见 §3.5」「§3.4.4」仍然有效，只是指向的是 `plan_v0.md`。
 > 本文件从此只负责：**路线图 + V1 之后的设计**。V0 的新发现写 `plan_v0.md`；只有**影响 V1+ 设计**的结论才在这里留摘要。
 
@@ -118,9 +126,9 @@ Python 改一行 prompt 直接跑；Rust 要等编译，还要跟所有权较劲
 
 | | |
 |---|---|
-| **已完成** | `.env` 三变量 · `config.rs` 五版定稿（方案 C 已落地） · 真实通道 **200** · **实验 2 / 2.5 闭环**（工具调用 → 回灌 → 收尾，prompt cache 命中 256） · **`model.rs` 类型齐了**（`content` 已收紧、`Invocation` 装箱 Args、`parse_kind` 一步解析） · **`llm.rs` 真实 200**（手写 `Debug`、`bearer_auth`、私有 `WireRequest<'a>`） |
-| **正在写** | **循环**（`for step in 0..max_steps`，六分支见 `plan_v0.md` §3.7.2）→ 然后 4 个真工具 |
-| **下一个动作** | ① 三处小债：`chat()` 删 `to_value` 二段序列化 / 先判状态码再读 body / 删 `model.rs::ChatRequest` 与 `main.rs` 旧探针 ② 循环接上（`client` 从参数进来、返回不出现 `reqwest` 类型）③ 4 工具实现 + 沙箱 + 截断 ④ **最后**抽 `LlmClient` —— 顺序依据见 `plan_v0.md` §3.7.2 |
+| **已完成** | `.env` 三变量 · `config.rs` 五版定稿（方案 C 已落地） · 真实通道 **200** · **实验 2 / 2.5 闭环**（工具调用 → 回灌 → 收尾，prompt cache 命中 256） · **`model.rs` 类型齐了**（`content` 已收紧、`Invocation` 装箱 Args、`parse_kind` 一步解析） · **`llm.rs` 真实 200**（手写 `Debug`、`bearer_auth`、私有 `WireRequest<'a>`） · **循环跑通**（`for step in 1..=max_steps` + 错误回灌 `Error: {e:#}`） · **三个真工具** `read_file`/`list_files`/`write_file` + 路径沙箱（读侧 canon、写侧祖先 canon）+ 截断 |
+| **正在写** | **工具层最后一公里**：`write_file` 的回执 bug（返回词法路径 ⇒ `prefix not found`）→ `run_command`（无 shell 的 `{program,args}`），设计见 `plan_v0.md` §3.5 末 |
+| **下一个动作** | ① 修 `resolve_for_write` 返回「canon 祖先 + 词法尾巴」（含空尾巴单判）② `run_command`（2026-10-23 定案，见 `plan_v0.md` §3.5 末）③ 日志改成 `→/←` ④ `truncates` / `resolve_in` 两条单测 ⑤ **最后**抽 `LlmClient` —— 顺序依据见 `plan_v0.md` §3.7.2 |
 | **验收** | 在 `scratch/my_api` 副本上，说一句"让它通过编译"，agent 自主「读 → 改 → `cargo check` → 读报错 → 再改」，**中途不需介入** |
 | **欠账** | `config.rs` 的 `#[cfg(test)] mod tests`（有意留到 V0 跑通后） |
 
@@ -166,15 +174,18 @@ Python 教程（21.9k★）。**当"协议参照 + 概念词典 + 失败模式�
 
 ## 五、进度记录
 
-**V0** → 完整清单见 [`plan_v0.md` §五](./plan_v0.md)（**23 项已勾 / 15 项未勾**，截至 2026-10-20）。
-当前卡在：**循环**。`model.rs` / `llm.rs` 已能发请求并把 `tool_calls` 解析成类型（真实 200），
-但工具是假的、没有 `for step in 0..max_steps`。下一步先把 3 处小债清掉，再接循环与 4 个真工具。
+**V0** → 完整清单见 [`plan_v0.md` §五](./plan_v0.md)（**34 项已勾 / 15 项未勾**，截至 2026-10-23）。
+当前卡在：**工具层最后一公里**。循环已跑通（`for step in 1..=max_steps` + 回灌），三个真工具
+`read_file`/`list_files`/`write_file` 都已在，沙箱（读侧 canon / 写侧祖先 canon）与截断都在。
+`write_file` 还剩一个回执 bug：返回词法路径 ⇒ `strip_prefix(root)` 在沙箱内普通绝对路径上报
+`prefix not found`。下一步：修它 → `run_command` → 日志 → 单测 → `my_api` 副本验收。
 
 **V1**
 
 - [ ] 手写 SSE 流式解析（含 `tool_calls` 跨 chunk 累积）
 - [ ] `CancellationToken` 取消 + `tokio::select!` 超时（Ctrl-C 可中断）
 - [ ] 上下文管理：历史裁剪 / assistant·tool 消息配对协议
+- [ ] MCP **client**（官方 SDK `rmcp` v3.6，rustc 1.88 + edition 2024；**排在 `Vec<Box<dyn Tool>>` 注册表之后** —— MCP 就是「一种 Tool 实现」，注册 = push 一个 adapter：`tools/list` → `FunctionDecl`、`tools/call` → 回灌字符串。V0 的 `enum Invocation` 派发用不了，因为工具名/schema 是运行期才知道的）
 
 **V2**
 
@@ -184,7 +195,7 @@ Python 教程（21.9k★）。**当"协议参照 + 概念词典 + 失败模式�
 
 **V3**
 
-- [ ] MCP
+- [ ] MCP **server 化**（把 agent 自己暴露成 MCP server，与 V1 的 client 方向相反）
 - [ ] 多后端抽象
 
 ---

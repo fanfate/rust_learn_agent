@@ -110,6 +110,14 @@ impl Invocation {
             }
         }
     }
+
+    pub fn info(&self) -> String {
+        match self {
+            Self::ReadFile(args) => format!("read_file, path : {}", args.path),
+            Self::ListFiles(args) => format!("list_files, path : {}", args.path),
+            Self::WriteFile(args) => format!("write_file, path : {}", args.path),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -171,7 +179,7 @@ impl ToolKind {
             },
             ToolKind::WriteFile => FunctionDecl {
                 name: "write_file",
-                description: "写入文件内容，路径相对沙箱根目录",
+                description: "写入文件内容，路径相对沙箱根目录, 覆盖整个文件（不是追加/插入）,会自动创建缺失的父目录,返回写入文件的字节数",
                 parameters: serde_json::json!({
                 "type": "object",
                 "properties": { "path": { "type": "string" }, "content" : { "type" : "string" } },

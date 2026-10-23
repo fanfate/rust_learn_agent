@@ -2050,6 +2050,8 @@ pub fn list_files(root: &Path, dir: &Path) -> anyhow::Result<String>;
 
 ⚠️ **改成 `&Path` 后 `format!` 会挂**：`Path` 没有 `Display`，`format!("读取 {path} 失败")` 编译不过，要用 `path.display()`。这是唯一必须同步改的地方。
 
+⚠️ **但"能编译"不等于"该这么写"**：`display()` 只是类型桥接，把解析后的绝对路径拼进 error message 就等于把 `\\?\D:\...` 塞进 history。错误文案里的路径应该用**模型给的那个 `args.path`**，详见 §3.5 末「错误文案里的路径用哪个」。
+
 实测（`.probe_pb/`，已删，`resolve_in` + `read_file(&Path)` + `list_files` + `strip_prefix` 全链路）：
 
 ```
@@ -2090,20 +2092,366 @@ root = \\?\D:\...\sb
 
 ```rust
 let canon = std::fs::canonicalize(&target)
-    .with_context(|| format!("无法解析路径 {p}（沙箱根 {}；可用 list_files \"\" 查看目录）", root.display()))?;
+    .with_context(|| format!("无法解析路径 {p}（路径相对沙箱根，可用 list_files \".\" 查看目录）"))?;
 ```
 
-对照实测（加了 context 之后）：
+⚠️ **`root.display()` 绝对不能写进这里**（2026-10-23 实测修正，上一版模板写错了）：这条 context 的终点是 `Error: {e:#}` **回灌给模型**，等于把 `\\?\D:\WorkSpace\...\scratch` 塞进 history。实测回灌字符串 139 字节，其中 60 字节是宿主机绝对路径 —— 模型既用不上（它只能传相对路径），换机器后这段历史还指着一个不存在的目录。
+
+#### 错误文案里的路径用哪个：`args.path`，不是解析后的 `Path`（2026-10-23 实测）
+
+两个受众，两种形式，不能混：
+
+| 去向 | 用哪个 | 写法 | 实测输出 |
+|---|---|---|---|
+| **回灌进 history**（`role:"tool"` / `Error: {e:#}`） | **`args.path` 原样**（模型输入的那个串） | `format!("读取 {p} 失败")` | `读取 nope.txt 失败` |
+| 本地 stderr 日志（人看） | 解析后的绝对路径 | `path.display()` | `\\?\D:\...\scratch\tmp` |
+
+关键：**`with_context` 挂在错误链上，而错误链的唯一出口就是回灌** —— 它属于"回灌"，不属于"打印"。「要 `Display` 就用 `display()`」（§2400 那条）说的是类型桥接，跟"该不该显示绝对路径"是两个维度；`display()` 只是把 `OsStr` 变成可打印，**泄漏与否取决于你 display 的是哪个 `Path`**。
+
+实测（`.probe_leak/` 已删，直接调 `Executor::run` 打 `{:#}`）：
 
 ```
-无法解析路径 nope.txt（沙箱根 \\?\D:\...\scratch）: 系统找不到指定的文件。 (os error 2)
+[read 不存在] 无法解析路径nope.txt，沙箱根\\?\D:\WorkSpace\rust\rust\web_learn\my_agent\scratch: 系统找不到指定的文件。 (os error 2)
+              139 字节，含 1 处 verbatim 前缀
+[read 目录]   读取 \\?\D:\WorkSpace\rust\rust\web_learn\my_agent\scratch\tmp 失败: 拒绝访问。 (os error 5)
+              101 字节，含 1 处 verbatim 前缀
+[write 到目录] 路径并不是合法文件!                                 28 字节，0 处前缀  ← 反向问题：缺路径
+[list .]      [DIR] test / [DIR] tmp / [FILE] readme.md         ← 正确：file_name() 天生相对
 ```
+
+⇒ 判据：**`read_file` / `list_files` / `write_file` 不写路径，由 `raw_invoke` 写** —— 它是唯一同时握着「模型输入串」和「解析结果」的地方，也是文案的唯一出口：
+
+```rust
+Invocation::ReadFile(args) => {
+    let p = resolve_in(root, &args.path)?;
+    read_file(&p).with_context(|| format!("读取 {} 失败", args.path))
+}
+Invocation::WriteFile(args) => {
+    let p = resolve_for_write(root, &args.path)?;
+    let n = write_file(&p, &args.content)
+        .with_context(|| format!("写入 {} 失败", args.path))?;
+    Ok(format!("成功写入 {} ：{n} 字节", p.strip_prefix(root).map_err(|_| anyhow::anyhow!("内部路径不在沙箱内"))?.display()))
+}
+```
+
+`read_file` 里那句 `with_context(|| format!("读取 {} 失败", path.display()))` 因此可以退化成裸 `?`（它只做 IO，`path` 上已经没有"模型认识的名字"）。成功回执里的 `strip_prefix(root)?.display()` **不属于泄漏** —— 剥掉前缀后正好是干净的 `a/b.txt`，这是 `display()` 的正确用法。
 
 ⚠️ 顺带一个**已知点**：`starts_with` 检查在 canon 之后 ⇒ **越界且目标不存在**的路径报的是"找不到"而不是"越界"。模型探 `../../etc/passwd`（不存在）时会以为路径写错、继续试别的。MCP 参考实现是"先 normalize + 前缀判断，再 realpath"，正好相反。V0 接受这个顺序（先 canon 才能可靠判断越界，词法判断挡不住 `..` 和符号链接），但要知道它是**已知的文案错配**，不是 bug。
 
 🔴 **`Invocation` 里的 `path` 字段仍是 `String`**，绝不能改 `PathBuf`：它是协议层数据，要和模型 JSON 里的 `arguments` 逐字往返（§3.4.4）。`PathBuf` 只出现在**执行层内部**，从 `resolve_in` 的返回值开始到 IO 结束。
 
 改签名会连带这几处：`tool.rs` 的两个函数与签名、`#\[cfg(test)\]` 里的 `read_file("plan.md")` → `read_file(Path::new("plan.md"))`、`main.rs` 里若有直接调用。
+
+#### `rg` / `jq` / `yq` / `fd` 该写进 prompt，还是做成专用工具？（2026-10-23）
+
+用户问：「本机有 rg/fzf/yq/jq/fd 等命令行工具，是否直接写成 prompt 就可以让 agent 执行？」先测环境，再回答。
+
+**环境实测**：五个全是 scoop shim 的 `.exe`（`C:\Users\jiahaof\scoop\shims\*.exe`）。`Command::new("rg")` **裸名**直接 spawn 5/5 成功、PATH 继承正常、版本号都拿得到（rg 15.2.0 / jq 1.8.2 / yq v4.54.1 / fd 10.5.0 / fzf 0.74.5）。
+⇒ **「能不能执行」这层没有障碍，它不是问题所在。**
+
+**逐个判定**（判据照抄 §3.5 调研小节里 Claude Code 的演化理由）：
+
+| 工具 | 做成专用 tool？ | 理由 |
+|---|---|---|
+| `rg` | **值得**（V1） | 输出要行号、要截断、要权限粒度 —— 正是 Claude Code 把 `Grep` 从 `Bash` 独立出来的那三条。可用 `ignore` + `regex` 纯 crate 实现，不依赖外部 exe |
+| `jq` / `yq` | 不必 | 它们只是"读取者"，模型在 `run_command` 里调即可；读 JSON/YAML 本来就是 LLM 的强项，宿主不需要理解其输出 |
+| `fd` | V1 再说 | 与 `list_files` 能力重叠，唯一增量是 `.gitignore` 感知 |
+| `fzf` | **不能给** | 交互式 TUI。实测非 TTY 下**零输出直接退出**（`printf 'a\nb\n' \| fzf` → stdout 空，exit 0）⇒ 模型只拿到空结果，分不清"没匹配"和"用不了" |
+
+**关键区分：「prompt 声明」与「tools 声明」不是同一强度的契约。**
+
+| | `tools` 数组 | system prompt 文字 |
+|---|---|---|
+| 参数格式 | JSON Schema 强制 | 自然语言捏的字符串，宿主无法校验 |
+| 宿主控制 | 可逐参数审计 / 截断 / 拒绝 | 只能整串接受 |
+| 可见性 | 每轮必在请求里 | 多轮之后会被注意力稀释 |
+
+⇒ **要宿主控制的（read / write / list / rg）做成 tool；长尾只读、输出简单的（jq / yq）留在 prompt 里走 `run_command`。**
+「写成 prompt 就能跑」在**能力**上成立，在**安全**上不成立 —— 原因见下节。
+
+#### `run_command`：V0 不给 shell，并且要知道路径沙箱在此彻底失效（2026-10-23，六组实测）
+
+命令能跑通（上节），但一旦落到 `run_command` 上，有五个实测确认的坑。
+
+**① 模型写的命令语法依赖 shell，而"给一个 shell"在 Windows 上没有免费选项。**
+
+实测（`.probe_cli/`，已删）：
+
+| 写法 | 结果 | 说明 |
+|---|---|---|
+| `Command::new("rg").arg("needle \| head -1")` | **code=0，有输出** | rg 把 `needle \| head -1` 当**正则**（交替分支）⇒ 静默给出错误结果。**不报错的错最贵** |
+| `cmd /C "rg -n 'needle' a.txt"` | code=1 | cmd 里单引号不是引号，rg 收到 pattern `'needle'`（带引号） |
+| `cmd /C "echo $HOME"` | 输出 `$HOME` | cmd 用 `%VAR%` |
+| `cmd /C "rg -n \"needle\" a.txt"` | code=1 | Rust → cmd 两层引号解析打架（`Command` 会先替 arg 加引号/转义） |
+| `sh -c "cd .. && cat a.txt"` | 读到外层文件 | 语法对，但见下 |
+| `Command::new("bash")` | code=1 | 裸名命中的是 **WSL 的 bash**，还被安全策略拦 |
+
+`sh` 确实能用，但 `where sh` 显示它来自 `D:\Program\WorkBuddy\resources\vendor\PortableGit\usr\bin\sh.exe` —— **是宿主应用自带的，不是这台机器的环境**。换一台没装 WorkBuddy 的机器就没有。
+
+⇒ **V0 定案：`run_command` 收 `{ program: String, args: Vec<String> }`，不接受 shell 命令字符串。** 工具描述里显式否定：「没有 shell —— 不支持管道 `|`、重定向 `>`、`&&`、通配符、变量展开」。三条理由：
+
+1. 避开上表第一行那种**静默错误**；
+2. 程序名可以精确白名单，命令串不能；
+3. `cmd` 的内建命令（`cd`/`echo`/`type`/`dir`）输出是 **GBK**，`from_utf8_lossy` 后是乱码（实测 `'nosuchcmd_xyz' 不是内部或外部命令` → `'nosuchcmd_xyz' �����ڲ����ⲿ���`）；而 exe 自己输出的 UTF-8 正常。只用 exe 顺带解决编码。
+
+代价：模型训练数据里 99% 是 bash 管道，它必然先试错一两次。所以描述要显式否定，并且错误回灌带上「本工具不支持 shell 语法，请拆成多次调用」。
+
+**② 路径沙箱在 `run_command` 上失效 —— 实测三重越界。**
+
+`current_dir` 已设成沙箱内，仍然全部读到外面：
+
+```
+cmd /C "cd .. && type a.txt"   -> OUTSIDE        （cd 越界）
+rg -n OUTSIDE ..               -> 搜到外层文件     （纯相对路径越界，不需要 cd）
+fd . ..                        -> 列出外层全部
+Command::new("rg").args(["-n","OUTSIDE",".."])  -> 同样越界（不包 shell 也一样）
+```
+
+最后一行是关键：**越界与是否用 shell 无关，只要允许任意 argv 就存在。** 印证 §3.5 调研小节里两家官方说法（Codex 的 *hard links*、Claude Code 的 *subprocesses that read or write files indirectly*），现在有本机复现。
+
+**③ 硬链接连「路径」这一层都能骗过（实测，无需任何权限）。**
+
+```
+在 sb/ 内 hard_link 指向沙箱外的文件      -> 成功
+canon(sb/inside_hard.txt) 在沙箱内        -> true
+父目录 canon 在沙箱内                     -> true
+symlink_metadata.is_symlink               -> false
+fs::write 通过它写 -> 沙箱外的原文件变成 "OVERWRITTEN-BY-AGENT"
+```
+
+硬链接没有"目标"概念，它是同一 inode 的第二个名字，**canon 结果就是沙箱内的路径** ⇒ `starts_with` 通过、`is_symlink` 为 false、任何路径检查都发现不了。
+威胁模型上，链接必须事先存在、agent 自己造不出来 ⇒ **V0 无实际风险**；但它证明「路径检查不是安全边界」是真的，Codex 那条注释讲的就是这件事。
+
+**④ 退出码不是「0 = 成功」这么简单。**
+
+```
+rg 有匹配   -> code=0   success()=true
+rg 无匹配   -> code=1   success()=false   ← 这是正常业务结果
+rg 参数错   -> code=2   success()=false   ← 这才是真错
+```
+
+宿主要是写 `if !output.status.success() { bail!() }`，**「搜不到」会变成工具失败回灌**，模型会以为 rg 坏了、转去试别的办法。
+规则：**0 和 1 都算成功**，把 code 与 stdout/stderr 一起放进回灌文本让模型自己判断；**2 及以上**才标 `Error:`。
+
+**⑤ 两处必须显式设的东西。**
+
+- `.current_dir(sandbox_root)` **必须显式设**：实测子进程默认继承父进程 CWD（父 `my_agent` → 子 `my_agent`）。不设的话模型写 `cat a.txt` 读的是 `my_agent/a.txt`。与「检查 A 使用 B」是同一个 bug 家族。
+- **白名单只允许裸名**：拒绝绝对路径、拒绝 `..\..\bin\rg`、拒绝 `cmd`/`sh`/`powershell`/`wsl` 本身 —— 否则 `cmd /C ...` 就是万能逃逸，前面全白给。
+
+**⑥ 输出合并 + 截断**：stdout 与 stderr 都要（实测 `rg needle no_such_file.txt` 的错误全在 stderr、stdout 为空），合并后走现成的 `truncates`，并附退出码。
+
+#### `write_file` 是整文件覆盖，不是插入（2026-10-23，实测）
+
+用户问「writefile 本质上是覆盖整个 file 而非插入对吧」——**对，就是 `fs::write` 的语义**。实测：
+
+```
+fs::write("t.txt", 20 字节)  -> "AAAAAAAAAAAAAAAAAAAA"
+fs::write("t.txt", "BB")     -> after = "BB"（2 字节，截断覆盖，无残留）
+父目录不存在                  -> NotFound「系统找不到指定的路径。(os error 3)」
+```
+
+这就是主流 agent 的 `Write` / `write_file`，与「替换」是两个工具（Claude Code 的 `Write` vs `Edit`，Gemini CLI 的 `write_file` vs `replace`）。V0 只做前者：
+
+| | 整文件覆盖 | 插入/替换（`Edit`） |
+|---|---|---|
+| 实现 | `fs::write` 一行 | 要唯一匹配、要 diff、要 CRLF 归一、要防「匹配到多处」 |
+| 模型负担 | 必须先读、再输出全文 | 只给 old/new 片段 |
+| token | 改一行 = 重写全文 | 只传片段 |
+
+代价是 token。对 V0 的 `scratch/` 小文件可接受；V1 有真实项目时 `Edit` 才划算。
+
+⚠️ **覆盖语义带来两个必须处理的点**：
+
+1. **必须先读**：没读过就写 = 把文件其余内容静默抹掉。Claude Code 的做法是「文件已存在但本会话没读过 → 拒绝并要求先 Read」。V0 可以退一步：返回里带一句「已覆盖 N 字节」让模型自己核。
+2. **目标是已存在的 symlink 时会写穿到沙箱外**（`fs::write` 跟随链接）。本机**无法实测** —— `symlink_file` 报 `os error 1314 客户端没有所需的特权`（未开开发者模式）。按 std 文档「`write` 会 truncate 已存在文件」推断成立。
+   ⇒ 检查规则分两步：**父目录 canon + `starts_with`（目标可能不存在）+ 目标若存在则目标也 canon + `starts_with`**（挡 symlink）。硬链接挡不住（上一节实测），但那要求链接事先存在。
+
+顺带：`write_file` 的错误文案要像 `read_file` 一样带路径 —— `fs::write` 自己的 `os error 3` 不说是哪个路径。
+
+#### 要不要一个独立的 `mkdir` 工具：**取决于你有没有 shell**（2026-10-23，查证五家）
+
+用户质疑：「一般 agent 也没有 mkdir 工具吧？我还以为都是使用 bash/pwsh 命令呢」。查了五个实现，结论比"有/没有"更细 —— **没有独立 mkdir 工具是多数派，但每个都留了别的路能建目录**：
+
+| 实现 | 有独立 mkdir 工具？ | 那目录由谁建 |
+|---|---|---|
+| **Claude Code** | 无 | `Bash` 里 `mkdir -p`（有 shell 就有兜底） |
+| **Codex CLI** | 无 | `apply_patch` 里的 `write_file_with_missing_parent_retry`：**先写，遇 `ErrorKind::NotFound` 才 `create_directory(recursive: true)` 然后重试** |
+| **Gemini CLI** | 无 | `write-file.ts` 的 `applyWrite`：`try { await fsPromises.access(dirName) } catch { await fsPromises.mkdir(dirName, { recursive: true }) }` |
+| **MCP filesystem**（参考实现） | **有 `create_directory`** | `write_file` **不建目录**，直接报 `Parent directory does not exist: <dir>`；注释明写 `mkdir -p` 归 `create_directory` 管 |
+| **Aider** | 无 | 走 shell / `utils.touch_file`（未追到最终落盘处，标注为未核实） |
+
+⇒ 真正的规律：**只有当"既没有 shell、`write_file` 又不自动建目录"时才需要一个 `create_directory` 工具** —— 五家里只有 MCP filesystem 是这个组合，所以也只有它加了。
+反过来说：**「没有 mkdir 工具」不等于「不能建目录」**，它一定是在别处兜住了。如果两条路都堵死，模型就真的完不成"新建 `src/foo.rs`"。
+
+**这对 V0 是决定性的**：V0 的 `run_command` 定案是**无 shell**（上节），所以模型手里**没有 `mkdir -p` 这条兜底**。于是：
+
+- ❌ 「父目录必须已存在」在 V0 里是死路（上一轮提议的 A 方案，**撤回**）—— 模型撞墙后没有任何别的工具能救，只能反复重试同一个路径。
+- ✅ 必须让 `write_file` 自己建目录（Gemini / Codex 路线），或者补一个 `create_directory` 工具（MCP 路线）。V0 选前者：**工具数量是成本**，4 个工具里塞第 5 个只为建目录不划算。
+
+**两种自建目录的实现，V0 选 Codex 那种「写失败再重试」**，因为不用提前判断目录存不存在：
+
+```rust
+match fs::write(&target, content) {
+    Err(e) if e.kind() == ErrorKind::NotFound => {
+        /* 沙箱检查 → create_dir_all(target.parent()) → 重试 fs::write */
+    }
+    other => other,
+}
+```
+
+⚠️ 但**沙箱检查卡在这里**：父目录不存在 ⇒ `canonicalize` 必然 ENOENT ⇒ 上一节的「父目录 canon + starts_with」用不了。三种解法：
+
+| 解法 | 说明 | 评价 |
+|---|---|---|
+| 词法 normalize + 前缀比较 | 栈式消掉 `..` 后做组件前缀判断 | 挡得住 `../../`，挡不住 symlink 祖先 |
+| **找最深的已存在祖先再 canon** | 从 `target.parent()` 往上找到第一个 `try_exists()` 为真的目录，canon 它 + `starts_with`，再 `create_dir_all` | **MCP 的 `resolveUnicodeEquivalentPath` 就是这个**（realpath 已存在部分 + append 不存在的尾巴 + 前缀检查） |
+| 先 `create_dir_all` 再 canon | 顺序反了 | ❌ 等于先在沙箱外把目录建出来了 |
+
+选第二种。两个细节：用 `try_exists()` 不用 `exists()`（后者在权限错误时也返回 `false`，std 文档明确警告）；找到祖先之后**还要对最终路径再 canon 一次**（挡 symlink），因为 `create_dir_all` 之后路径已存在。
+
+**顺带一个必须自己检查的理由**：`fs::write` 指向目录时的报错是 `PermissionDenied「拒绝访问。(os error 5)」`，**完全看不出是"目标是目录"**（实测）。所以写之前用 `symlink_metadata(&target)` 判一下：
+
+```
+symlink_metadata(dir).file_type()  -> is_file=false is_dir=true     ← 能拒
+create_new 对已存在文件             -> ErrorKind::AlreadyExists      ← 可用于原子独占创建
+create_dir_all 对已存在目录         -> Ok（幂等）
+```
+
+这正是 MCP `writeFileContent` 的做法：先用 `flag: "wx"`（Rust 的 `.create_new(true)`）**原子独占创建**，`EEXIST` 时再 `lstat` 检查是不是普通文件，不是就 `Refusing to write: not a regular file`。两个好处：① `create_new` 不跟随 symlink，天然挡住"写穿链接"；② 原子，没有"检查完被换成 symlink"的窗口（TOCTOU）。V0 可以只取 ①（先 `symlink_metadata` 判 `is_file()`），TOCTOU 留给 OS 沙箱。
+
+#### 🔴 实测：纯词法 normalize 挡不住 junction，`write_file` 能写穿（2026-10-23）
+
+上表里「词法 normalize 挡不住 symlink 祖先」不是理论 —— **Windows 的 junction 不需要管理员也不需要开发者模式**（`mklink /J`，普通用户即可），实测直接写穿：
+
+```
+root                                   = \\?\D:\...\sb
+target                                 = \\?\D:\...\sb\link\escape.txt     (link 是指向 ..\outside 的 junction)
+词法 normalize                          = \\?\D:\...\sb\link\escape.txt
+starts_with(root)                      = true      ← 现实现据此判定，放行
+fs::write                              = Ok
+沙箱外 D:\...\outside\escape.txt         = 出现，内容 "ESCAPED"
+```
+
+同一份路径下，两条分支的结论**完全相反**：
+
+| 分支 | 用什么判 | 结果 |
+|---|---|---|
+| `resolve_in`（读） | `canonicalize(target)` → `\\?\...\outside\escape.txt` | `starts_with` = **false**，被挡住 ✔ |
+| `resolve_for_write`（写） | 只做词法 normalize | `starts_with` = **true**，写穿 ✘ |
+
+⇒ **同一个沙箱，读是安全的、写不安全**，而读之所以安全纯属「目标必须存在才能 canon」这个巧合，不是设计出来的。
+
+修法就是上表第二种：write 侧也做 canon，只是 canon 的对象是**最深的已存在祖先**而不是目标本身。实测这样能挡住：
+
+```
+canon(sb\link)          = \\?\...\outside
+starts_with(root)       = false     ← 修法据此判定，拒绝
+```
+
+落地要点：`normalize_path` 之后，从 `lexical.parent()` 往上逐个 `try_exists()` 找到第一个存在的祖先 → `canonicalize(ancestor)?` → `starts_with(root)` → `Ok(canon_ancestor.join(lexical.strip_prefix(ancestor)?))`。**目标存在时**（覆盖已有文件）直接 canon 目标即可，那一支天然安全。
+
+⚠️ 已知残留（V0 接受）：**硬链接**连这个也挡不住 —— canon 在沙箱内、`is_symlink`=false（2026-10-23 实测），只能靠 OS 沙箱；这与 Codex 官方那句 *"paths in the patch are hard links to files outside the writable roots"* 是同一个结论。
+
+#### 复测 v3：加了「往上找已存在祖先」的循环，但仍然一次 canon 都没有（2026-10-23）
+
+v3 的写法是「从 `lexical` 往上 `try_exists()` 找到第一个存在的祖先，然后对**它**做 `starts_with(root)`，返回原来的 `lexical`」。**循环白写了** —— 找到的是词法祖先，比较的也是词法，`fs::canonicalize` 一次都没调用：
+
+```
+[write link/escape.txt]          Ok("成功写入文件link\escape.txt : 9 字节")
+  沙箱外 outside/escape.txt exists = true   content = "ESCAPED-1"
+[write link/deep/nest/x.txt]     Ok("成功写入文件link\deep\nest\x.txt : 9 字节")
+  沙箱外 outside/deep/nest/x.txt exists = true     ← 连多级目录都建到沙箱外
+[write ok.txt]                   Ok("成功写入文件ok.txt : 4 字节")   ← 正常路径没坏
+```
+
+⇒ **缺的就是那一行 `canonicalize(ancestor)`**，不是缺循环。
+
+同一个「没 canon」还制造了第二个 bug —— **误报越界**（模型给沙箱内的绝对路径时）：
+
+```
+root  = \\?\D:\WorkSpace\...\sb          components[0] = Prefix(VerbatimDisk('D'))
+plain = D:\WorkSpace\...\sb\a.txt        components[0] = Prefix(Disk('D'))
+plain.starts_with(root)       = false    ← 误报越界
+canon(plain).starts_with(root) = true    ← canon 之后就对了
+```
+
+这就是 §七 ②「**两边都 canon 才可比**」的第二个实例：`VerbatimDisk` 与 `Disk` 是两个不同的 `Prefix` 变体，逐字节比较必然 false。`resolve_in` 因为 canon 过所以没这问题，`resolve_for_write` 有。
+
+🔴 **修的时候有个坑：祖先 == 目标时尾巴是空串，`join("")` 会加尾分隔符**：
+
+```
+PathBuf::from(r"\\?\D:\a\b.txt").join("")  = "\\?\D:\a\b.txt\"     ← 尾部多一个分隔符
+Path::new("a.txt\").strip_prefix(自身)      = Ok("")                ← 空尾巴的来源
+```
+
+`join("")` **不是 no-op**，它会补一个分隔符。而这个分隔符在 Win32 语义里等价于「**按目录打开**」，实测（`.probe_trail/` 已删，`a.txt` 是已存在的普通文件）：
+
+| 调用 | 结果 |
+|---|---|
+| `fs::symlink_metadata("a.txt")` | `Ok(true)` |
+| `fs::symlink_metadata("a.txt\")` | **`Err(267, NotADirectory, "目录名称无效。")`** |
+| `fs::metadata("a.txt\")` | 同上 267 |
+| `fs::canonicalize("a.txt\")` | 同上 267 |
+| `fs::write("a.txt\", "NEW")` | 267，**原文件内容不变**（没被截断） |
+
+⇒ 覆盖已有文件这条路径会 100% 失败，回灌是 `写入 ok.txt 失败: 无法读取文件状态: 目录名称无效。 (os error 267)` —— 模型会以为路径有问题，去换名字重试。
+
+⚠️ **这个 bug 在类型上完全看不见**：`Path` 的 `PartialEq` **按组件比较**，而 components 会忽略尾分隔符，所以
+
+```
+Path::new("D:\\t\\a.txt\\") == Path::new("D:\\t\\a.txt")   ->  true      ← Path 相等
+   .as_os_str() == .as_os_str()                            ->  false     ← 字节不等
+file_name() 两者都是 Some("a.txt")，components().count() 都是 9
+```
+
+也就是说 `starts_with` / `strip_prefix` / 测试里的 `assert_eq!(p, expect)` / `Debug` 打印**全都看不出差别**，只有 `OsStr` 逐字节比才暴露。这就是它只能靠实测发现的原因。
+
+所以必须 `if tail.as_os_str().is_empty() { canon_ancestor } else { canon_ancestor.join(tail) }` —— 不是洁癖，是 267 的硬要求。
+
+正确顺序（4 行，关键在第 3 步）：
+
+```rust
+let lexical = normalize_path(&target)?;                                  // 1. 消 ..
+let ancestor = 从 lexical 往上找到第一个 try_exists() 为真的路径;          // 2. 循环
+let canon_ancestor = fs::canonicalize(ancestor)?;                        // 3. ★ 缺的就是这行
+if !canon_ancestor.starts_with(root) { bail!("路径越界: {p}") }           // 4. 比 canon 过的
+// 5. 返回 canon_ancestor（尾巴为空）或 canon_ancestor.join(lexical.strip_prefix(ancestor)?)
+```
+
+一个可选的加固：`try_exists()` 返回 `Err`（权限拒绝）时现在被 `is_ok_and` 当成「不存在」继续往上走，最后错误会在 `fs::write` 处以 `PermissionDenied` 冒出来 —— 能接受，但更干净的是 `Err` 就直接 break，让 `canonicalize` 把真实原因报出来。
+
+#### ✅ 复测 v4：canon 补上了，junction 挡住；但「方案 A」在回执上挂了（2026-10-23）
+
+v4 的写法是**方案 A** —— canon 祖先做检查，但**返回词法 `canon`**（不 join 尾巴）。实测四类场景：
+
+| # | 场景 | 结果 |
+|---|---|---|
+| 1 | `link/escape.txt`（junction 单层） | `Err("路径越界: link/escape.txt")`，**沙箱外没多文件** ✔ |
+| 2 | `link/deep/nest/x.txt`（junction 多级） | `Err("路径越界: ...")`，沙箱外没建目录 ✔ |
+| 3 | `ok.txt`（普通相对） | `Ok("成功写入文件ok.txt : 4 字节")` ✔ |
+| 4 | `ok.txt`（**覆盖**已有文件） | `Ok("成功写入文件ok.txt : 9 字节")`，内容被替换 ✔ |
+| 5 | `D:\...\sb\abs.txt`（**沙箱内、普通绝对路径**） | 🔴 `Err("prefix not found")`，**但 `abs.txt` 真的写进去了** |
+
+**安全侧全对，回执侧挂了一个**：第 5 条是「写成功却报失败」—— 最坏的一类。原因在 `raw_invoke` 的回执：
+
+```rust
+Ok(format!("成功写入文件{} : {s} 字节", p.strip_prefix(root)?.display()))
+//                                        ↑ p 是词法路径 D:\...\sb\abs.txt
+//                                          root 是 canon 路径 \\?\D:\...\sb
+```
+
+`D:\...`.strip_prefix(`\\?\D:\...`) → `Err(StripPrefixError)`，Display 就是 `prefix not found`（**一句不提路径**）。而写已经完成了。
+
+⇒ 这正是 §七 ②「**两边都 canon 才可比**」的第三次出现，也是「方案 A：检查 A 使用 B」的代价 —— 我上一轮说"A 能用"只对了一半：**安全性上 A 没问题（尾巴不存在⇒无链接），但它把词法路径交回给了下游**，下游任何 `starts_with` / `strip_prefix` 都会撞上前缀不匹配。
+
+**两条出路，选 B**：
+
+- **B（推荐）**：返回 `canon_祖先.join(词法尾巴)` → 交出去的永远是 canon 前缀 + 词法尾巴，`strip_prefix(root)` 恒成立。代价是**必须处理空尾巴**（上一小节那个 267）。
+- A + 补丁：`strip_prefix(root).unwrap_or(&p)` → 不报错了，但回执会带 `D:\...`（宿主机绝对路径进 history，正是要避免的）。**不选**：修好一个洞又开一个。
+
+✅ 一句话：**"检查过的路径"和"交出去的路径"必须是同一个值** —— canon 只解决"怎么检查"，返回什么才决定"下游能不能用"。
+
+
 
 ### 3.6 验收标准
 
@@ -3146,21 +3494,24 @@ loop {
 - [x] **删 `ToolKind::tool_json()`**（零调用点），`chat` 的 `tools` 收 `&[WireTool]`；`let tools = ToolKind::tools()` 放**循环外**构造一次（**§3.7.6** 实测：`&Value` 路径每轮多 105 次分配，且 `to_value` 会把键按字母序重排 ⇒ 与 struct 声明序字节不同）
 - [x] `OpencodeGoClient` **手写 `Debug`**：`api_key` 打 `"***"`、`client` 打 `"<reqwest::Client>"`（**§3.7.3 / §3.7.5** 实测：`reqwest::Client` 的 `Debug` 会明文打出 `authorization: Bearer sk-...`）
 - [x] api_key **走 `.bearer_auth()` 每请求设置**，**不要**塞进 `default_headers`（**§3.7.3** 实测：`bearer_auth` 自动 `set_sensitive`，其余三种写法有两种明文泄漏）
-- [ ] **`chat()` 里删掉 `serde_json::to_value(chat_request)?`**，直接 `.json(&chat_request)`：现在跑的是「结构体 → `Value` → 再序列化」两趟，`to_value` 还会经 `BTreeMap` 把键按字母序重排
-- [ ] **`chat()` 先判状态码再 `text()`**：现在 4xx 会退化成 serde 的 `expected value at line 1 column 1`，body 里的真实报错丢了 ⇒ `if !status.is_success()` 时把 `status` + `body` 一起塞进 `anyhow` 错误
+- [x] **`chat()` 里删掉 `serde_json::to_value(chat_request)?`**（2026-10-23 已改：直接 `.json(&chat_request)`）
+- [x] **`chat()` 先判状态码再 `text()`**（2026-10-23 已改：`status` 先存下来，body 拿完再 `if !status.is_success()` 把 `status` + `body` 一起塞进 `anyhow`）
 - [ ] 删 `model.rs` 的 `pub struct ChatRequest`（零调用点，与 `llm.rs::WireRequest` 构成「两个真相」）+ 删 `main.rs` 的 `test_chat` / `get_chat`（协议探针使命已完成，现在是 dead code）
 - [x] 循环接上：`tool_calls` 非空 → 执行 → 回灌 → 继续（**§3.7.2** 六分支表；`client` 从参数进来、返回值不出现 `reqwest` 类型）—— **2026-10-22 真实任务跑通**
 - [x] 终止条件 + 步骤上限（`for step in 1..=max_steps`，`tool_calls` 为空即 break；`finish_reason` 只用于 `length` 日志）
-- [ ] **`ToolKind::ALL` 缩到「真能用的工具」**：`WriteFile` 已在 `ALL` 里、`spec()`/`parse_kind` 也全写好了，但 `raw_invoke` 走 `_ => bail!("工具尚不支持")` ⇒ **`write_file` 真的发给了模型**，实测模型白烧 2 步并猜出"临时故障 / 路径限制 / 大小写文件系统"三种错误假设（**§3.7.2 末 2026-10-22 实测**）。要么先缩 `ALL`，要么立刻实现
-- [ ] **`raw_invoke` 的 `_` 臂换成显式 `Invocation::WriteFile(..)`**：那个 `_` 是"漏臂静默"的唯一来源（换掉后加变体才会报 E0004）；顺带错误文案要带工具名 + 可用清单
-- [ ] **日志从 `read_file`/`list_files` 内部挪到 `Executor::run`**：现在写在 IO 函数里 ⇒ `WriteFile` 走 `_` 臂时一行日志都没有（实测第 3、4 步日志全空白），也污染直接调内层 IO 的测试。`run` 里同时握有工具名 / 入参 / 输出字节数
+- [x] **`ToolKind::ALL` 缩到「真能用的工具」**（2026-10-23 由「立刻实现」路径解决：`write_file` 已是真实现，`_` 臂已删）：`WriteFile` 已在 `ALL` 里、`spec()`/`parse_kind` 也全写好了，但 `raw_invoke` 走 `_ => bail!("工具尚不支持")` ⇒ **`write_file` 真的发给了模型**，实测模型白烧 2 步并猜出"临时故障 / 路径限制 / 大小写文件系统"三种错误假设（**§3.7.2 末 2026-10-22 实测**）。**2026-10-23 定：走「立刻实现」这条路，不缩 `ALL`** —— 顺序 = `write_file` → `run_command`
+- [x] **`raw_invoke` 的 `_` 臂换成显式 `Invocation::WriteFile(..)`**（2026-10-23 完成：`match` 三个臂穷尽、无 `_`，加变体会报 E0004；失败文案已带 `args.path`）：那个 `_` 是"漏臂静默"的唯一来源（换掉后加变体才会报 E0004）；顺带错误文案要带工具名 + 可用清单
+- [ ] **日志从 `read_file`/`list_files` 内部挪到 `Executor::run`**（**一半已做**：IO 函数里的 `println!` 已随 context 重构删掉，只剩 `run` 里两行。待改成 `→ 工具名(参数)` / `← N 字节`）：`run` 里同时握有工具名 / 入参 / 输出字节数
 - [ ] **`max_steps` 用尽后补一次 `tool_choice:"none"` 收尾**（V1）：实测耗尽时模型 `reasoning` 里已经写好结论（"report to user honestly"）却再没机会输出（**§3.7.2 末**）
 - [ ] `LlmClient` trait 立起来 —— **排在循环跑通之后**，签名从实际代码抄（§3.7.2）
-- [ ] 4 个工具实现：`list_files` / `read_file` ✔（2026-10-22 完成：`sort()` 确定序、`join` 替 `fold`、`file_name()` 相对路径、`[DIR]`/`[FILE]` 前缀、非 UTF-8 显式标注） / `write_file` / `run_command`
-- [ ] **`write_file` 的沙箱检查要单独写**：目标可能不存在 ⇒ `canonicalize` 会 ENOENT，必须对**父目录** canon + `starts_with`，再 `join(file_name)`；`file_name` 单独校验（无分隔符、不是 `.`/`..`）（**§3.5** 分工具策略表）
+- [ ] 4 个工具实现：`list_files` ✔ / `read_file` ✔（2026-10-22 完成：`sort()` 确定序、`join` 替 `fold`、`file_name()` 相对路径、`[DIR]`/`[FILE]` 前缀、非 UTF-8 显式标注） / `write_file` ✔（2026-10-23 v4：整文件覆盖 + 自动建父目录 + 祖先 canon） / `run_command`（待做）
+- [x] **`write_file` 的沙箱检查要单独写**（2026-10-23 v4 完成：`normalize_path` 消 `..` → 往上 `try_exists()` 找最深已存在祖先 → **canon 祖先** + `starts_with` → `symlink_metadata` 判非普通文件 → 仅 `NotFound` 才建父目录重试）：语义是**整文件覆盖**（`fs::write`，实测 20→2 字节截断无残留），返回里带「已覆盖 N 字节」。**必须自动建父目录**（V0 无 shell，模型没有 `mkdir -p` 兜底，2026-10-23 查证五家后修正）⇒ 写失败 `NotFound` 时：从 `target.parent()` 往上用 `try_exists()` 找**最深的已存在祖先** → canon + `starts_with` → `create_dir_all(parent)` → 重试写。`file_name()` 为 `None` 的输入（`""`/`..`/`a/..`）要拒；`target` 已存在时用 `symlink_metadata().is_file()` 判（`fs::write` 指向目录只报 `拒绝访问 os error 5`，看不出是目录）（**§3.5** 末 2026-10-23）
+- [ ] **`run_command` 收 `{program, args}`，不收命令字符串**：V0 不给 shell（实测管道会被 rg 当正则、`cmd` 单引号不是引号、`sh` 来自 WorkBuddy 自带 PortableGit）；白名单**只允许裸名**且排除 `cmd`/`sh`/`powershell`；显式 `.current_dir(root)`；退出码 **0/1 都算成功**、2+ 才 `Error:`；stdout+stderr 合并后截断（**§3.5** 末 2026-10-23 六组实测）
 - [x] **`tool.rs::truncates` 修 panic**：`while !text.is_char_boundary(end) { end -= 1 }` 已补，并加了「原文 N 行 / M 字节」报告（2026-10-22）
 - [x] **`Executor` 横切层 + `raw_invoke` 分派层**：`Executor{root, max_bytes}`（`new` 里 `canonicalize` 一次 = 不变量载体）、`run` = `raw_invoke` → `truncates`；`raw_invoke` 私有、每臂先 `resolve_in`（**§3.5**：校验函数必须**返回**后续真正被使用的那个值，不是 `bool`/`()`）
-- [ ] **`truncates` / `resolve_in` 两条单测**（现在测试 0 个）：`truncates("中".repeat(3000), 8192)` 不得 panic；`resolve_in(tmp, "../x")` 必须 `Err`
+- [x] **错误文案里的路径统一成 `args.path`**（2026-10-23 完成）：① ✔ `resolve_in` 的 `root.display()` 已删 ② ✔ `read_file`/`list_files` 的 `with_context` 已退化成裸 `?`，路径由 `raw_invoke` 用 `args.path` 补 ③ ✔ `WriteFile` 臂已加 `.with_context(|| format!("写入 {} 失败", args.path))`，`路径并不是合法文件!` 改成「目标已存在，但并不是普通文件!」（§3.5 末 2026-10-23 实测）
+- [ ] 🔴 **`resolve_for_write` 改成返回「canon 祖先 + 词法尾巴」（方案 B）**：canon 已经有了（junction 实测已挡住），但它**返回词法 `canon`** ⇒ `raw_invoke` 里 `p.strip_prefix(root)?` 撞上 `D:\...` vs `\\?\D:\...` 前缀不匹配，实测沙箱内绝对路径**写入成功却报 `Err("prefix not found")`**（副作用已发生，最坏的一类）。修法 `canon_祖先.join(词法尾巴)`，**空尾巴要单判**（`join("")` 会加尾分隔符 ⇒ `os error 267`，§3.5 末 2026-10-23 实测 v4）
+- [ ] **`truncates` / `resolve_in` 两条单测**（现有 1 个 `test_resolve_write` 覆盖 write 四场景；`truncates` 与 `resolve_in` 仍 0 覆盖）：`truncates("中".repeat(3000), 8192)` 不得 panic；`resolve_in(tmp, "../x")` 必须 `Err`；另需补 **junction 越界**用例（`mklink /J` 普通用户可建）与 **覆盖已有文件**用例
 - [ ] 安全边界落地：scratch 目录 + 写/shell 确认 + 命令白名单 + 输出截断（**路径沙箱已落地** 2026-10-22；「`run_command` 上线时路径检查即失效，必须换 OS 沙箱/白名单/容器」见 §3.5 调研小节）
 - [ ] 自答 §3.8 的 4 个问题
 - [ ] **验收**：拿 `my_api` 副本跑通一次真实修复（§3.6）

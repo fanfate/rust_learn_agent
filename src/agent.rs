@@ -26,6 +26,7 @@ pub async fn run_agent(
     let mut finished = false;
 
     for step in 1..=max_steps {
+        println!("----------");
         println!("开始第 {} 步", step);
 
         let mut resp = client.chat(&messages, &tools).await?;
@@ -49,7 +50,7 @@ pub async fn run_agent(
         }
 
         if let Some(ai_content) = content {
-            println!("AI : {}", ai_content);
+            println!("AI 回答 : {}", ai_content);
         }
 
         if tool_calls.is_empty() {
@@ -80,6 +81,8 @@ pub async fn run_agent(
                                 Ok(out) => out,
                                 Err(err) => format!("Error: {err:#}"),
                             };
+
+                            println!("Tool Result :\n{}", tool_res);
 
                             tool_messages.push(Message::Tool {
                                 tool_call_id: tool_id.clone(),
