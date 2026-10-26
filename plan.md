@@ -53,11 +53,20 @@
   → **返回 `canon_祖先.join(词法尾巴)`**，空尾巴单判）。
   关键坑：`tail` 必须 `canon.strip_prefix(canon_tmp)?`（**词法**祖先）；用 canon 后的祖先会因
   `VerbatimDisk` vs `Disk` 恒失败 → `unwrap_or` 静默吞掉 → `join` 遇绝对路径替换 → 退回"写成功却报
-  `prefix not found`"。**下一个动作 = ① `run_command` ② 日志改成 `→ 工具名(参数)` / `← N 字节`
-  ③ 补 `truncates` / `resolve_in` 两条单测。**
-  设计与实测见 `plan_v0.md` **§3.5 末七节**（2026-10-26 最新两节：复测 v6 + `\\?\` verbatim 前缀
-  与跨平台对照；此前五节含 rg/jq 走 prompt 还是专用工具、run_command 六组实测、`write_file` 覆盖语义、
-  错误文案用 `args.path`、junction 写穿 + 复测 v3/v4）。
+  `prefix not found`"。
+  **`run_command` 已写三版（2026-10-26 v3，当前编译不过）**：无 shell 的 `{program, args}` + 裸名检查 +
+  `ALLOW_CMD=[cargo,rg,yq,jq]` + `env_clear` 六变量最小集 + `.current_dir(root)` + 双流 pipe；
+  **退出码全走 `Ok`**（只有 `spawn` 失败才 `Err`），回执三段带标签。
+  上一轮的两组实测推翻了「0/1 算成功」：`yq` 真错误也是 1 且只写 stderr、`cargo test` 失败诊断全在 stdout。
+  **当前三个待修**：① 🔴 `tool.rs` 编译不过（`RunCommand` 臂结尾 `),}` —— 逗号落在块内，删掉即可）
+  ② 🔴 **两个安全检查被拆成两层**：白名单在 `raw_invoke`、裸名在 `run_command` ⇒ 白名单先跑，
+  裸名分支成了**死代码**，`rg.exe`/`./rg`/绝对路径三条撞同一句话。要合并到同一层（推荐都放 `raw_invoke`，
+  裸名在前）—— **V1 换 `Box<dyn Tool>` 时 `raw_invoke` 的 `match` 会消失，白名单留在那儿就是静默丢掉安全边界**
+  ③ 🟠 `.stdin(Stdio::null())`（`Command` 三流默认全 inherit ⇒ `cargo run` 会挂在人的终端上，agent 卡死）。
+  **修完下一个动作 = ① 日志改成 `→ 工具名(参数)` / `← N 字节` ② 补 `truncates` / `resolve_in` 两条单测。**
+  设计与实测见 `plan_v0.md` **§3.5 末（共 21 节，2026-10-26 最新四节**：复测 v6、`\\?\` verbatim 前缀与跨平台对照、
+  run_command 退出码分档被推翻的两组实测、v3 评审**）**；更早的含 rg/jq 走 prompt 还是专用工具、run_command 六组实测、
+  `write_file` 覆盖语义、错误文案用 `args.path`、junction 写穿 + 复测 v3/v4。
 
 ---
 
@@ -118,7 +127,7 @@ Python 改一行 prompt 直接跑；Rust 要等编译，还要跟所有权较劲
 
 ## 三、V0 详细 → 已归档到 [`plan_v0.md`](./plan_v0.md)
 
-> 📦 V0 的设计过程、协议实测报文、类型决策日志、安全边界与验收标准，全部搬到了 **`plan_v0.md`**（约 3500 行）。
+> 📦 V0 的设计过程、协议实测报文、类型决策日志、安全边界与验收标准，全部搬到了 **`plan_v0.md`**（约 3700 行）。
 > 章节号**原样保留**（§3.1 … §3.9），所以别处笔记里的「详见 §3.5」「§3.4.4」仍然有效，只是指向的是 `plan_v0.md`。
 > 本文件从此只负责：**路线图 + V1 之后的设计**。V0 的新发现写 `plan_v0.md`；只有**影响 V1+ 设计**的结论才在这里留摘要。
 
@@ -126,9 +135,9 @@ Python 改一行 prompt 直接跑；Rust 要等编译，还要跟所有权较劲
 
 | | |
 |---|---|
-| **已完成** | `.env` 三变量 · `config.rs` 五版定稿（方案 C 已落地） · 真实通道 **200** · **实验 2 / 2.5 闭环**（工具调用 → 回灌 → 收尾，prompt cache 命中 256） · **`model.rs` 类型齐了**（`content` 已收紧、`Invocation` 装箱 Args、`parse_kind` 一步解析） · **`llm.rs` 真实 200**（手写 `Debug`、`bearer_auth`、私有 `WireRequest<'a>`） · **循环跑通**（`for step in 1..=max_steps` + 错误回灌 `Error: {e:#}`） · **三个真工具** `read_file`/`list_files`/`write_file` + 路径沙箱（读侧 canon、写侧祖先 canon）+ 截断 |
-| **正在写** | **工具层最后一个工具** `run_command`（无 shell 的 `{program, args}` + 裸名白名单 + 退出码 0/1 都算成功），设计见 `plan_v0.md` §3.5 末 |
-| **下一个动作** | ① `run_command`（2026-10-26 起，见 `plan_v0.md` §3.5 末六组实测）② 日志改成 `→/←` ③ `truncates` / `resolve_in` 两条单测 ④ **最后**抽 `LlmClient` —— 顺序依据见 `plan_v0.md` §3.7.2 |
+| **已完成** | `.env` 三变量 · `config.rs` 五版定稿（方案 C 已落地） · 真实通道 **200** · **实验 2 / 2.5 闭环**（工具调用 → 回灌 → 收尾，prompt cache 命中 256） · **`model.rs` 类型齐了**（`content` 已收紧、`Invocation` 装箱 Args、`parse_kind` 一步解析） · **`llm.rs` 真实 200**（手写 `Debug`、`bearer_auth`、私有 `WireRequest<'a>`） · **循环跑通**（`for step in 1..=max_steps` + 错误回灌 `Error: {e:#}`） · **三个真工具** `read_file`/`list_files`/`write_file` + 路径沙箱（读侧 canon、写侧祖先 canon）+ 截断 · **第四个 `run_command` v3**（退出码全走 `Ok`，当前编译不过） |
+| **正在写** | **工具层最后一个工具** `run_command` v3：无 shell 的 `{program, args}` + 裸名+白名单 + `env_clear` 最小集 + `.current_dir(root)` + 双流 pipe，**退出码已全走 `Ok`**；当前卡在三处（编译错误 / 两个检查被拆层 ⇒ 裸名成死代码 / `stdin` 未 null），见 `plan_v0.md` §3.5 末 |
+| **下一个动作** | ① 删 `RunCommand` 臂那个逗号（现在编译不过）② 裸名与白名单**合并到同一层**（都放 `raw_invoke`，裸名在前）③ `.stdin(Stdio::null())` ④ 日志改成 `→/←` ⑤ `truncates` / `resolve_in` 两条单测 ⑥ **最后**抽 `LlmClient` —— 顺序依据见 `plan_v0.md` §3.7.2 |
 | **验收** | 在 `scratch/my_api` 副本上，说一句"让它通过编译"，agent 自主「读 → 改 → `cargo check` → 读报错 → 再改」，**中途不需介入** |
 | **欠账** | `config.rs` 的 `#[cfg(test)] mod tests`（有意留到 V0 跑通后） |
 
@@ -174,11 +183,11 @@ Python 教程（21.9k★）。**当"协议参照 + 概念词典 + 失败模式�
 
 ## 五、进度记录
 
-**V0** → 完整清单见 [`plan_v0.md` §五](./plan_v0.md)（**35 项已勾 / 14 项未勾**，截至 2026-10-26）。
-当前卡在：**工具层最后一公里**。循环已跑通（`for step in 1..=max_steps` + 回灌），三个真工具
-`read_file`/`list_files`/`write_file` 都已在，沙箱（读侧 canon / 写侧祖先 canon）与截断都在。
-`write_file` 还剩一个回执 bug：返回词法路径 ⇒ `strip_prefix(root)` 在沙箱内普通绝对路径上报
-`prefix not found`。下一步：修它 → `run_command` → 日志 → 单测 → `my_api` 副本验收。
+**V0** → 完整清单见 [`plan_v0.md` §五](./plan_v0.md)（**37 项已勾 / 19 项未勾**，截至 2026-10-26 v3）。
+当前卡在：**`run_command` 的收尾**。循环已跑通（`for step in 1..=max_steps` + 回灌），三个真工具
+`read_file`/`list_files`/`write_file` 都已在（沙箱读侧 canon / 写侧祖先 canon，截断在位），
+`run_command` 第三版写出来了但**编译不过**（`),}` 多一个逗号），且**两个安全检查被拆到两层** ⇒ 裸名检查成了死代码。
+修完这三处 → 日志 `→/←` → 单测 → `my_api` 副本验收。
 
 **V1**
 

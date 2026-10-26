@@ -1,13 +1,16 @@
+use crate::model::{Invocation, ToolKind};
+use anyhow::{Context, bail};
 use std::{
+    env,
+    ffi::OsStr,
     fs,
     path::{Component, Path, PathBuf},
+    process::{Command, Stdio},
 };
 
-use anyhow::{Context, bail};
-
-use crate::model::Invocation;
-
 const MAX_TOOL_OUTPUT: usize = 8 * 1024;
+
+//工具函数
 
 fn read_file(path: &Path) -> anyhow::Result<String> {
     Ok(fs::read_to_string(path)?)
@@ -65,6 +68,45 @@ fn write_file(path: &Path, content: &str) -> anyhow::Result<usize> {
         }
     }
 }
+
+fn run_command(program: &str, args: &[String], root: &Path) -> anyhow::Result<String> {
+    match Path::new(program).file_name() {
+        Some(p) => {
+            if p != program {
+                bail!("program 必须是裸名（不带路径、不带 .exe），命令不合法");
+            }
+        }
+        None => {
+            bail!("未找到可执行文件，命令不合法");
+        }
+    }
+
+    let mut cmd = Command::new(program);
+
+    let allow_path: &[&str] = &["PATH", "HOME", "USERPROFILE", "SystemRoot", "TEMP", "TMP"];
+    cmd.env_clear();
+    for key in allow_path {
+        if let Ok(val) = env::var(key) {
+            cmd.env(key, val);
+        }
+    }
+    cmd.current_dir(root);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.stdin(Stdio::null());
+
+    let output = cmd.args(args).spawn()?.wait_with_output()?;
+
+    let res_code = output.status.code().unwrap_or(-1);
+    let res_out = String::from_utf8_lossy_owned(output.stdout);
+    let res_error = String::from_utf8_lossy_owned(output.stderr);
+
+    Ok(format!(
+        "命令退出码: {res_code}\n返回结果: {res_out}\n错误信息: {res_error}\n"
+    ))
+}
+
+// 参数处理和输出后处理函数
 
 fn truncates(mut text: String, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
@@ -159,6 +201,8 @@ fn normalize_path(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(out)
 }
 
+// tool call
+
 impl Invocation {
     fn raw_invoke(&self, root: &Path) -> anyhow::Result<String> {
         match self {
@@ -178,6 +222,17 @@ impl Invocation {
                     "成功写入文件{} : {s} 字节",
                     p.strip_prefix(root)?.display()
                 ))
+            }
+            Invocation::RunCommand(args) => {
+                if !ToolKind::ALLOW_CMD.contains(&args.program.as_str()) {
+                    bail!(
+                        "{} 不是允许的合法命令, 合法命令为: [{}]",
+                        args.program,
+                        ToolKind::ALLOW_CMD.join(", ")
+                    );
+                }
+                run_command(&args.program, &args.args, root)
+                    .with_context(|| format!("执行命令 {} 失败", args.program))
             }
         }
     }

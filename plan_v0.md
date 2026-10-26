@@ -2231,7 +2231,7 @@ rg 参数错   -> code=2   success()=false   ← 这才是真错
 ```
 
 宿主要是写 `if !output.status.success() { bail!() }`，**「搜不到」会变成工具失败回灌**，模型会以为 rg 坏了、转去试别的办法。
-规则：**0 和 1 都算成功**，把 code 与 stdout/stderr 一起放进回灌文本让模型自己判断；**2 及以上**才标 `Error:`。
+最初定的规则是「**0 和 1 都算成功**，2 及以上才标 `Error:`」—— **这条被 2026-10-26 的复测推翻了一半**，见下面 `#### 退出码分档是错的`。
 
 **⑤ 两处必须显式设的东西。**
 
@@ -2239,6 +2239,57 @@ rg 参数错   -> code=2   success()=false   ← 这才是真错
 - **白名单只允许裸名**：拒绝绝对路径、拒绝 `..\..\bin\rg`、拒绝 `cmd`/`sh`/`powershell`/`wsl` 本身 —— 否则 `cmd /C ...` 就是万能逃逸，前面全白给。
 
 **⑥ 输出合并 + 截断**：stdout 与 stderr 都要（实测 `rg needle no_such_file.txt` 的错误全在 stderr、stdout 为空），合并后走现成的 `truncates`，并附退出码。
+
+#### `run_command`：退出码分档是错的，诊断信息可能整个丢光（2026-10-26，v2 复测）
+
+实现第一版按「0/1 = 成功、2+ = 失败」分档，并且**成功只取 stdout、失败只取 stderr**。两组实测证明这个分档在原理上就不成立。
+
+**① 退出码 `1` 的语义是程序特定的，宿主没法编码。**
+
+| 调用 | 退出码 | 输出去哪 |
+|---|---|---|
+| `rg zzz_nomatch .`（无匹配） | **1** | stdout 空 —— 这是**正常结果** |
+| `yq . nosuch.yaml`（文件不存在） | **1** | **stderr**: `Error: open nosuch.yaml: The system cannot find the file specified.` |
+| `yq . bad.yaml`（YAML 语法错） | **1** | **stderr** |
+| `jq . <<< 'not json'` | **5** | **stderr**: `jq: parse error: Invalid numeric literal at line 1, column 4` |
+| `jq . <<< '{"a":1}'` | 0 | stdout |
+
+`yq` 的两行是关键：**真错误也是 1**。分档把它判成成功 ⇒ 回执是 `命令退出码 1:\n`（stdout 空、stderr 被丢）—— **模型收到一条零信息量的回执**，只能瞎猜。
+
+**最硬的取证（2026-10-26，走真实 `Executor::run` → `format!("Error: {e:#}")`）：两条性质完全相反的命令，回执逐字节相同。**
+
+```
+yq . nosuch.yaml   （文件不存在，真错误）  ->  "命令退出码 1:"   19 字节
+rg  zzz_nomatch .  （正常业务结果，无匹配）->  "命令退出码 1:"   19 字节
+```
+
+⇒ 问题不是"少补一个字段"，而是**这两个结果在此设计下不可区分**。任何"给回执加点信息"的补丁都救不了，只能改流划分。
+
+**② 诊断信息经常在「不对应的那个流」里。**
+
+`cargo test` 有一个失败用例时：退出码 **101**，`running 1 test / test bad ... FAILED / panicked at src\lib.rs:2:12 / test result: FAILED` 全在 **stdout**，stderr 只有 **314 字节**的 `Compiling… / error: test failed, to rerun pass --lib`。
+
+按「失败只取 stderr」的写法，模型永远看不到**哪个测试失败、断言是什么、在哪一行**。而 V0 的验收任务正是「让 agent 在 `my_api` 副本上跑编译/测试并修」⇒ 这是对目标最致命的一条。
+
+**③ 顺带量到截断缺口。**
+
+同一个 80 个类型错误的 crate：
+
+```
+cargo check --message-format=short   -> stderr 6,533 字节
+cargo check（默认 rich 渲染）        -> stderr 17,213 字节 / 643 行
+MAX_TOOL_OUTPUT                      -> 8,192 字节
+```
+
+两件事：① 失败分支走 `bail!` ⇒ 绕过 `truncates`（`Executor::run` 的 `?` 直接上抛，`agent.rs` 只做 `format!("Error: {e:#}")`），17KB 原样进 history；② 即使截断生效，`error: could not compile … due to N previous errors` 这句在**尾部**，head-only 策略会把它切掉。
+
+**定案（取代 0/1 分档）：**
+
+- `run_command` **只把「进程没能启动」当 `Err`**（`spawn()` 失败：程序不在 PATH、参数非法）。退出码 0/1/2/101 全部走 `Ok`，回执里三段带标签：`退出码 N` + `--- stdout ---` + `--- stderr ---`（空的流省略）。理由：退出码是**程序的**语义，不是**宿主**的；而且这样只有一条路经过 `truncates`。
+- `Error:` 前缀保留给真正的工具失败（白名单、裸名、路径越界、程序起不来），**编译失败/测试失败是任务信息，不是工具故障** —— 与「模型能不能靠改变下一次输出来修复」那条分流判据一致。
+- 仍建议 `Executor::run` 对 `Err` 也截一次（`map_err(|e| anyhow!("{}", truncates(format!("{e:#}"), self.max_bytes)))`）作为兜底网，V1 再说。
+- 实用建议写进 system prompt：编译检查用 `cargo check --message-format=short`（实测 6.5KB vs 17KB，同样的信息量）。
+
 
 #### `write_file` 是整文件覆盖，不是插入（2026-10-23，实测）
 
@@ -2527,6 +2578,69 @@ verbatim: \\?\D:\a\..\b
 | 长度上限 | 260（或 32767） | 单段 255 字节，总长 4096 |
 
 结论：**`\\?\` 这一整套（前缀变体、大小写归一、尾随点剥离、`..` 报 123）在 Linux 上全部消失**，这是真实简化 —— v6 里 `strip_prefix(canon_tmp)` 那类坑不会出现。但**沙箱的两条根本洞（symlink、硬链接）在 Linux 上照样存在**，因为那是文件系统语义而非 Win32 层；而且 Linux 的 `..` 在 symlink 之后应用，**词法 normalize 反而更不可省**（只靠内核会把 `sb/link/../x` 解析到沙箱外）。
+
+#### `run_command` v3（2026-10-26）：退出码问题已解，暴露出「安全检查被拆成两层」
+
+v3 把退出码全走 `Ok`（只有 `spawn`/`wait_with_output` 失败才 `Err`），格式改成
+`命令退出码: N` + `返回结果:` + `错误信息:` 三段 —— 上面那节的两个「零信息量回执」问题消失。
+但新版本有四处：
+
+**🔴 ① 编译不过：逗号落进了块里**
+
+```rust
+run_command(&args.program, &args.args, root)
+    .with_context(|| format!("执行命令 {} 失败", args.program)),}   // ← 这个逗号在 } 之前
+```
+
+报 `expected one of '.', ';', '?', '}', or an operator, found ','`。`),}` 的读法是「表达式 + 逗号」然后 `}`
+关块 —— 块内 `expr,` 非法。逗号要放在 `}` **之后**。
+
+**🔴 ② 裸名检查成了死代码（两层检查顺序反了）**
+
+```
+raw_invoke:  白名单（ALLOW_CMD.contains）   ← 先跑
+run_command: 裸名（file_name() == program）  ← 永远到不了
+```
+
+实测 `file_name()` 判定（`.probe_bare`，已删）：
+
+| `program` | `file_name()` | 裸名检查 |
+|---|---|---|
+| `rg` | `Some("rg")` | 过 |
+| `rg.exe` | `Some("rg.exe")` | **过** ⇒ 由白名单兜住，**两个检查互补，不冗余** |
+| `./rg` | `Some("rg")` | 拦 |
+| `C:\…\rg.exe` / `""` / `..` / `sub/../rg` | `None` 或不等 | 拦 |
+
+因为白名单在前，`rg.exe` / `./rg` / 绝对路径**三条都撞同一句**「不是允许的合法命令」，
+裸名那句「必须是裸名」一次都不出现。
+
+**定案：两个检查必须在同一层**，不能一半在分派层、一半在工具里。
+
+- **A（推荐，与 `resolve_in` / `write_file` 的先例一致）**：都放 `raw_invoke`，**裸名在前、白名单在后**；
+  `run_command` 只留注释「无条件信任 `program` 已过校验」—— 跟 `write_file` 那句契约同一个模式。
+- **B**：都放 `run_command`，`raw_invoke` 只调不分派。
+
+必须选一个的硬理由：**V1 换 `Vec<Box<dyn Tool>>` 时 `raw_invoke` 的 `match` 会整个消失**
+⇒ 白名单留在分派层就等于**静默丢掉安全边界**（`write_file` 的 `_ => bail!` 那次是同一个教训的镜像）。
+
+**🟠 ③ `stdin` 默认是 inherit**
+
+`Command` 的 stdin/stdout/stderr **默认全部继承父进程**（std 文档），v3 只 pipe 了后两个。
+⇒ `cargo run`、任何读 stdin 的程序挂在**你的终端**上等输入，`wait_with_output()` 无限等、agent 卡死。
+`.stdin(Stdio::null())` 一行，把它们从「永久阻塞」降成「立刻 EOF」。
+（这条是文档结论，未实测 —— 演示阻塞需要一个真 TTY，探针环境里 stdin 本来就是 EOF。）
+
+**🟡 ④ 其余小处**
+
+- `RunCommandArg` 缺 `#[serde(deny_unknown_fields)]`（另外三个 Arg 都有）⇒ 模型传 `timeout` 被静默忽略。
+- `use std::ffi::OsStr` 未使用（`cargo check` 在报）；正好能把两层 `match` 压成
+  `if Path::new(program).file_name() != Some(OsStr::new(program))`。
+- `bail!(format!(…))` 是 clippy `useless_format`；`{}` 换 `{:?}`，空串/怪字符才看得见。
+- `resolve_in` 文案 `"无法解析路径{p}"` 缺空格 ⇒ 模型看到 `无法解析路径nope.txt`。
+- 回执总是打三段，`rg zzz_nomatch .` 得到 `命令退出码: 1` + 两个空标签。建议空段不打 ——
+  但**标签必须留**，它是 `role:"tool"` 没有 `is_error` 时唯一能区分 stdout / stderr 的东西。
+- 外侧 context「执行命令 `{}` 失败」→「无法执行 `{}`」：退出码全走 `Ok` 之后，`Err` 只剩
+  「拒绝执行 / 起不来」，命令根本没跑。
 
 ### 3.6 验收标准
 
@@ -3579,9 +3693,16 @@ loop {
 - [ ] **日志从 `read_file`/`list_files` 内部挪到 `Executor::run`**（**一半已做**：IO 函数里的 `println!` 已随 context 重构删掉，只剩 `run` 里两行。待改成 `→ 工具名(参数)` / `← N 字节`）：`run` 里同时握有工具名 / 入参 / 输出字节数
 - [ ] **`max_steps` 用尽后补一次 `tool_choice:"none"` 收尾**（V1）：实测耗尽时模型 `reasoning` 里已经写好结论（"report to user honestly"）却再没机会输出（**§3.7.2 末**）
 - [ ] `LlmClient` trait 立起来 —— **排在循环跑通之后**，签名从实际代码抄（§3.7.2）
-- [ ] 4 个工具实现：`list_files` ✔ / `read_file` ✔（2026-10-22 完成：`sort()` 确定序、`join` 替 `fold`、`file_name()` 相对路径、`[DIR]`/`[FILE]` 前缀、非 UTF-8 显式标注） / `write_file` ✔（2026-10-23 v4：整文件覆盖 + 自动建父目录 + 祖先 canon） / `run_command`（待做）
+- [ ] 4 个工具实现：`list_files` ✔ / `read_file` ✔（2026-10-22 完成：`sort()` 确定序、`join` 替 `fold`、`file_name()` 相对路径、`[DIR]`/`[FILE]` 前缀、非 UTF-8 显式标注） / `write_file` ✔（2026-10-23 v4：整文件覆盖 + 自动建父目录 + 祖先 canon） / `run_command` 🟡（2026-10-26 v3：裸名 + 白名单 + `env_clear` 最小集 + `current_dir` + 双流 pipe + **退出码全走 `Ok`**；待修编译错误 + 两个检查合并 + `stdin` null）
 - [x] **`write_file` 的沙箱检查要单独写**（2026-10-23 v4 完成：`normalize_path` 消 `..` → 往上 `try_exists()` 找最深已存在祖先 → **canon 祖先** + `starts_with` → `symlink_metadata` 判非普通文件 → 仅 `NotFound` 才建父目录重试）：语义是**整文件覆盖**（`fs::write`，实测 20→2 字节截断无残留），返回里带「已覆盖 N 字节」。**必须自动建父目录**（V0 无 shell，模型没有 `mkdir -p` 兜底，2026-10-23 查证五家后修正）⇒ 写失败 `NotFound` 时：从 `target.parent()` 往上用 `try_exists()` 找**最深的已存在祖先** → canon + `starts_with` → `create_dir_all(parent)` → 重试写。`file_name()` 为 `None` 的输入（`""`/`..`/`a/..`）要拒；`target` 已存在时用 `symlink_metadata().is_file()` 判（`fs::write` 指向目录只报 `拒绝访问 os error 5`，看不出是目录）（**§3.5** 末 2026-10-23）
-- [ ] **`run_command` 收 `{program, args}`，不收命令字符串**：V0 不给 shell（实测管道会被 rg 当正则、`cmd` 单引号不是引号、`sh` 来自 WorkBuddy 自带 PortableGit）；白名单**只允许裸名**且排除 `cmd`/`sh`/`powershell`；显式 `.current_dir(root)`；退出码 **0/1 都算成功**、2+ 才 `Error:`；stdout+stderr 合并后截断（**§3.5** 末 2026-10-23 六组实测）
+- [x] **`run_command` 收 `{program, args}`，不收命令字符串**（2026-10-26 v3 落地）：V0 不给 shell（实测管道会被 rg 当正则、`cmd` 单引号不是引号、`sh` 来自 WorkBuddy 自带 PortableGit）；`ALLOW_CMD = [cargo, rg, yq, jq]` 且**排除 `cmd`/`sh`/`powershell`**；`env_clear` + 六变量最小集（`PATH`/`HOME`/`USERPROFILE`/`SystemRoot`/`TEMP`/`TMP`，`LLM_API_KEY` 绝不进列表）；显式 `.current_dir(root)`；双流 pipe 后截断（**§3.5** 末 2026-10-23 六组实测 + 2026-10-26 v3）
+- [x] **`run_command` 的退出码不再分档（2026-10-26 复测推翻 0/1 规则；v3 已落地）**：`yq . nosuch.yaml` 真错误也是 **1** 且只写 stderr ⇒ 旧写法回执是零信息量的 `命令退出码 1:`；`cargo test` 失败（101）诊断全在 **stdout**（stderr 仅 314 字节）⇒ 旧写法把"哪个测试失败/断言是什么"整个丢掉。v3 改成：**只有 `spawn()` / `wait_with_output()` 失败才 `Err`，其余退出码全走 `Ok`**，回执带 `命令退出码: N` + `返回结果:` + `错误信息:`（§3.5 末 2026-10-26）
+- [ ] 🔴 **`tool.rs` 当前编译不过**：`raw_invoke` 的 `RunCommand` 臂结尾是 `.with_context(…)),}` —— 逗号落在**块内**（`}` 才是关块的），报 `expected one of '.', ';', '?', '}', or an operator, found ','`。删掉那个逗号即可（§3.5 末 2026-10-26 v3）
+- [ ] 🔴 **`run_command` 的两个安全检查必须合并到同一层**：白名单在 `raw_invoke`、裸名在 `run_command` ⇒ **白名单先跑，裸名分支永远到不了（死代码）**，`rg.exe` / `./rg` / 绝对路径三条撞同一句话。推荐都放 `raw_invoke`（**裸名在前、白名单在后**，与 `resolve_in`/`write_file` 先例一致），`run_command` 只留「无条件信任 `program` 已过校验」的注释。硬理由：**V1 换 `Box<dyn Tool>` 时 `raw_invoke` 的 `match` 会消失 ⇒ 白名单留在那儿就是静默丢掉安全边界**（§3.5 末 2026-10-26 v3 实测）
+- [ ] 🟠 **`run_command` 要 `.stdin(Stdio::null())`**：`Command` 的 stdin/stdout/stderr **默认全部继承父进程**，v3 只 pipe 了后两个 ⇒ `cargo run` / 任何读 stdin 的程序挂在**人的终端**上等输入，`wait_with_output()` 无限等、agent 卡死。一行修成「立刻 EOF」（§3.5 末 2026-10-26 v3）
+- [ ] 🟠 **`Executor::run` 对 `Err` 也要截断**：现在 `?` 直接上抛，`agent.rs` 只做 `format!("Error: {e:#}")` ⇒ `cargo check` 一个 80 错的 crate 产生 **17,213 字节 / 643 行** stderr（`--message-format=short` 是 6,533），全部原样进 history（`MAX_TOOL_OUTPUT` = 8192）。⚠️ 退出码全走 `Ok` 之后这条已大幅降级（`Err` 只剩 `spawn`/拒绝执行，文案都很短），属防御性兜底（§3.5 末 2026-10-26 实测）
+- [ ] 🟡 **`run_command` 两条 bail 文案：缺「可用清单」的已补，归因仍是假话**（2026-10-26 二次更正）：`program` 原文**本来就有**（`with_context` 会串成 `执行命令 rg.exe 失败: …`）—— 原判断说"不含收到的值"是错的。① ✔ 白名单那句已带 `ALLOW_CMD.join(", ")` ② ✘ `./rg` / 绝对路径撞的是**裸名检查**，却报「**未找到可执行文件**」——**归因假话**（`rg.exe` 明明在 PATH 里，它没去找过）⇒ 模型会往"是不是没装 rg"排查 ③ 外侧 context「执行命令 `{}` 失败」→「无法执行 `{}`」（退出码全走 `Ok` 之后 `Err` 只剩拒绝执行/起不来，命令根本没跑）
+- [ ] 🟡 **`RunCommandArg` 缺 `deny_unknown_fields`**（`WriteFileArg` 有）：模型传 `{"program":"rg","args":[],"timeout":5}` 会被**静默忽略** `timeout`，以为设了超时
 - [x] **`tool.rs::truncates` 修 panic**：`while !text.is_char_boundary(end) { end -= 1 }` 已补，并加了「原文 N 行 / M 字节」报告（2026-10-22）
 - [x] **`Executor` 横切层 + `raw_invoke` 分派层**：`Executor{root, max_bytes}`（`new` 里 `canonicalize` 一次 = 不变量载体）、`run` = `raw_invoke` → `truncates`；`raw_invoke` 私有、每臂先 `resolve_in`（**§3.5**：校验函数必须**返回**后续真正被使用的那个值，不是 `bool`/`()`）
 - [x] **错误文案里的路径统一成 `args.path`**（2026-10-23 完成）：① ✔ `resolve_in` 的 `root.display()` 已删 ② ✔ `read_file`/`list_files` 的 `with_context` 已退化成裸 `?`，路径由 `raw_invoke` 用 `args.path` 补 ③ ✔ `WriteFile` 臂已加 `.with_context(|| format!("写入 {} 失败", args.path))`，`路径并不是合法文件!` 改成「目标已存在，但并不是普通文件!」（§3.5 末 2026-10-23 实测）

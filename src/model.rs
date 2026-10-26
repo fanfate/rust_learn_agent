@@ -74,11 +74,21 @@ pub struct WriteFileArg {
     pub content: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunCommandArg {
+    pub program: String,
+
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 #[derive(Debug)]
 pub enum Invocation {
     ReadFile(ReadFileArg),
     ListFiles(ListFilesArg),
     WriteFile(WriteFileArg),
+    RunCommand(RunCommandArg),
 }
 
 impl Invocation {
@@ -108,6 +118,14 @@ impl Invocation {
                     })?;
                 Ok(Self::WriteFile(write_args))
             }
+            ToolKind::RunCommand => {
+                let runcmd_args: RunCommandArg =
+                    serde_json::from_str(args).map_err(|err| ToolError::WrongParams {
+                        name: kind.name().to_string(),
+                        details: err.to_string(),
+                    })?;
+                Ok(Self::RunCommand(runcmd_args))
+            }
         }
     }
 
@@ -116,6 +134,11 @@ impl Invocation {
             Self::ReadFile(args) => format!("read_file, path : {}", args.path),
             Self::ListFiles(args) => format!("list_files, path : {}", args.path),
             Self::WriteFile(args) => format!("write_file, path : {}", args.path),
+            Self::RunCommand(args) => format!(
+                "run_command, program : {}, args : {}",
+                args.program,
+                args.args.join(" ")
+            ),
         }
     }
 }
@@ -130,7 +153,7 @@ pub struct WireTool {
 #[derive(Debug, Serialize)]
 pub struct FunctionDecl {
     pub name: &'static str,
-    pub description: &'static str,
+    pub description: String,
     pub parameters: serde_json::Value,
     pub strict: bool,
 }
@@ -140,16 +163,25 @@ pub enum ToolKind {
     ReadFile,
     ListFiles,
     WriteFile,
+    RunCommand,
 }
 
 impl ToolKind {
-    const ALL: &'static [ToolKind] =
-        &[ToolKind::ReadFile, ToolKind::ListFiles, ToolKind::WriteFile];
+    const ALL: &'static [ToolKind] = &[
+        ToolKind::ReadFile,
+        ToolKind::ListFiles,
+        ToolKind::WriteFile,
+        ToolKind::RunCommand,
+    ];
+
+    pub const ALLOW_CMD: &'static [&str] = &["cargo", "rg", "yq", "jq"];
+
     pub fn name(&self) -> &'static str {
         match self {
             ToolKind::ReadFile => "read_file",
             ToolKind::ListFiles => "list_files",
             ToolKind::WriteFile => "write_file",
+            ToolKind::RunCommand => "run_command",
         }
     }
 
@@ -157,36 +189,57 @@ impl ToolKind {
         match self {
             ToolKind::ReadFile => FunctionDecl {
                 name: "read_file",
-                description: "读取文件内容，路径相对沙箱根目录",
+                description: "读取文件内容，路径相对沙箱根目录".to_string(),
                 parameters: serde_json::json!({
-                "type": "object",
-                "properties": { "path": { "type": "string" } },
-                "required": ["path"],
-                "additionalProperties": false
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"],
+                    "additionalProperties": false
                 }),
                 strict: true,
             },
             ToolKind::ListFiles => FunctionDecl {
                 name: "list_files",
-                description: "列出路径下的所有文件，路径相对沙箱根目录，前缀DIR代表路径，FILE代表文件",
+                description:
+                    "列出路径下的所有文件，路径相对沙箱根目录，前缀DIR代表路径，FILE代表文件"
+                        .to_string(),
                 parameters: serde_json::json!({
-                "type": "object",
-                "properties": { "path": { "type": "string" } },
-                "required": ["path"],
-                "additionalProperties": false
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"],
+                    "additionalProperties": false
                 }),
                 strict: true,
             },
             ToolKind::WriteFile => FunctionDecl {
                 name: "write_file",
-                description: "写入文件内容，路径相对沙箱根目录, 覆盖整个文件（不是追加/插入）,会自动创建缺失的父目录,返回写入文件的字节数",
+                description: "写入文件内容，路径相对沙箱根目录, 覆盖整个文件（不是追加/插入）,\
+                    会自动创建缺失的父目录,返回写入文件的字节数"
+                    .to_string(),
                 parameters: serde_json::json!({
-                "type": "object",
-                "properties": { "path": { "type": "string" }, "content" : { "type" : "string" } },
-                "required": ["path", "content"],
-                "additionalProperties": false
+                    "type": "object",
+                    "properties": { "path": { "type": "string" }, "content" : { "type" : "string" } },
+                    "required": ["path", "content"],
+                    "additionalProperties": false
                 }),
                 strict: true,
+            },
+            ToolKind::RunCommand => FunctionDecl {
+                name: "run_command",
+                description: format!(
+                    "运行命令行命令。\n1.没有 shell：不支持管道、重定向、通配符、变量展开; \n\
+                        2.program 只接受裸名，且必须在白名单里，白名单为: [{}];\n\
+                        3.工作目录固定在沙箱根，路径都相对它;\n\
+                        4.返回：退出码 + stdout + stderr；输出过长会被截断",
+                    Self::ALLOW_CMD.join(", ")
+                ),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": { "program": { "type": "string" }, "args" : { "type" : "array", "items" : {"type" : "string"} } },
+                    "required": ["program"],
+                    "additionalProperties": false
+                }),
+                strict: false,
             },
         }
     }
