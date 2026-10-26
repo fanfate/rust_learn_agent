@@ -2451,7 +2451,82 @@ Ok(format!("成功写入文件{} : {s} 字节", p.strip_prefix(root)?.display())
 
 ✅ 一句话：**"检查过的路径"和"交出去的路径"必须是同一个值** —— canon 只解决"怎么检查"，返回什么才决定"下游能不能用"。
 
+#### ✅ 复测 v6：方案 B 落地，11/11 通过（2026-10-26）
 
+v5 已经补了 `canon_ancestor.join(tail)`，但仍然 `prefix not found`。**根因不在拼接，在 `strip_prefix` 的左手**：
+
+```rust
+let tail = canon.strip_prefix(&canon_ancestor).unwrap_or(&canon);   // ✘ v5
+let tail = canon.strip_prefix(canon_tmp)?;                          // ✔ v6
+```
+
+`canon` 是**词法**路径，`canon_ancestor` 是 **canon 后**的。模型给普通绝对路径（`D:\...`）时，`canon` 是 `Prefix(Disk('D'))`、`canon_ancestor` 是 `Prefix(VerbatimDisk('D'))` ⇒ strip 必失败 ⇒ `unwrap_or(&canon)` 把**整条绝对路径**当尾巴 ⇒ `join` 遇绝对路径**静默替换** ⇒ 返回词法路径，等于退回方案 A。
+
+左手换成 `canon_tmp`（循环里那个**词法**祖先）就必然成功：`canon` 正是沿它的 `parent()` 链派生的，同源同形态。
+
+v6 实测 11/11（含 junction 用 `mklink /J` 真建）：
+
+| # | 输入 | 结果 |
+|---|---|---|
+| 9a / 9b | `D:\...\sb\abs.txt`（**沙箱内普通绝对路径**，新建 / 覆盖） | `Ok` ✔ —— 上两版的 `prefix not found` 消失 |
+| 1 / 4 | `new.txt` / `ok.txt`（覆盖） | `Ok`，内容替换 ✔ |
+| 7 / 8 | `sub/case.txt`（真实名 `Sub`），覆盖同上 | `Ok`，回执是 **`Sub\case.txt`**（真实大小写）⇒ 证明走的是真拼接，不再靠 `unwrap_or` 退化 |
+| 2 / 3 | `link/escape.txt`、`link/deep/nest/x.txt` | `Err 路径越界`，沙箱外无文件、无目录 ✔ |
+| 5 | `../x.txt` | `Err 路径越界`，无副作用 ✔ |
+| 10 / 11 | verbatim 绝对路径 / `d1/d2/d3/deep.txt` | `Ok` ✔ |
+
+第 7、8 条是**判断"到底走了哪条分支"的探针**：`unwrap_or` 那条会原样返回词法大小写（回执 `sub\...`），真拼接这条返回 canon 前缀（回执 `Sub\...`）。只断言 `is_ok()` 永远看不出区别。
+
+⚠️ `unwrap_or` 这形态在本项目已第三次出现（`to_str()` 的 `if let`、`is_ok_and` 吞 `Err`、这里的 `unwrap_or(&canon)`）—— **失败被静默降级成"看起来成功"**，是这个项目最容易复发的一类 bug。
+
+#### `\\?\` 到底是什么，为什么每次都在（跨平台对照）
+
+`\\?\` 是 Win32 的 **verbatim path（逐字路径）** 前缀，Rust 里是 `Prefix::VerbatimDisk`。名字里的 `?` 语义就是「**这串别再解析了，直接往下传**」。
+
+Win32 拿到路径后做两件不同的事：
+
+```
+plain:    D:\a\..\b
+            ↓ RtlGetFullPathName_U ← 拼 CWD、消 . / ..、把 / 改成 \、剥尾随点和空格
+          D:\b
+            ↓
+          \??\D:\b                    ← 对象管理器的 DOS 设备目录
+
+verbatim: \\?\D:\a\..\b
+            ↓ 只做一件：\\?\ → \?\
+          \??\D:\a\..\b               ← 一个字节都不解释
+```
+
+`\??\` 是 NT 对象命名空间里真实存在的目录（`\??\C:` 就是盘符），`\\?\` 是它在 Win32 侧的别名。`\\?\UNC\server\share\x` 是同一条规则用在网络路径上（`\\?\` 后面必须接卷，UNC 没有卷，所以补一个 `UNC` 段）—— 实测 `canonicalize("\\\\localhost\\C$\\Windows")` = `\\?\UNC\localhost\C$\Windows`。
+
+**它关掉的四件事**（实测 2026-10-26）：
+
+| 关掉什么 | 实测（同一路径两种写法） |
+|---|---|
+| `..` / `.` 解析 | `sb\a\..\b.txt`：plain 写成 **`sb\b.txt`**；verbatim **报 123**（把 `..` 当字面目录名） |
+| `/` → `\` 转换 | `sb/slash/x.txt`：plain 当分隔符；verbatim **报 123**（`/` 只是普通字符） |
+| 剥尾随点和空格 | 写 `trail.`：plain 落盘 **`trail`**；verbatim 落盘 **`trail.`**（两个文件并存） |
+| 260 字符上限 | 本机 `LongPathsEnabled = 1`（Win11 build 26300）⇒ 355 字符 plain 也成功，**这条测不出来** |
+
+最后一行说明：`\\?\` 从来是"无条件解药"，但 Win10 1607+ 的 `LongPathsEnabled`（需程序 manifest 声明 `longPathAware`）让它对长度不再是唯一手段。**我们现在需要它的理由是前三条语义，不是长度。**
+
+**为什么 canonicalize 必然给 verbatim**：`GetFinalPathNameByHandleW` 默认 `VOLUME_NAME_DOS` 就返回这个形式 —— 因为只有它能把真名 1:1 表示出来（plain 形式会剥尾随空格、展开 8.3 短名、改大小写）。⇒ **只要 canon，就必然撞 `VerbatimDisk` vs `Disk`**，`starts_with` / `strip_prefix` 的两次坑都源于此。
+
+**⚠️ 它不是安全特性，是"更字面"**：`\\?\` 下 `NUL` / `CON` 这类 Win32 保留设备名**真的能被创建成普通文件**（实测落盘条目出现 `CON`、`NUL`），而 plain 写法是写进设备黑洞（返回 `Ok` 但什么都没创建）。它不做任何访问检查，沙箱仍得自己 canon + `starts_with`。推论：`normalize_path` **必须自己消掉 `..`**，不能指望系统 —— 漏了会以 `123 文件名、目录名或卷标语法不正确` 出现，模型完全猜不到是 `..` 的锅。
+
+**Linux / POSIX 对照**（换平台时不用重新推理）：
+
+| 现象 | Windows | Linux |
+|---|---|---|
+| canon 输出形态 | `\\?\D:\...` verbatim | 纯绝对路径，无前缀 |
+| 盘符前缀变体 | `Disk` vs `VerbatimDisk` ⇒ 两边必须都 canon | 不存在，`starts_with` 不会因形态不同失败 |
+| 大小写 | 不敏感，canon 归一成真实大小写（`sub` → `Sub`） | 敏感，`sub` 和 `Sub` 是两个目录 |
+| `..` 谁解析 | Win32 层（verbatim 下不解析，报 123） | **内核**解析，且是在**跟随 symlink 之后**应用 ⇒ `sb/link/../x`（`link`→ 外面）会逃逸 |
+| `/` 与 `\` | `/` 被转换；`\` 是分隔符 | `/` 是分隔符；**`\` 是合法文件名字符** |
+| 尾随分隔符 | 267 `NotADirectory` | `ENOTDIR`（同义不同 errno） |
+| 长度上限 | 260（或 32767） | 单段 255 字节，总长 4096 |
+
+结论：**`\\?\` 这一整套（前缀变体、大小写归一、尾随点剥离、`..` 报 123）在 Linux 上全部消失**，这是真实简化 —— v6 里 `strip_prefix(canon_tmp)` 那类坑不会出现。但**沙箱的两条根本洞（symlink、硬链接）在 Linux 上照样存在**，因为那是文件系统语义而非 Win32 层；而且 Linux 的 `..` 在 symlink 之后应用，**词法 normalize 反而更不可省**（只靠内核会把 `sb/link/../x` 解析到沙箱外）。
 
 ### 3.6 验收标准
 
@@ -3510,7 +3585,7 @@ loop {
 - [x] **`tool.rs::truncates` 修 panic**：`while !text.is_char_boundary(end) { end -= 1 }` 已补，并加了「原文 N 行 / M 字节」报告（2026-10-22）
 - [x] **`Executor` 横切层 + `raw_invoke` 分派层**：`Executor{root, max_bytes}`（`new` 里 `canonicalize` 一次 = 不变量载体）、`run` = `raw_invoke` → `truncates`；`raw_invoke` 私有、每臂先 `resolve_in`（**§3.5**：校验函数必须**返回**后续真正被使用的那个值，不是 `bool`/`()`）
 - [x] **错误文案里的路径统一成 `args.path`**（2026-10-23 完成）：① ✔ `resolve_in` 的 `root.display()` 已删 ② ✔ `read_file`/`list_files` 的 `with_context` 已退化成裸 `?`，路径由 `raw_invoke` 用 `args.path` 补 ③ ✔ `WriteFile` 臂已加 `.with_context(|| format!("写入 {} 失败", args.path))`，`路径并不是合法文件!` 改成「目标已存在，但并不是普通文件!」（§3.5 末 2026-10-23 实测）
-- [ ] 🔴 **`resolve_for_write` 改成返回「canon 祖先 + 词法尾巴」（方案 B）**：canon 已经有了（junction 实测已挡住），但它**返回词法 `canon`** ⇒ `raw_invoke` 里 `p.strip_prefix(root)?` 撞上 `D:\...` vs `\\?\D:\...` 前缀不匹配，实测沙箱内绝对路径**写入成功却报 `Err("prefix not found")`**（副作用已发生，最坏的一类）。修法 `canon_祖先.join(词法尾巴)`，**空尾巴要单判**（`join("")` 会加尾分隔符 ⇒ `os error 267`，§3.5 末 2026-10-23 实测 v4）
+- [x] **`resolve_for_write` 返回「canon 祖先 + 词法尾巴」（方案 B）**（2026-10-26 v6 完成）：`canon_祖先.join(tail)` + 空尾巴单判；**关键坑**是 `tail` 必须 `canon.strip_prefix(canon_tmp)?`（**词法**祖先），用 `canon_ancestor`（canon 后）会因 `VerbatimDisk` vs `Disk` 恒失败、再被 `unwrap_or(&canon)` 静默吞掉 ⇒ `join` 遇绝对路径替换 ⇒ 退回方案 A。v6 实测 **11/11**：沙箱内普通绝对路径（新建/覆盖）、大小写不同祖先（回执 `Sub\...` 证明走了真拼接）、junction 单层/多级、`../` 越界、深层建目录全过（§3.5 末 2026-10-26）
 - [ ] **`truncates` / `resolve_in` 两条单测**（现有 1 个 `test_resolve_write` 覆盖 write 四场景；`truncates` 与 `resolve_in` 仍 0 覆盖）：`truncates("中".repeat(3000), 8192)` 不得 panic；`resolve_in(tmp, "../x")` 必须 `Err`；另需补 **junction 越界**用例（`mklink /J` 普通用户可建）与 **覆盖已有文件**用例
 - [ ] 安全边界落地：scratch 目录 + 写/shell 确认 + 命令白名单 + 输出截断（**路径沙箱已落地** 2026-10-22；「`run_command` 上线时路径检查即失效，必须换 OS 沙箱/白名单/容器」见 §3.5 调研小节）
 - [ ] 自答 §3.8 的 4 个问题

@@ -118,18 +118,25 @@ fn resolve_for_write(root: &Path, p: &str) -> anyhow::Result<PathBuf> {
             break;
         }
 
-        let Some(p) = canon_tmp.parent() else {
+        let Some(parent) = canon_tmp.parent() else {
             break;
         };
 
-        canon_tmp = p;
+        canon_tmp = parent;
     }
 
-    if !fs::canonicalize(canon_tmp)?.starts_with(root) {
+    let canon_ancestor = fs::canonicalize(canon_tmp)?;
+
+    if !canon_ancestor.starts_with(root) {
         bail!("路径越界: {p}");
     }
 
-    Ok(canon)
+    let tail = canon.strip_prefix(canon_tmp)?;
+    if tail.as_os_str().is_empty() {
+        Ok(canon_ancestor)
+    } else {
+        Ok(canon_ancestor.join(tail))
+    }
 }
 
 fn normalize_path(path: &Path) -> anyhow::Result<PathBuf> {
