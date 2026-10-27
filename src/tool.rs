@@ -1,7 +1,9 @@
-use crate::model::{Invocation, ToolKind};
+use crate::{
+    config,
+    model::{Invocation, ToolKind},
+};
 use anyhow::{Context, bail};
 use std::{
-    env,
     ffi::OsStr,
     fs,
     path::{Component, Path, PathBuf},
@@ -9,6 +11,7 @@ use std::{
 };
 
 const MAX_TOOL_OUTPUT: usize = 8 * 1024;
+const LINE_SNAP_MAX: usize = 256;
 
 //工具函数
 
@@ -70,25 +73,11 @@ fn write_file(path: &Path, content: &str) -> anyhow::Result<usize> {
 }
 
 fn run_command(program: &str, args: &[String], root: &Path) -> anyhow::Result<String> {
-    match Path::new(program).file_name() {
-        Some(p) => {
-            if p != program {
-                bail!("program 必须是裸名（不带路径、不带 .exe），命令不合法");
-            }
-        }
-        None => {
-            bail!("未找到可执行文件，命令不合法");
-        }
-    }
-
     let mut cmd = Command::new(program);
 
-    let allow_path: &[&str] = &["PATH", "HOME", "USERPROFILE", "SystemRoot", "TEMP", "TMP"];
-    cmd.env_clear();
-    for key in allow_path {
-        if let Ok(val) = env::var(key) {
-            cmd.env(key, val);
-        }
+    let disallow_path = config::LLM_ENV_KEYS;
+    for key in disallow_path {
+        cmd.env_remove(key);
     }
     cmd.current_dir(root);
     cmd.stdout(Stdio::piped());
@@ -101,33 +90,89 @@ fn run_command(program: &str, args: &[String], root: &Path) -> anyhow::Result<St
     let res_out = String::from_utf8_lossy_owned(output.stdout);
     let res_error = String::from_utf8_lossy_owned(output.stderr);
 
-    Ok(format!(
-        "命令退出码: {res_code}\n返回结果: {res_out}\n错误信息: {res_error}\n"
-    ))
+    let mut res_str = format!("命令退出码: {res_code}\n");
+    if !res_out.is_empty() {
+        res_str = format!("{res_str}返回结果: {res_out}\n");
+    }
+    if !res_error.is_empty() {
+        res_str = format!("{res_str}错误信息: {res_error}\n");
+    }
+
+    Ok(res_str)
 }
 
 // 参数处理和输出后处理函数
 
-fn truncates(mut text: String, max_bytes: usize) -> String {
+fn truncate_head(mut text: String, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text;
     }
 
-    let (line_count, length) = (text.lines().count(), text.len());
+    let (total_len, total_lines) = (text.len(), text.lines().count());
 
-    let mut end = max_bytes;
-    if let Some(pos) = text.as_bytes()[..end].iter().rposition(|&b| b == b'\n') {
-        end = pos + 1;
-    }
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-
-    text.truncate(end);
+    let (head, _) = truncate_middle(&text, max_bytes, 0);
+    text.truncate(head);
+    let now_lines = text.lines().count();
+    let now_len = text.len();
     format!(
-        "{text}...[过长截断, 最大{max_bytes}字节, 原文{}行/{}字节]\n",
-        line_count, length
+        "{text}...内容过长，只返回了前{now_lines}行/{now_len}字节，原文共{total_lines}行/{total_len}字节\n"
     )
+}
+
+fn truncate_head_tail(text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let (total_len, total_lines) = (text.len(), text.lines().count());
+
+    let (head, tail) = truncate_middle(&text, max_bytes - max_bytes / 4, max_bytes / 4);
+
+    let middle_lines = &text[head..tail].lines().count();
+    let middle_len = &text[head..tail].len();
+
+    format!(
+        "{}\n...[中间省略{middle_lines}行/{middle_len}字节，原文{total_lines}行/{total_len}字节]\n{}",
+        &text[..head],
+        &text[tail..]
+    )
+}
+
+fn truncate_middle(text: &str, head_bytes: usize, tail_bytes: usize) -> (usize, usize) {
+    let total_bytes = text.len();
+    if total_bytes <= head_bytes + tail_bytes {
+        return (total_bytes, total_bytes);
+    }
+
+    let mut head_end = std::cmp::min(head_bytes, total_bytes);
+    if let Some(pos) = text.as_bytes()[..head_end]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        && head_end - pos < LINE_SNAP_MAX
+    {
+        head_end = pos + 1;
+    };
+    while !text.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+
+    let mut tail_start = total_bytes.saturating_sub(tail_bytes);
+    if let Some(pos) = text.as_bytes()[tail_start..]
+        .iter()
+        .position(|&b| b == b'\n')
+        && pos < LINE_SNAP_MAX
+    {
+        tail_start = tail_start + pos + 1;
+    }
+    while !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+
+    debug_assert!(
+        head_end <= tail_start,
+        "head_end={head_end} tail_start={tail_start} total={total_bytes}"
+    );
+
+    (head_end, tail_start)
 }
 
 fn resolve_in(root: &Path, p: &str) -> anyhow::Result<PathBuf> {
@@ -138,7 +183,7 @@ fn resolve_in(root: &Path, p: &str) -> anyhow::Result<PathBuf> {
     };
 
     let canon = fs::canonicalize(&target)
-        .with_context(|| format!("无法解析路径{p}, 可用 list_files '.' 查看根目录"))?;
+        .with_context(|| format!("无法解析路径 {p} , 可用 list_files '.' 查看根目录"))?;
     if !canon.starts_with(root) {
         bail!("路径越界: {p}");
     }
@@ -170,7 +215,7 @@ fn resolve_for_write(root: &Path, p: &str) -> anyhow::Result<PathBuf> {
     let canon_ancestor = fs::canonicalize(canon_tmp)?;
 
     if !canon_ancestor.starts_with(root) {
-        bail!("路径越界: {p}");
+        bail!("路径越界(不在沙箱内，可能经过符号连接): {p}");
     }
 
     let tail = canon.strip_prefix(canon_tmp)?;
@@ -188,7 +233,7 @@ fn normalize_path(path: &Path) -> anyhow::Result<PathBuf> {
             Component::CurDir => (),
             Component::ParentDir => {
                 if !out.pop() {
-                    bail!("路径越界")
+                    bail!("路径中含过多'..'，越界沙箱根")
                 }
             }
             Component::Normal(name) => {
@@ -220,10 +265,15 @@ impl Invocation {
                     .with_context(|| format!("写入 {} 失败", args.path))?;
                 Ok(format!(
                     "成功写入文件{} : {s} 字节",
-                    p.strip_prefix(root)?.display()
+                    p.strip_prefix(root)
+                        .expect("canon 必然以词法祖先为前缀")
+                        .display()
                 ))
             }
             Invocation::RunCommand(args) => {
+                if Path::new(&args.program).file_name() != Some(OsStr::new(&args.program)) {
+                    bail!("program 必须是裸名（不带路径），命令不合法");
+                }
                 if !ToolKind::ALLOW_CMD.contains(&args.program.as_str()) {
                     bail!(
                         "{} 不是允许的合法命令, 合法命令为: [{}]",
@@ -232,7 +282,7 @@ impl Invocation {
                     );
                 }
                 run_command(&args.program, &args.args, root)
-                    .with_context(|| format!("执行命令 {} 失败", args.program))
+                    .with_context(|| format!("无法执行命令 {}", args.program))
             }
         }
     }
@@ -258,7 +308,10 @@ impl Executor {
         println!("开始调用工具...");
         println!("Tool Info : {}", inv.info());
         let raw = inv.raw_invoke(&self.root)?;
-        Ok(truncates(raw, self.max_bytes))
+        match inv {
+            Invocation::RunCommand(_) => Ok(truncate_head_tail(raw, self.max_bytes)),
+            _ => Ok(truncate_head(raw, self.max_bytes)),
+        }
     }
 }
 

@@ -2642,6 +2642,124 @@ run_command: 裸名（file_name() == program）  ← 永远到不了
 - 外侧 context「执行命令 `{}` 失败」→「无法执行 `{}`」：退出码全走 `Ok` 之后，`Err` 只剩
   「拒绝执行 / 起不来」，命令根本没跑。
 
+#### 🔴 `env_clear` 白名单被推翻：改「继承 + 摘掉自己的 key」（2026-10-27，三派调研 + 端到端实测）
+
+**起因**：跑真实 `cargo test` 时链接失败，报
+
+```
+note: link: missing operand after '\377\376'
+      Try 'link --help' for more information.
+```
+
+`\377\376` 是 UTF-16 BOM ⇒ 跑到的是 PATH 上的 **GNU coreutils `link`**（`PortableGit/usr/bin/link.exe`），
+不是 MSVC 的 `link.exe` ⇒ **rustc 没找到 MSVC 工具链，退回裸名搜索**。本机 PATH 上根本没有 MSVC 的
+`link`/`cl`,也没有 `CC`/`LIB`/`INCLUDE`/`VCINSTALLDIR`,rustc 全靠环境变量 + 注册表探测 ⇒ **`env_clear` 把探测条件清掉了**。
+
+分组实测（每组先删 `target` 强制重链，跑两轮结果一致）：
+
+| 环境 | 链接 |
+|---|---|
+| 全量继承 | OK |
+| `env_clear` + 6 变量（当时现状） | **FAIL → 撞 GNU link** |
+| 6 + `ProgramFiles(x86)` / `ProgramFiles` / `ProgramW6432` / `COMSPEC` / `windir` | 全 FAIL |
+| 6 + `ProgramData` | **OK** |
+| 6 + `SystemDrive` | **OK** |
+| `cargo check`（不链接）+ 6 变量 | **OK** |
+
+⇒ **只有链接阶段受影响**。V0 验收用 `cargo check` 碰不到，但模型一跑 `cargo test`/`cargo run` 就废 ——
+而「跑编译/测试并修」正是 V0 的目标任务，几乎必然踩到。
+
+**第一步的修法是错的**：往白名单里补 `SystemDrive` + `ProgramData`（各自单独就能救回来）。
+错在两点：① 这是 rustc 黑盒探测的副产物，跨版本、跨机器（装了 VS / 没装 VS）会变，**永远收敛不了**；
+② 它掩盖了真正的病根 —— 白名单是**从零构造正集**。
+
+**三派调研（这一轮才有结论）**：
+
+| 派别 | 代表 | 默认 |
+|---|---|---|
+| 全量继承 | `system()` / Node `spawn` / Python `subprocess` / Rust `Command`（不传 `env`） | 什么都不做 |
+| **继承 + 按名字减**（主流 agent CLI） | **Codex** `shell_environment_policy`、**Gemini CLI** `sanitizeEnvironment` | 先继承，再按模式剔 |
+| 从零构造白名单 | `sudo` `env_reset`+`env_keep`、`cron`、`systemd`、`ssh SendEnv`、Bazel `--action_env`、`docker build` | 默认拒绝 |
+
+Codex 的配置本身就是证据 —— **`inherit="all"` 是默认值，而默认剔除仍然开着**：
+
+```toml
+[shell_environment_policy]
+inherit = "all"                  # 默认：克隆完整父环境
+ignore_default_excludes = false  # 默认：剔除名字含 KEY / SECRET / TOKEN 的变量
+exclude = ["AWS_*", "AZURE_*"]   # 追加 glob
+include_only = ["PATH", "HOME"]  # 可选，最后一道白名单
+set = { CI = "1" }               # 永远覆盖
+```
+
+Gemini CLI 同构：`const sourceEnv = shellExecutionConfig.env ?? process.env;` → `sanitizeEnvironment(...)`
+→ 再补 `TERM`/`PAGER`/`GIT_*`，并强制 `GIT_TERMINAL_PROMPT=0`、`GIT_ASKPASS=''`。
+
+⇒ **业界常见做法不是「去掉 config 里那几个」，是「按名字模式批量减」。**
+但注意 Codex 对**外部进程**（MCP server）反过来用**白名单**（`env_vars`）⇒ 真正的分界是**信任边界**，
+不是严格程度：同 UID 的本地工具链 → 继承+减；外部/不可信进程 → 白名单。
+
+**为什么「清空+加」必然翻车 —— 这是集合封闭性问题**：
+
+```
+白名单（正集）  上界 = 「地球上所有工具链需要什么」  不可枚举 ⇒ 永远追不全
+黑名单（负集）  上界 = 「我自己的凭证」              可枚举、闭合
+```
+
+`sudo`/`systemd` 敢用白名单，是因为它们跨的是**特权边界**（环境变量在那个边界上是攻击者的输入）。
+agent 的子进程跟父进程**同 UID、同会话**，这里的白名单给的「最小权限」是错觉。
+
+**env 清理的真实目标（这条想清楚了才算懂）**：不是「构造最小权限环境」，而是
+
+> **让自己的凭证不出现在「会被回显的地方」**：子进程 stdout → 回执 → history → **每一步都重新发给模型服务商**。
+
+任何测试里写一句 `dbg!(std::env::vars())`，key 就进了 history 并长期驻留。所以目标是那 3 个**已知** key
+（封闭集），不是无界集合。至于蓄意 exfiltration —— 挡不住：`run_command` 的子进程**没有文件系统沙箱**，
+`cargo` 能直接读 `my_agent/.env` 拿走 key；那要靠 V1 的 OS 沙箱 + 网络禁用。
+
+**定案（已落地）**：
+
+```rust
+// config.rs —— 单一来源，紧挨 from_map
+pub const LLM_ENV_KEYS: &[&str] = &["LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY"];
+
+// tool.rs::run_command —— env_clear 与 8 项白名单整段删除
+for key in config::LLM_ENV_KEYS {
+    cmd.env_remove(key);
+}
+```
+
+`env_remove` 收 `AsRef<OsStr>`，`for key in &[&str]` 得到 `&&str` 也能过（`&T: AsRef<U> where T: AsRef<U>` 的
+blanket impl），已实测编译通过。
+
+**端到端实测（走 `Executor::run` 公开入口，父进程先 `set_var("LLM_API_KEY", ...)`）**：
+
+| 用例 | 结果 |
+|---|---|
+| `cargo run` 打印环境 | `LLM_API_KEY`/`LLM_BASE_URL`/`LLM_MODEL` 全 **absent**；继承 **254** 个变量；**链接成功**（`cargo run` 必须链接才跑得起来） |
+| `cargo test`（1200 行日志 + 末尾断言） | 回执 8242 字节 / 598 行，`这就是真正的诊断` / `panicked` / `test result: FAILED` / `中间省略` 全在 |
+| `cargo check --message-format=short`（200 个 E0308） | 回执 8199 字节 / 105 行，可见 **99** 个错，尾部还有 `due to 200 previous errors` |
+| `jq --version` / `rg --version` | 正常，44 / 194 字节，小输出不截断 |
+
+**残留风险（记录，不改）**：
+
+1. **`dotenvy::dotenv()` 会写进程环境** —— 源码 `iter.rs:35`：
+   ```rust
+   if env::var(&key).is_err() { env::set_var(&key, value); }   // 只有「键原本不存在」才写 = 「真 env 优先」
+   ```
+   ⇒ `.env` 内容进入进程环境。今天 `.env` 只有那 3 个 key（已核实），所以 `env_remove` 3 个就闭环；
+   **但将来往 `.env` 加任何别的 key（如 `GITHUB_TOKEN`）就会静默漏**。
+   彻底解 = `dotenvy::dotenv_iter()` / `from_filename_iter()`（源码里只有 `load()` 才 `set_var`），
+   让 secret 根本不进环境。代价两条：① `dotenv_iter()` **不调 `remove_bom()`**（BOM 会污染第一个 key 名）
+   ② 「真 env 优先」要自己实现（`Config::from_map(&get)` 正好是这个注入点 —— functional core 的价值在这里兑现）。
+   ⇒ **列为 V1 前可选升级，V0 不做。**
+2. **回执比名义预算多约 50 字节**（`truncate_head` 8199 / `truncate_head_tail` 8242 vs `max_bytes` 8192）：
+   省略标记是在切完之后**追加**的 ⇒ `max_bytes` 实际管的是「正文」不是「整份回执」。
+   **2026-10-27 决定维持现状**（50 字节不值得动逻辑），若要修：改名 `max_body` 或切之前预留 ~150 字节。
+3. `LLM_ENV_KEYS` 与 `from_map` 的键名仍是**两处写**。可以加一条测试钉住一个方向（清单里每个 key 都能让
+   `from_map` 报 `Missing`），但危险的那个方向（新增字段忘了加清单）挡不住 ⇒ 只能靠**紧挨着写 + 注释**。
+   别为这个把 `from_map` 改成 `ENV_KEYS[i]` 索引数组，更难读且加第 4 个字段照样忘。
+
 ### 3.6 验收标准
 
 **功能**：在 scratch 里放一段编译不过的代码（用 `my_api` 的副本），对 agent 说"让它通过编译"，它自主完成
@@ -3673,7 +3791,7 @@ loop {
 - [x] 删掉 `Invocation::to_functioncall` / `from_functioncall`，改 `parse_kind(kind: &ToolKind, args: &str) -> Result<Invocation, ToolError>`（**§3.4.9** 规则 1/2；`Option` 会丢错误信息）
 - [x] `write_file` 补 `content` 参数（`WriteFileArg{path, content}` 已加）；`run_command` 的 `cmd` 等白名单设计定案再定（**§3.4.10** 末表）
 - [ ] `ToolKind::ALL` 防漂移测试：长度 + 名字唯一 + `from_name` 往返（§3.4.8 实测 ③ / §3.4.12 漏洞 ②；V1 换 `trait Tool` 后此测试可删）
-- [ ] `from_name` 改成 `Self::ALL.iter().copied().find(|t| t.name() == n)`，删掉手写 `match`（**§3.4.12 漏洞 ①**：消掉工具名第二份 + 消掉「`from_name` 认识但 `ALL` 不宣告」的矛盾态）
+- [x] **`from_name` 已改成 `Self::ALL.iter().find(|t| t.name() == n).cloned()`**（2026-10-27 核实：手写 `match` 已删）—— 工具名只剩 `name()` 一处，`from_name` 认识但 `ALL` 不宣告的矛盾态消失（**§3.4.12 漏洞 ①**）
 - [x] 每个 `Invocation` 变体装箱 `XxxArgs`（`#[serde(deny_unknown_fields)]`），`parse` 用 `from_args::<T>`（**§3.4.11 / §3.4.12**）
 - [x] **`content` 收紧**：`System` / `User` / `Tool` 改 `String`，`Assistant` 留 `Option<String>`（**§3.4.13** 实测：`user` 的 `null` 会让模型幻觉出问题且不报错；`tool` 的 `null` 直接 400）
 - [x] `parse_kind` 改一步 `from_str::<T>(args)`，删 `ToolError::BadParse`（**§3.4.13** 末：两步解析丢 `line/column`）
@@ -3685,7 +3803,8 @@ loop {
 - [x] api_key **走 `.bearer_auth()` 每请求设置**，**不要**塞进 `default_headers`（**§3.7.3** 实测：`bearer_auth` 自动 `set_sensitive`，其余三种写法有两种明文泄漏）
 - [x] **`chat()` 里删掉 `serde_json::to_value(chat_request)?`**（2026-10-23 已改：直接 `.json(&chat_request)`）
 - [x] **`chat()` 先判状态码再 `text()`**（2026-10-23 已改：`status` 先存下来，body 拿完再 `if !status.is_success()` 把 `status` + `body` 一起塞进 `anyhow`）
-- [ ] 删 `model.rs` 的 `pub struct ChatRequest`（零调用点，与 `llm.rs::WireRequest` 构成「两个真相」）+ 删 `main.rs` 的 `test_chat` / `get_chat`（协议探针使命已完成，现在是 dead code）
+- [x] ✅ **`main.rs` 的协议探针已删**（2026-10-27）：`test_chat` / `get_chat` 等 150 行清掉，现在 `main.rs` = `Config::from_env` → `OpencodeGoClient` → `run_agent(…, 5)` 共 12 行
+- [ ] 删 `model.rs` 的 `pub struct ChatRequest`（零调用点，与 `llm.rs::WireRequest` 构成「两个真相」）——**仅剩这一处**
 - [x] 循环接上：`tool_calls` 非空 → 执行 → 回灌 → 继续（**§3.7.2** 六分支表；`client` 从参数进来、返回值不出现 `reqwest` 类型）—— **2026-10-22 真实任务跑通**
 - [x] 终止条件 + 步骤上限（`for step in 1..=max_steps`，`tool_calls` 为空即 break；`finish_reason` 只用于 `length` 日志）
 - [x] **`ToolKind::ALL` 缩到「真能用的工具」**（2026-10-23 由「立刻实现」路径解决：`write_file` 已是真实现，`_` 臂已删）：`WriteFile` 已在 `ALL` 里、`spec()`/`parse_kind` 也全写好了，但 `raw_invoke` 走 `_ => bail!("工具尚不支持")` ⇒ **`write_file` 真的发给了模型**，实测模型白烧 2 步并猜出"临时故障 / 路径限制 / 大小写文件系统"三种错误假设（**§3.7.2 末 2026-10-22 实测**）。**2026-10-23 定：走「立刻实现」这条路，不缩 `ALL`** —— 顺序 = `write_file` → `run_command`
@@ -3693,21 +3812,25 @@ loop {
 - [ ] **日志从 `read_file`/`list_files` 内部挪到 `Executor::run`**（**一半已做**：IO 函数里的 `println!` 已随 context 重构删掉，只剩 `run` 里两行。待改成 `→ 工具名(参数)` / `← N 字节`）：`run` 里同时握有工具名 / 入参 / 输出字节数
 - [ ] **`max_steps` 用尽后补一次 `tool_choice:"none"` 收尾**（V1）：实测耗尽时模型 `reasoning` 里已经写好结论（"report to user honestly"）却再没机会输出（**§3.7.2 末**）
 - [ ] `LlmClient` trait 立起来 —— **排在循环跑通之后**，签名从实际代码抄（§3.7.2）
-- [ ] 4 个工具实现：`list_files` ✔ / `read_file` ✔（2026-10-22 完成：`sort()` 确定序、`join` 替 `fold`、`file_name()` 相对路径、`[DIR]`/`[FILE]` 前缀、非 UTF-8 显式标注） / `write_file` ✔（2026-10-23 v4：整文件覆盖 + 自动建父目录 + 祖先 canon） / `run_command` 🟡（2026-10-26 v3：裸名 + 白名单 + `env_clear` 最小集 + `current_dir` + 双流 pipe + **退出码全走 `Ok`**；待修编译错误 + 两个检查合并 + `stdin` null）
+- [x] 4 个工具实现：`list_files` ✔ / `read_file` ✔（2026-10-22 完成：`sort()` 确定序、`join` 替 `fold`、`file_name()` 相对路径、`[DIR]`/`[FILE]` 前缀、非 UTF-8 显式标注） / `write_file` ✔（2026-10-23 v4：整文件覆盖 + 自动建父目录 + 祖先 canon） / `run_command` ✔（2026-10-27：裸名 + 白名单（都在 `raw_invoke`，裸名在前）+ **继承环境 + `env_remove` 自己的 key** + `current_dir` + 三流显式 + **退出码全走 `Ok`**；端到端实测通过，见 §3.5 末 2026-10-27）
 - [x] **`write_file` 的沙箱检查要单独写**（2026-10-23 v4 完成：`normalize_path` 消 `..` → 往上 `try_exists()` 找最深已存在祖先 → **canon 祖先** + `starts_with` → `symlink_metadata` 判非普通文件 → 仅 `NotFound` 才建父目录重试）：语义是**整文件覆盖**（`fs::write`，实测 20→2 字节截断无残留），返回里带「已覆盖 N 字节」。**必须自动建父目录**（V0 无 shell，模型没有 `mkdir -p` 兜底，2026-10-23 查证五家后修正）⇒ 写失败 `NotFound` 时：从 `target.parent()` 往上用 `try_exists()` 找**最深的已存在祖先** → canon + `starts_with` → `create_dir_all(parent)` → 重试写。`file_name()` 为 `None` 的输入（`""`/`..`/`a/..`）要拒；`target` 已存在时用 `symlink_metadata().is_file()` 判（`fs::write` 指向目录只报 `拒绝访问 os error 5`，看不出是目录）（**§3.5** 末 2026-10-23）
-- [x] **`run_command` 收 `{program, args}`，不收命令字符串**（2026-10-26 v3 落地）：V0 不给 shell（实测管道会被 rg 当正则、`cmd` 单引号不是引号、`sh` 来自 WorkBuddy 自带 PortableGit）；`ALLOW_CMD = [cargo, rg, yq, jq]` 且**排除 `cmd`/`sh`/`powershell`**；`env_clear` + 六变量最小集（`PATH`/`HOME`/`USERPROFILE`/`SystemRoot`/`TEMP`/`TMP`，`LLM_API_KEY` 绝不进列表）；显式 `.current_dir(root)`；双流 pipe 后截断（**§3.5** 末 2026-10-23 六组实测 + 2026-10-26 v3）
+- [x] **`run_command` 收 `{program, args}`，不收命令字符串**（2026-10-26 v3 落地）：V0 不给 shell（实测管道会被 rg 当正则、`cmd` 单引号不是引号、`sh` 来自 WorkBuddy 自带 PortableGit）；`ALLOW_CMD = [cargo, rg, yq, jq]` 且**排除 `cmd`/`sh`/`powershell`**；显式 `.current_dir(root)`；三流全显式（`stdout`/`stderr` pipe + `stdin` null）后截断（**§3.5** 末 2026-10-23 六组实测 + 2026-10-26 v3）
+- [x] **env 策略改判（2026-10-27，推翻 2026-10-26 的 `env_clear` + 最小集）**：原方案 `env_clear` + 6 变量（`PATH`/`HOME`/`USERPROFILE`/`SystemRoot`/`TEMP`/`TMP`）**让 `cargo test`/`cargo run` 链接失败**（rustc 找不到 MSVC 工具链 ⇒ 撞 PATH 上的 GNU coreutils `link`，报 `link: missing operand after '\377\376'`）。补 `SystemDrive`/`ProgramData` 能救，但那是 rustc 黑盒探测的副产物、跨版本跨机器会变 ⇒ **整段删除**，改 `for key in config::LLM_ENV_KEYS { cmd.env_remove(key); }`。理由：白名单是**从零构造正集**（上界不可枚举），负集才闭合；业界主流（Codex `shell_environment_policy` / Gemini CLI `sanitizeEnvironment`）都是「继承 + 按名字减」。实测：继承 254 个变量、`LLM_*` 三个全 absent、链接恢复正常（**§3.5** 末 2026-10-27 三派调研）
 - [x] **`run_command` 的退出码不再分档（2026-10-26 复测推翻 0/1 规则；v3 已落地）**：`yq . nosuch.yaml` 真错误也是 **1** 且只写 stderr ⇒ 旧写法回执是零信息量的 `命令退出码 1:`；`cargo test` 失败（101）诊断全在 **stdout**（stderr 仅 314 字节）⇒ 旧写法把"哪个测试失败/断言是什么"整个丢掉。v3 改成：**只有 `spawn()` / `wait_with_output()` 失败才 `Err`，其余退出码全走 `Ok`**，回执带 `命令退出码: N` + `返回结果:` + `错误信息:`（§3.5 末 2026-10-26）
-- [ ] 🔴 **`tool.rs` 当前编译不过**：`raw_invoke` 的 `RunCommand` 臂结尾是 `.with_context(…)),}` —— 逗号落在**块内**（`}` 才是关块的），报 `expected one of '.', ';', '?', '}', or an operator, found ','`。删掉那个逗号即可（§3.5 末 2026-10-26 v3）
-- [ ] 🔴 **`run_command` 的两个安全检查必须合并到同一层**：白名单在 `raw_invoke`、裸名在 `run_command` ⇒ **白名单先跑，裸名分支永远到不了（死代码）**，`rg.exe` / `./rg` / 绝对路径三条撞同一句话。推荐都放 `raw_invoke`（**裸名在前、白名单在后**，与 `resolve_in`/`write_file` 先例一致），`run_command` 只留「无条件信任 `program` 已过校验」的注释。硬理由：**V1 换 `Box<dyn Tool>` 时 `raw_invoke` 的 `match` 会消失 ⇒ 白名单留在那儿就是静默丢掉安全边界**（§3.5 末 2026-10-26 v3 实测）
-- [ ] 🟠 **`run_command` 要 `.stdin(Stdio::null())`**：`Command` 的 stdin/stdout/stderr **默认全部继承父进程**，v3 只 pipe 了后两个 ⇒ `cargo run` / 任何读 stdin 的程序挂在**人的终端**上等输入，`wait_with_output()` 无限等、agent 卡死。一行修成「立刻 EOF」（§3.5 末 2026-10-26 v3）
-- [ ] 🟠 **`Executor::run` 对 `Err` 也要截断**：现在 `?` 直接上抛，`agent.rs` 只做 `format!("Error: {e:#}")` ⇒ `cargo check` 一个 80 错的 crate 产生 **17,213 字节 / 643 行** stderr（`--message-format=short` 是 6,533），全部原样进 history（`MAX_TOOL_OUTPUT` = 8192）。⚠️ 退出码全走 `Ok` 之后这条已大幅降级（`Err` 只剩 `spawn`/拒绝执行，文案都很短），属防御性兜底（§3.5 末 2026-10-26 实测）
-- [ ] 🟡 **`run_command` 两条 bail 文案：缺「可用清单」的已补，归因仍是假话**（2026-10-26 二次更正）：`program` 原文**本来就有**（`with_context` 会串成 `执行命令 rg.exe 失败: …`）—— 原判断说"不含收到的值"是错的。① ✔ 白名单那句已带 `ALLOW_CMD.join(", ")` ② ✘ `./rg` / 绝对路径撞的是**裸名检查**，却报「**未找到可执行文件**」——**归因假话**（`rg.exe` 明明在 PATH 里，它没去找过）⇒ 模型会往"是不是没装 rg"排查 ③ 外侧 context「执行命令 `{}` 失败」→「无法执行 `{}`」（退出码全走 `Ok` 之后 `Err` 只剩拒绝执行/起不来，命令根本没跑）
-- [ ] 🟡 **`RunCommandArg` 缺 `deny_unknown_fields`**（`WriteFileArg` 有）：模型传 `{"program":"rg","args":[],"timeout":5}` 会被**静默忽略** `timeout`，以为设了超时
-- [x] **`tool.rs::truncates` 修 panic**：`while !text.is_char_boundary(end) { end -= 1 }` 已补，并加了「原文 N 行 / M 字节」报告（2026-10-22）
-- [x] **`Executor` 横切层 + `raw_invoke` 分派层**：`Executor{root, max_bytes}`（`new` 里 `canonicalize` 一次 = 不变量载体）、`run` = `raw_invoke` → `truncates`；`raw_invoke` 私有、每臂先 `resolve_in`（**§3.5**：校验函数必须**返回**后续真正被使用的那个值，不是 `bool`/`()`）
+- [x] ✅ **`tool.rs` 编译已通过**（2026-10-27）：`RunCommand` 臂那个落在块内的逗号已删（`…)),}` → `…))`），`cargo check --all-targets` 零 error 零代码告警（§3.5 末 2026-10-26 v3）
+- [x] ✅ **`run_command` 的两个安全检查已合并到 `raw_invoke`**（2026-10-27）：**裸名在前、白名单在后**，`run_command` 只剩 IO + 契约注释。这样 V1 换 `Box<dyn Tool>` 时安全边界不会随 `match` 一起消失（§3.5 末 2026-10-26 v3 实测）
+- [x] ✅ **`run_command` 已加 `.stdin(Stdio::null())`**（2026-10-27）：三流现在全显式声明（stdout/stderr pipe + stdin null），不再继承父进程终端（§3.5 末 2026-10-26 v3）
+- [x] ✅ **`RunCommandArg` 已补 `#[serde(deny_unknown_fields)]`**（2026-10-27）：与另外三个 Arg 一致，模型传 `timeout` 现在会明确报参数有误，不再静默忽略
+- [x] ✅ **`run_command` 两条 bail 文案已修**（2026-10-27）：裸名那句不再谎称「未找到可执行文件」（改成「只能写裸名，不能带目录或路径」），白名单那句带 `ALLOW_CMD.join(", ")` 清单；外侧 context 改「无法执行命令 {}」（§3.5 末 2026-10-26 二次更正）
+- [ ] 🟠 **`run_command` 的 description 要写一句 `cargo check --message-format=short`**（**尚未落地**，`spec()` 现在只有 4 条）：`MAX_TOOL_OUTPUT` = 8192，80 个错的 crate 长格式 `cargo check` 是 **17,213 字节 / 643 行**、`--short` 是 6,533。实测 200 个 E0308 时 head=6144 只能装 **27 个（长格式）/ 99 个（short）** ⇒ 不写这句，模型会「修完前 27 个 → 再跑 → 再修」。属于纯文案，`spec()` 加第 5 条即可（§3.5 末 2026-10-27 实测）
+- [x] ✅ **截断拆成 `truncate_head` / `truncate_head_tail`（2026-10-27，`max_bytes` 不用调大）**：原来一份 `truncates` 只砍尾巴，而 **`cargo test` 的诊断恰好在尾部**（1200 行日志把 `panicked` / 断言值 / `test result: FAILED` 全推到 8192 之后 ⇒ 模型只看到 50 行 `test ok`）。现在按 `Invocation` 派发：`RunCommand` → 头 3/4 + 尾 1/4（实测尾部诊断只需 348 字节，2048 有 6 倍余量），其余工具 → 只留头。共用私有 `truncate_middle() -> (head_end, tail_start)`，`LINE_SNAP_MAX = 256`。**没抽「core + 两个壳」**：两份文案不同（`read_file` 要报「剩多少 + 用 rg 定位」，`run_command` 只报「中间省略多少」），core 里带 `if 策略` 就是假壳。实测 6 个用例全过（见 §3.5 末 2026-10-27）
+- [x] ✅ **回执超预算 ~50 字节：决定维持现状**（2026-10-27）：`truncate_head` 8199 / `truncate_head_tail` 8242 vs `max_bytes` 8192 —— 省略标记是切完之后**追加**的，所以该参数实际管的是「正文」。要么改名 `max_body` + 注释，要么切之前预留 ~150 字节；**50 字节不值得动逻辑**，记录在案（§3.5 末 2026-10-27）
+- [ ] 🟠 **`Executor::run` 对 `Err` 也要截断**：现在 `?` 直接上抛，`agent.rs` 只做 `format!("Error: {e:#}")` ⇒ 一个 80 错的 crate 可达 **17,213 字节 / 643 行**，全部原样进 history（`MAX_TOOL_OUTPUT` = 8192）。⚠️ 退出码全走 `Ok` 之后这条已大幅降级（`Err` 只剩 `spawn`/拒绝执行，文案都很短），属**防御性兜底**，V0 可不做（§3.5 末 2026-10-26 实测）
+- [x] **`truncates` 修 panic**：`while !text.is_char_boundary(end) { end -= 1 }` 已补，并加了「原文 N 行 / M 字节」报告（2026-10-22）。**2026-10-27 已重命名并拆分**：`truncates` → `truncate_middle`（私有，返回切点）+ `truncate_head` / `truncate_head_tail`（两个具名策略）
+- [x] **`Executor` 横切层 + `raw_invoke` 分派层**：`Executor{root, max_bytes}`（`new` 里 `canonicalize` 一次 = 不变量载体）、`run` = `raw_invoke` → **按 `Invocation` 派发截断策略**（`RunCommand` → 头+尾，其余 → 只留头，2026-10-27）；`raw_invoke` 私有、每臂先 `resolve_in`（**§3.5**：校验函数必须**返回**后续真正被使用的那个值，不是 `bool`/`()`）
 - [x] **错误文案里的路径统一成 `args.path`**（2026-10-23 完成）：① ✔ `resolve_in` 的 `root.display()` 已删 ② ✔ `read_file`/`list_files` 的 `with_context` 已退化成裸 `?`，路径由 `raw_invoke` 用 `args.path` 补 ③ ✔ `WriteFile` 臂已加 `.with_context(|| format!("写入 {} 失败", args.path))`，`路径并不是合法文件!` 改成「目标已存在，但并不是普通文件!」（§3.5 末 2026-10-23 实测）
 - [x] **`resolve_for_write` 返回「canon 祖先 + 词法尾巴」（方案 B）**（2026-10-26 v6 完成）：`canon_祖先.join(tail)` + 空尾巴单判；**关键坑**是 `tail` 必须 `canon.strip_prefix(canon_tmp)?`（**词法**祖先），用 `canon_ancestor`（canon 后）会因 `VerbatimDisk` vs `Disk` 恒失败、再被 `unwrap_or(&canon)` 静默吞掉 ⇒ `join` 遇绝对路径替换 ⇒ 退回方案 A。v6 实测 **11/11**：沙箱内普通绝对路径（新建/覆盖）、大小写不同祖先（回执 `Sub\...` 证明走了真拼接）、junction 单层/多级、`../` 越界、深层建目录全过（§3.5 末 2026-10-26）
-- [ ] **`truncates` / `resolve_in` 两条单测**（现有 1 个 `test_resolve_write` 覆盖 write 四场景；`truncates` 与 `resolve_in` 仍 0 覆盖）：`truncates("中".repeat(3000), 8192)` 不得 panic；`resolve_in(tmp, "../x")` 必须 `Err`；另需补 **junction 越界**用例（`mklink /J` 普通用户可建）与 **覆盖已有文件**用例
+- [ ] **`truncates` / `resolve_in` 两条单测**（现有 1 个 `test_resolve_write` 覆盖 write 四场景）：2026-10-27 已用 `Executor::run` **手动端到端**跑过 6 个用例（不超限原样返回 / 5000 行 rg 命中保尾 / 中文多字节 / 20KB 无换行单行 / 真实 `cargo test` 尾部诊断 / `cargo check` 200 错），但**单测仍是 0 覆盖** —— 手动测不防回归。要补：`truncate_middle("中".repeat(3000), 8192, 0)` 不 panic、`resolve_in(tmp, "../x")` 必须 `Err`、**junction 越界**（`mklink /J` 普通用户可建）、**覆盖已有文件**
 - [ ] 安全边界落地：scratch 目录 + 写/shell 确认 + 命令白名单 + 输出截断（**路径沙箱已落地** 2026-10-22；「`run_command` 上线时路径检查即失效，必须换 OS 沙箱/白名单/容器」见 §3.5 调研小节）
 - [ ] 自答 §3.8 的 4 个问题
 - [ ] **验收**：拿 `my_api` 副本跑通一次真实修复（§3.6）

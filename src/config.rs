@@ -1,5 +1,7 @@
 use dotenvy::dotenv;
 
+pub const LLM_ENV_KEYS: &[&str] = &["LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY"];
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("环境变量 {name} 未设置")]

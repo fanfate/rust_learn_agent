@@ -135,9 +135,9 @@ impl Invocation {
             Self::ListFiles(args) => format!("list_files, path : {}", args.path),
             Self::WriteFile(args) => format!("write_file, path : {}", args.path),
             Self::RunCommand(args) => format!(
-                "run_command, program : {}, args : {}",
+                "run_command, program : {}, args : [{}]",
                 args.program,
-                args.args.join(" ")
+                args.args.join(", ")
             ),
         }
     }

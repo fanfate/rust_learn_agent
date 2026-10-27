@@ -42,7 +42,8 @@
   ~~下一个动作 = 循环~~（**已完成，见下条**；当时列的 3 处小债**已清两条**，只剩 `model.rs::ChatRequest` 与 `main.rs` dead code，见 `plan_v0.md` §五）。
 - ✅ **循环已跑通（2026-10-22）**：`agent.rs::run_agent` —— `for step in 1..=max_steps` + 六分支 + 工具结果/错误
   **回灌**（`Error: {e:#}`）+ `tool_calls` 为空即收尾。`tool.rs` 已有 `Executor{root,max_bytes}` 不变量载体、
-  `resolve_in`（canon + `starts_with`，**返回 PathBuf 供 IO 直接使用**）、`truncates`（字符边界回退 + 总大小报告）。
+  `resolve_in`（canon + `starts_with`，**返回 PathBuf 供 IO 直接使用**）、`truncate_head` / `truncate_head_tail`
+  （字符边界回退 + 总大小报告；**2026-10-27 由单个 `truncates` 拆成两个策略**，见 §〇 末）。
   真实任务跑通两轮：`list_files(".")` → `read_file("readme.md")` → 收尾。
   **实测「缺工具」任务（改名）暴露的四条**见 `plan_v0.md` §3.7.2 末 —— 核心是
   **`write_file` 已在 `ALL` 里但 `raw_invoke` 走 `_ => bail!`** ⇒ 模型看得见却调不通，白烧 2 步；
@@ -54,18 +55,24 @@
   关键坑：`tail` 必须 `canon.strip_prefix(canon_tmp)?`（**词法**祖先）；用 canon 后的祖先会因
   `VerbatimDisk` vs `Disk` 恒失败 → `unwrap_or` 静默吞掉 → `join` 遇绝对路径替换 → 退回"写成功却报
   `prefix not found`"。
-  **`run_command` 已写三版（2026-10-26 v3，当前编译不过）**：无 shell 的 `{program, args}` + 裸名检查 +
-  `ALLOW_CMD=[cargo,rg,yq,jq]` + `env_clear` 六变量最小集 + `.current_dir(root)` + 双流 pipe；
-  **退出码全走 `Ok`**（只有 `spawn` 失败才 `Err`），回执三段带标签。
-  上一轮的两组实测推翻了「0/1 算成功」：`yq` 真错误也是 1 且只写 stderr、`cargo test` 失败诊断全在 stdout。
-  **当前三个待修**：① 🔴 `tool.rs` 编译不过（`RunCommand` 臂结尾 `),}` —— 逗号落在块内，删掉即可）
-  ② 🔴 **两个安全检查被拆成两层**：白名单在 `raw_invoke`、裸名在 `run_command` ⇒ 白名单先跑，
-  裸名分支成了**死代码**，`rg.exe`/`./rg`/绝对路径三条撞同一句话。要合并到同一层（推荐都放 `raw_invoke`，
-  裸名在前）—— **V1 换 `Box<dyn Tool>` 时 `raw_invoke` 的 `match` 会消失，白名单留在那儿就是静默丢掉安全边界**
-  ③ 🟠 `.stdin(Stdio::null())`（`Command` 三流默认全 inherit ⇒ `cargo run` 会挂在人的终端上，agent 卡死）。
-  **修完下一个动作 = ① 日志改成 `→ 工具名(参数)` / `← N 字节` ② 补 `truncates` / `resolve_in` 两条单测。**
-  设计与实测见 `plan_v0.md` **§3.5 末（共 21 节，2026-10-26 最新四节**：复测 v6、`\\?\` verbatim 前缀与跨平台对照、
-  run_command 退出码分档被推翻的两组实测、v3 评审**）**；更早的含 rg/jq 走 prompt 还是专用工具、run_command 六组实测、
+  **`run_command` 已收工（2026-10-27 v4）**：无 shell 的 `{program, args}` + **裸名检查与白名单合并到 `raw_invoke`（裸名在前）**
+  + `ALLOW_CMD=[cargo,rg,yq,jq]` + **继承环境 + `env_remove` 自己的 key** + `.current_dir(root)` + 三流全显式；
+  **退出码全走 `Ok`**（只有 `spawn`/`wait_with_output` 失败才 `Err`），回执三段带标签、空段不打。
+  两组实测推翻了「0/1 算成功」：`yq` 真错误也是 1 且只写 stderr、`cargo test` 失败诊断全在 stdout。
+  🔴 **env 策略在 2026-10-27 被推翻重做**：`env_clear` + 最小变量集让 `cargo test`/`cargo run` **链接失败**
+  （rustc 找不到 MSVC 工具链 ⇒ 撞 PATH 上的 GNU coreutils `link`，报 `link: missing operand after '\377\376'`）。
+  往白名单补 `SystemDrive`/`ProgramData` 能救，但那是 rustc 黑盒探测的副产物、跨版本跨机器会变 ⇒ **整段删除**。
+  理由是**集合封闭性**，不是严格程度：白名单是从零构造正集（上界不可枚举），负集才闭合。业界主流
+  （Codex `shell_environment_policy` 默认 `inherit="all"` 但仍剔除名字含 `KEY/SECRET/TOKEN` 的变量；
+  Gemini CLI `sanitizeEnvironment`）都是「继承 + 按名字减」。端到端实测：继承 254 个变量、`LLM_*` 三个全 absent、链接恢复。
+  **截断也在这轮重做**：`truncates` 只砍尾巴，而 `cargo test` 的诊断恰好在尾部（1200 行日志把 `panicked`/断言值
+  推到 8192 之外 ⇒ 模型只看到 50 行 `test ok`）。现拆成 `truncate_middle`（私有，算两个切点）+ `truncate_head` /
+  `truncate_head_tail`，由 `Executor::run` 按 `Invocation` 派发（命令 → 头 3/4 + 尾 1/4，文件/目录 → 只留头）；
+  **`MAX_TOOL_OUTPUT` 一个字没改**——同样的字节预算换双倍信息。
+  **下一个动作 = ① 日志改成 `→ 工具名(参数)` / `← N 字节` ② 补 `truncate_middle` / `resolve_in` 两条单测
+  ③ `spec()` 加一句 `cargo check --message-format=short` ④ `my_api` 副本验收。**
+  设计与实测见 `plan_v0.md` **§3.5 末（共 22 节，2026-10-27 最新两节**：`env_clear` 白名单被推翻的三派调研 + 端到端实测、
+  截断拆头尾；更早的含 v3 评审**）**；更早的含 rg/jq 走 prompt 还是专用工具、run_command 六组实测、
   `write_file` 覆盖语义、错误文案用 `args.path`、junction 写穿 + 复测 v3/v4。
 
 ---
@@ -135,11 +142,11 @@ Python 改一行 prompt 直接跑；Rust 要等编译，还要跟所有权较劲
 
 | | |
 |---|---|
-| **已完成** | `.env` 三变量 · `config.rs` 五版定稿（方案 C 已落地） · 真实通道 **200** · **实验 2 / 2.5 闭环**（工具调用 → 回灌 → 收尾，prompt cache 命中 256） · **`model.rs` 类型齐了**（`content` 已收紧、`Invocation` 装箱 Args、`parse_kind` 一步解析） · **`llm.rs` 真实 200**（手写 `Debug`、`bearer_auth`、私有 `WireRequest<'a>`） · **循环跑通**（`for step in 1..=max_steps` + 错误回灌 `Error: {e:#}`） · **三个真工具** `read_file`/`list_files`/`write_file` + 路径沙箱（读侧 canon、写侧祖先 canon）+ 截断 · **第四个 `run_command` v3**（退出码全走 `Ok`，当前编译不过） |
-| **正在写** | **工具层最后一个工具** `run_command` v3：无 shell 的 `{program, args}` + 裸名+白名单 + `env_clear` 最小集 + `.current_dir(root)` + 双流 pipe，**退出码已全走 `Ok`**；当前卡在三处（编译错误 / 两个检查被拆层 ⇒ 裸名成死代码 / `stdin` 未 null），见 `plan_v0.md` §3.5 末 |
-| **下一个动作** | ① 删 `RunCommand` 臂那个逗号（现在编译不过）② 裸名与白名单**合并到同一层**（都放 `raw_invoke`，裸名在前）③ `.stdin(Stdio::null())` ④ 日志改成 `→/←` ⑤ `truncates` / `resolve_in` 两条单测 ⑥ **最后**抽 `LlmClient` —— 顺序依据见 `plan_v0.md` §3.7.2 |
+| **已完成** | `.env` 三变量 · `config.rs` 五版定稿（方案 C 已落地） · 真实通道 **200** · **实验 2 / 2.5 闭环**（工具调用 → 回灌 → 收尾，prompt cache 命中 256） · **`model.rs` 类型齐了** · **`llm.rs` 真实 200** · **循环跑通**（`for step in 1..=max_steps` + 错误回灌 `Error: {e:#}`） · **四个工具全收工** `read_file`/`list_files`/`write_file`/`run_command`（路径沙箱：读侧 canon、写侧祖先 canon；命令：裸名+白名单+继承环境+三流显式） · **截断按输出性质分派**（命令头+尾、文件只留头） |
+| **正在写** | 无。**工具层与循环层都通了**，`cargo check` / `cargo test` 零 error 零告警，端到端实测 6 组通过 |
+| **下一个动作** | ① 日志改 `→/←` ② `truncate_middle` / `resolve_in` 单测 ③ `spec()` 加 `cargo check --message-format=short` ④ **`scratch/my_api` 副本上做 V0 验收** |
 | **验收** | 在 `scratch/my_api` 副本上，说一句"让它通过编译"，agent 自主「读 → 改 → `cargo check` → 读报错 → 再改」，**中途不需介入** |
-| **欠账** | `config.rs` 的 `#[cfg(test)] mod tests`（有意留到 V0 跑通后） |
+| **欠账** | `config.rs` / `truncate_middle` / `resolve_in` 的单测（有意留到 V0 跑通后）；`model.rs::ChatRequest` 零调用点待删 |
 
 ### V0·1 归档索引（内容都在 `plan_v0.md`）
 
@@ -183,11 +190,16 @@ Python 教程（21.9k★）。**当"协议参照 + 概念词典 + 失败模式�
 
 ## 五、进度记录
 
-**V0** → 完整清单见 [`plan_v0.md` §五](./plan_v0.md)（**37 项已勾 / 19 项未勾**，截至 2026-10-26 v3）。
-当前卡在：**`run_command` 的收尾**。循环已跑通（`for step in 1..=max_steps` + 回灌），三个真工具
-`read_file`/`list_files`/`write_file` 都已在（沙箱读侧 canon / 写侧祖先 canon，截断在位），
-`run_command` 第三版写出来了但**编译不过**（`),}` 多一个逗号），且**两个安全检查被拆到两层** ⇒ 裸名检查成了死代码。
-修完这三处 → 日志 `→/←` → 单测 → `my_api` 副本验收。
+**V0** → 完整清单见 [`plan_v0.md` §五](./plan_v0.md)（**48 项已勾 / 13 项未勾**，截至 2026-10-27）。
+**工具层与循环层已全部打通**：四个工具（`read_file`/`list_files`/`write_file`/`run_command`）都在，
+路径沙箱读侧 canon + 写侧祖先 canon，命令侧裸名+白名单+继承环境+三流显式，截断按输出性质分派；
+`cargo check --all-targets` 零 error 零代码告警，`cargo test` 1 passed，`Executor::run` 端到端 6 组实测通过
+（含真实 `cargo test` 的尾部诊断、200 个编译错误的头部截断、`LLM_*` 不泄漏且链接正常）。
+
+剩下的 13 项里，**没有一项挡路 V0 验收**：单测 3 处、日志 `→/←` 1 处、`ChatRequest` 零调用点 1 处、
+`spec()` 加一句 flag 1 处，其余是 V1 才要的（`LlmClient`、`usage`、`tool_choice:"none"` 收尾、安全边界升级）
+和「自答 §3.8 的 4 问」。
+**下一个动作 = 日志 `→/←` → 单测 → `scratch/my_api` 副本验收。**
 
 **V1**
 
