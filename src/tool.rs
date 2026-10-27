@@ -44,13 +44,17 @@ fn list_files(path: &Path) -> anyhow::Result<String> {
 }
 
 // write_file 会创建缺失的父目录，无条件信任 path 已经过沙箱检查
-fn write_file(path: &Path, content: &str) -> anyhow::Result<usize> {
+fn write_file(path: &Path, content: &str, max_bytes: usize) -> anyhow::Result<usize> {
     let meta_res = fs::symlink_metadata(path);
 
     match meta_res {
         Ok(meta) => {
             if !meta.is_file() {
                 bail!("目标已存在，但并不是普通文件!");
+            }
+
+            if meta.len() > max_bytes as u64 {
+                bail!("文件过大，超过 {max_bytes} 字节，请使用edit_file工具");
             }
 
             fs::write(path, content).with_context(|| "写入路径失败")?;
@@ -70,6 +74,15 @@ fn write_file(path: &Path, content: &str) -> anyhow::Result<usize> {
             Ok(content.len())
         }
     }
+}
+
+fn edit_file(
+    path: &Path,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> anyhow::Result<String> {
+    todo!()
 }
 
 fn run_command(program: &str, args: &[String], root: &Path) -> anyhow::Result<String> {
@@ -249,7 +262,7 @@ fn normalize_path(path: &Path) -> anyhow::Result<PathBuf> {
 // tool call
 
 impl Invocation {
-    fn raw_invoke(&self, root: &Path) -> anyhow::Result<String> {
+    fn raw_invoke(&self, root: &Path, max_bytes: usize) -> anyhow::Result<String> {
         match self {
             Invocation::ReadFile(args) => {
                 let p = resolve_in(root, &args.path)?;
@@ -261,10 +274,21 @@ impl Invocation {
             }
             Invocation::WriteFile(args) => {
                 let p = resolve_for_write(root, &args.path)?;
-                let s = write_file(&p, &args.content)
+                let s = write_file(&p, &args.content, max_bytes)
                     .with_context(|| format!("写入 {} 失败", args.path))?;
                 Ok(format!(
                     "成功写入文件{} : {s} 字节",
+                    p.strip_prefix(root)
+                        .expect("canon 必然以词法祖先为前缀")
+                        .display()
+                ))
+            }
+            Invocation::EditFile(args) => {
+                let p = resolve_in(root, &args.path)?;
+                let s = edit_file(&p, &args.old_string, &args.new_string, args.replace_all)
+                    .with_context(|| format!("编辑 {} 失败", args.path))?;
+                Ok(format!(
+                    "成功编辑文件{}, diff 为 :\n{s}\n",
                     p.strip_prefix(root)
                         .expect("canon 必然以词法祖先为前缀")
                         .display()
@@ -307,7 +331,7 @@ impl Executor {
     pub fn run(&self, inv: &Invocation) -> anyhow::Result<String> {
         println!("开始调用工具...");
         println!("Tool Info : {}", inv.info());
-        let raw = inv.raw_invoke(&self.root)?;
+        let raw = inv.raw_invoke(&self.root, self.max_bytes)?;
         match inv {
             Invocation::RunCommand(_) => Ok(truncate_head_tail(raw, self.max_bytes)),
             _ => Ok(truncate_head(raw, self.max_bytes)),
@@ -324,14 +348,14 @@ mod test {
         let root = fs::canonicalize("scratch/tmp").unwrap();
         {
             let p = resolve_for_write(&root, "new.txt").unwrap();
-            let s = write_file(&p, "x");
+            let s = write_file(&p, "x", MAX_TOOL_OUTPUT);
             assert!(s.is_ok());
             assert_eq!(fs::read_to_string(root.join("new.txt")).unwrap(), "x");
         }
 
         {
             let p = resolve_for_write(&root, "a/b/c.txt").unwrap();
-            let s = write_file(&p, "x");
+            let s = write_file(&p, "x", MAX_TOOL_OUTPUT);
             assert!(s.is_ok());
             assert_eq!(fs::read_to_string(root.join("a/b/c.txt")).unwrap(), "x");
         }
@@ -341,7 +365,7 @@ mod test {
         }
         {
             let p = resolve_for_write(&root, "a/b").unwrap();
-            let s = write_file(&p, "x");
+            let s = write_file(&p, "x", MAX_TOOL_OUTPUT);
             assert!(s.is_err());
             if let Err(err) = s {
                 assert!(format!("{err:#}").contains("目标已存在"));

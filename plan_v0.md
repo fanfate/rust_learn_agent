@@ -2771,14 +2771,219 @@ blanket impl），已实测编译通过。
 > 需求的正确来源是 **dogfooding，不是设计**。三个小时之内你会亲自撞到真正的需求：上下文塞不下、它改了错的文件、
 > 它在同一个错误上循环。**这些是设计不出来的。**（就像你在 T2 里第三次才撞到"提权时序"一样。）
 
+#### 3.6.1 靶场就绪（2026-10-27）
+
+`scratch/my_api` = `my_api` 本体副本（含 `.env` / `data/users.db` / `migrations` / `target`，`scratch/` 已 gitignore）。
+开关脚本在**工作区**（不污染沙箱）：`D:\WorkSpace\AICode\WorkBuddy\rust_learn\tools\scratch_bugs.py`
+
+| 目的 | 命令 |
+|---|---|
+| 注入 3 个编译错误 | `uv run tools/scratch_bugs.py inject` |
+| 复位成可编译 | `uv run tools/scratch_bugs.py clean` |
+| 查看当前靶状态 | `uv run tools/scratch_bugs.py status` |
+
+注入的 3 个错误（**全部落在 8192 字节以下的文件里**，理由见 3.6.3）：
+
+| # | 位置 | 编译器报错 | 修法 |
+|---|---|---|---|
+| 1 | `handler.rs:22` | E0308 `expected &Pool<Sqlite>, found Pool<Sqlite>` | 补 `&` |
+| 2 | `models.rs:52` | E0063 `missing field email in initializer of PublicUserResponse` | `From` 里补 `email: value.email` |
+| 3 | `response.rs:56` | E0308 `expected String, found &str` | `message: message.to_string()` |
+
+三条都是「重构做到一半」的真实形态，彼此独立、互不遮蔽。`--message-format=short` 全量回执 **451 字节**，
+一次看全、不触发截断；长格式下第 1 条还会在 `note:` 里打出 `auth.rs:198` 的完整签名 ⇒
+**模型不必读 `auth.rs` 也能修**（刻意避开长文件）。已验证：按上表修完 → `cargo check` **EXIT=0**，无连锁错误。
+
+#### 3.6.2 开跑前必须确认的 4 条（任一不满足，验收结果作废）
+
+1. **`max_steps` 够用** — `main.rs` 现为 50（原来 5 连「读→改→check→读错→改」都不够）。步数耗尽时结论会丢，是已知 V1 债。
+2. **副本必须带 `.env`** — `my_api` 有 **8 处 `sqlx::query!`** 编译期宏，`DATABASE_URL` **只能**来自 `my_api/.env`
+   （实测：父进程 env 为空、无 `.sqlx` 缓存、**移走 `.env` 立刻炸 7 条 `set DATABASE_URL to use query macros online`**）。
+   这类错误**模型改代码永远修不好**，会死循环，最后被误判成「agent 不行」。
+3. **cwd 无关，但 manifest 要对** — 实测 sqlx 从 **manifest 所在目录**读 `.env`，不是进程 cwd ⇒
+   从 `scratch` 根跑 `cargo check --manifest-path my_api/Cargo.toml` **可行**。
+   这一条必须成立：`run_command` 有 `.current_dir(root)` 而 `{program,args}` 无 shell、**不能 `cd`**，
+   所以 agent 只能用 `--manifest-path`。
+4. **`target` 要么带要么预热** — 没有 `target` 时首次 check 要编 200+ crate、几分钟；而 `wait_with_output()`
+   **没有超时**，看起来就是卡死。现副本随 `target` 一起拷贝（2.6G），实测冷启 1.6s、增量 1.3s。
+
+#### 3.6.3 已知限制：长文件「读一半再整文件写回」会静默丢内容
+
+`read_file` 是**头部**截断（`MAX_TOOL_OUTPUT` = 8192），`write_file` 是**整文件覆盖** ⇒
+对一个 >8192 字节的文件「读一半 + 写回」= 后半段消失，而回执仍然报「成功写入 N 字节」，看不出异常。
+实测 `my_api/src/auth.rs` = **18,488 字节**，`truncate_head_tail(8192)` 后中间 **10,368 字节**不可见
+（该区段里 `SqlitePool` 出现 7 次）。
+
+⇒ **本次验收只挑 8192 以下的文件注入**（`auth.rs` 是唯一雷区，其余 12 个文件全在 4828 及以下）。
+
+##### 为什么「只给 `read_file` 加 `offset`」是半个解（2026-10-27 用户指出）
+
+这是两个**独立**的缺口，`offset` 只补前一个：
+
+| 侧 | 缺口 | 谁补 |
+|---|---|---|
+| **读** | 8192 之后看不见 | `read_file` 的**行号** `offset`（可选） |
+| **写** | **只能整文件覆盖**，没有局部修改能力 | **`edit_file(old,new)`（关键，新工具）** |
+
+只加 `offset` 时，模型会走一条**语义正确但代价不可接受**的路：分三块读完 18KB → 把 18KB **逐字回写**。
+- 输出侧：≈6k token 只为抄一遍原文；
+- 正确性侧：转写时漏一行、改个缩进，**没有任何地方能发现**；
+- 观测侧：回执仍是「成功写入 18488 字节」，与「抄对了」逐字相同。
+
+⇒ **承重的是写侧**。`edit_file` 让「写」不再要求「手里有全文」，这才是闭合条件。
+
+**「插入」不需要独立工具**：它就是 `old_string` 挑锚点、`new_string` 里多写一段。
+⇒ 也**不要**给 `write_file` 加 `mode: append / insert / replace` 参数（那是把三种语义塞进一个工具，
+调用点读不出 `mode` 的取值，同 §3.4「单一策略决定点」那条）。
+
+`edit_file` 的形状 = **三态匹配**，回执必须各自可行动：
+
+```rust
+let n = content.matches(old_string).count();
+0 => bail!("未找到要替换的文本（逐字节匹配，含缩进；可能是行尾符差异）"),
+1 => 写回 content.replacen(old_string, new_string, 1),
+_ => bail!("匹配到 {n} 处，请把 old_string 扩大到能唯一定位的上下文"),
+```
+
+三个坑（前两个是设计，第三个是平台）：
+1. **必须唯一匹配**，不是「替换第一个匹配」——否则模型永远不知道它改的是不是那一处；
+2. `new_string` **可以等于** `old_string` 前缀（插入语义天然如此），不要加「有变化」的校验；
+3. **行尾符**：`old_string` 用 `\n`、文件是 CRLF ⇒ 0 匹配。实测 `my_api/src` **13 个文件全是 LF**（CRLF 计数 0），
+   所以当前不踩；但 0 匹配的文案里必须提到这个可能，否则模型会去重读文件、再失败、循环。
+   （业界对照：Claude Code `Edit` / Gemini `replace` 都走参数化 `old/new`；Aider 走 SEARCH/REPLACE 文本区块，
+   我们走前者是因为工具调用**已经是结构化 JSON**，不需要再解析文本区块。）
+
+##### 只有 `edit_file` 仍不够：`write_file` 的拒写守卫
+
+`edit_file` 存在 ≠ 模型会用。它可能在 >8192 的文件上继续 `write_file` 盲写。故在 `write_file` 的
+`Ok(meta)` 分支（那里已有 `meta.len()`，零额外 syscall，且紧跟在 `is_file()` 之后）加一道
+（签名已改成三参数：`fn write_file(path: &Path, content: &str, max_bytes: usize) -> Result<usize>`）：
+
+```rust
+// Ok(meta) 分支内、is_file() 判断之后
+if meta.len() > max_bytes as u64 {
+    bail!("文件过大，超过 {max_bytes} 字节，请使用 edit_file 工具");
+}
+```
+
+##### 守卫阈值：传参还是引常量（2026-10-27 用户质疑后**改判**）
+
+旧结论「判据**直接引常量**、不传参，否则改一个忘另一个」**作废** —— 那是**纪律型**论证：它没有指出任何
+类型 / 结构层面的强制，只是「希望你记得」。可判定的规则只有一条：
+
+> **这个值将来会不会变？看它是 `const` 还是 `Executor` 的字段。字段的存在本身就是「它会变」的授权 ⇒ 读字段。**
+
+审计（当时 `max_bytes` 全文 4 处）：声明 `tool.rs:314`、`new()` 里赋常量 `323`、`run()` 里读两次 `332/333`；
+**无 setter、无 CLI/env 入口、`write_file` 看不到它**。⇒ 那一刻「引常量」与「传字段」**运行期完全等价，一个字节不差**。
+但它既然被写成 `Executor` 的字段，就该读字段 —— 否则它不配做字段，该是 `const`。**用字段的意图去定参数的真假。**
+
+⇒ 落地为 **B**：`write_file(path, content, max_bytes)` + `raw_invoke(&self, root, max_bytes)`（`max_bytes` 与 `root`
+同属「执行环境」，加进签名不破坏形状；不变量从「两处写同一个数」变成「一个字段被读两次」，后者是结构性的）。
+
+一致性论据也支持 B：`truncate_head` / `truncate_head_tail` 的参数之所以**必须**是参数，是因为测试要传 64 / 128 这种小值；
+守卫同理 —— 传 `max_bytes` 后测试可构造 `max_bytes = 16` + 20 字节文件验证拒写；写死常量则只能真的造 8193 字节文件，
+**那时测的是常量值，不是逻辑**。
+
+⚠️ **两个参数同名 ≠ 同一件事**：`truncate_*` 收的是**预算**（这次最多放多少字节出去），守卫收的是**阈值**
+（多大就算「你不该见过全文」）。今天数值相同，靠的是一条**语义等价**：`read_file` 会截断 ⟺ 文件超过单次可见上限
+⟺ 模型不可能见过全文。这条等价在加 `offset`/`limit` 之后会漂 —— 用 offset 分块读完 18KB 的模型**其实见过全文**，
+守卫照拒。这正是下面「代价」那条、也是 V1 换覆盖率追踪的**同一个缺口**。
+
+其余三条设计点：
+- **`Err(NotFound)` 分支不守卫**：新文件没有「现有内容被截掉」的风险，拦住它只会妨碍建文件。
+  守卫的定位是「静默毁 10KB → 明确拒绝 + 指路」，不是「不许写大文件」。
+- **代价**：合法的大文件整体重写也会被拒（模型分块读完想整体写回）。V0 的任务是「修编译错误」，这条路本来不该走；
+  V1 的正确形态是 Claude Code 那种「Edit/Write 前必须 Read 过」的**覆盖率追踪**，那时才有状态可判。
+  **现在这条守卫的收益是把「静默毁 10KB」换成「明确拒绝 + 指路」**，这是纯增益。
+- ⚠️ **现文案缺两样可行动信息**：① 文件实际多少字节（模型据此判断「差一点」还是「差一倍」）；
+  ② **为什么**不能写（「你只可能看过前 `max_bytes`，尾部没见过」）—— 没有 ②，模型可能改成「先 `read_file` 再写」的
+  同一错误循环。两句都能从现有变量拼出来，属纯文案，待补。
+
+#### 3.6.4 验收记录：**通过**（2026-10-27，15 步）
+
+任务横幅（`main.rs`）：`查看并尝试修复沙箱下的my_api文件夹内的rust错误,临时文件请放在沙箱下的tmp文件夹内。
+可以使用"cargo check --message-format=short"命令减少输出。`　`max_steps = 50`（实际用 **15 步**）。
+
+**结果（我方独立复核，不采信 agent 自述）**：
+
+```
+cargo check --all-targets --message-format=short   → EXIT=0，零代码告警
+cargo test                                        → 21 passed + 17 passed = 38 passed，0 failed
+diff -rq my_api/src  scratch/my_api/src           → 只有 models.rs 不同（+1 行注释，59 字节）
+```
+
+| 注入的错误 | agent 的修法 | 判定 |
+|---|---|---|
+| `handler.rs:22` E0308 | 补 `&`（并对照同文件 `get_me`/`delete_me` 的写法） | 与本体**逐字节相同** ✔ |
+| `models.rs:52` E0063 | **删掉 `email` 字段** + 补注释，而非补 `email: value.email` | 与本体差 1 行注释 ✔（见下） |
+| `response.rs:56` E0308 | `message: message.to_string()` | 与本体**逐字节相同** ✔ |
+
+**`auth.rs`（18,488 字节，§3.6.3 的长文件雷区）一个字没动** —— 3.6.3 预判的风险没有发生。
+
+**三个超出"让编译器闭嘴"的行为（值得记，因为它们决定 V1 的设计）**：
+
+1. **第 2 个错误它没走最短路径**。它读了 `tests/http.rs::test_get_user`，判断「公开接口 `GET /users/{id}` 不该返回邮箱」，
+   于是**删字段**而不是补字段，并主动写出反向改法（「如果你的本意是公开接口也要返回邮箱，那么反向改一行即可」）。
+   ⇒ **V0 的验收目标「通过编译」不足以约束语义**：它改的是**接口契约**，不是恢复原状。这次它猜对了（本体本来就没有 email，
+   我注入的 `email` 字段是凭空加的），但这条说明「语义正确性」不在 V0 的能力范围内 —— V1 要补的是「改契约前先确认意图」。
+2. **自己决定跑 `cargo test`**（38 个测试、约 20 秒），不止于 `cargo check`。这同时验证了两个既有决定：
+   「退出码全走 `Ok`」（否则 test 失败会被当工具故障）+ 「头尾截断」（测试失败诊断在尾部）。
+3. **意识到「没有删除工具」并自行绕过**：原文 *"can't delete files with tools (no rm). I'll overwrite it with a useful note."*
+   ⇒ 这是 V0 工具集缺口的直接证据（`tmp/fix_handler.rs` 最后是一行笔记，98 字节，没有残留垃圾）。
+
+**代价与遗留**：15 步里它把 `cargo test` 跑了不止一次（约 20s/次），用时主要花在测试而非编译上。
+`tests/` 目录在 `scratch/my_api` 里也一并被拷进来了 —— 这次是好事（给了它语义线索），但也意味着**靶场不是"只有 src"的最小面**。
+
+**靶子设计教训（下次改进）**：错误 2 有**两条合法修法**（补 `email: value.email` / 删掉 `email` 字段），
+所以它**不能用来判「改得对不对」**，只能用来观察「它会不会自己找语义依据」。
+`handler.rs`（补 `&`）、`response.rs`（`.to_string()`）那两个才是**唯一解**的靶子。
+⇒ 下次要测「意图确认」，应该**单独设计一个必须提问的场景**，而不是靠歧义错误碰运气。
+
+#### 3.6.5 验收之后：V0 收尾定序 + 「意图确认」为什么必须拆成两件事（2026-10-27）
+
+**① 收尾顺序（覆盖 §〇 早先的「日志 → 单测 → offset」）**
+
+| 序 | 动作 | 理由 |
+|---|---|---|
+| 1 | **`edit_file` + `write_file` 大文件拒写守卫**（守卫 2026-10-27 已落地；`edit_file` 仍 `todo!()`） | 这两条**必须一起**，才把 §3.6.3 的静默丢内容**结构性**闭合（不是靠文档嘱咐） |
+| 2 | `read_file` 的**行号** `offset` | 解锁「尾部看不见」；在 1 之后它才是可选的加分项 |
+| 3 | 日志 `→ 工具名(参数)` / `← N 字节`、`truncate_middle` / `resolve_in` 单测 | 可观测性 + 防回归 |
+| 4 | **操作审批钩子**（见 ②） | 需 3 完成后才好观测「拒绝了什么」 |
+| 5 | 交互式 REPL + 语义追问 | V1 |
+
+**② 「意图确认」不是一件事，是两件**
+
+| | 是什么 | 现在能做吗 | 测试怎么做 |
+|---|---|---|---|
+| **(a) 操作审批** | host 在 `write_file`/`run_command` **之前**拦住，打 diff / 待执行命令，等 y/n | **能**，且**不需要终端也能测** | 注入 `confirm: impl Fn(&Invocation) -> bool`，测里传 `\|_\| false` |
+| **(b) 语义追问** | 模型**自己**停下来问「要补 `email` 还是删字段」 | 不能，要等多轮 REPL | 单发运行时它问完进程就结束了，无法追问 |
+
+(a) 的形状（关键在**注入**，不在读 stdin）：
+
+```rust
+struct Executor { root: PathBuf, max_bytes: usize, confirm: Box<dyn Fn(&Invocation) -> bool> }
+// CLI 传「打印 + 读一行 y/n」；测试传 |_| false
+```
+
+⇒ **审批逻辑这一层完全无交互可测**，缺的只有读 stdin 那 4 行。所以「必须先做交互式 CLI」只对 (b) 成立。
+
+**③ 更根本的一条：审批不能靠模型自觉**
+
+Codex 是 `approval_policy`（`untrusted` / `on-request` / `never`）+ sandbox、Claude Code 是 permission prompt / plan mode，
+**都是 host 强制**。「靠 prompt 让模型自己决定要不要问」不是可测的工程属性，成功率随模型波动 —— 它只能缓解，
+不能作为验收项。故 (b) 的正确形态也不是 prompt，而是「循环停在某个状态、把控制权交回人」。
+
+⇒ 文档口径修正：§3.7 分档表里「dry-run 确认」原本笼统列在「V0 就做」，现拆为
+**(a) 操作审批 = V0 收尾**、**(b) 语义追问 = V1–V2**。
+
 ### 3.7 工程化分档
 
 判据只有一条：**这项工程化，每小时能让你学到多少 Rust，以及是否直接提升可靠性 / 可测性 / 安全性。**
 
 | 档 | 内容 |
 |---|---|
-| **V0 就做** | 错误分层（领域错误 `thiserror` + 出口 `anyhow`，**结论见 §3.7.1**）· 结构化日志 · 超时与重试 · **把 LLM 调用藏在一个 trait 后面**（分发选择见 §3.2.1）· 路径沙箱 · 命令白名单 · dry-run 确认 · 工具输出截断 · token / 成本统计 |
-| **V1–V2 再做** | 会话持久化 · 上下文压缩 · 流式输出 · 多后端抽象 · MCP（**等真实需求出现，不提前设计**） |
+| **V0 就做** | 错误分层（领域错误 `thiserror` + 出口 `anyhow`，**结论见 §3.7.1**）· 结构化日志 · 超时与重试 · **把 LLM 调用藏在一个 trait 后面**（分发选择见 §3.2.1）· 路径沙箱 · 命令白名单 · **操作审批（host 在 write/run 前拦 y/n，注入式闭包，见 §3.6.5②）** · 工具输出截断 · token / 成本统计 |
+| **V1–V2 再做** | 会话持久化 · 上下文压缩 · 流式输出 · 多后端抽象 · MCP（**等真实需求出现，不提前设计**）· **交互式 REPL + 语义追问**（模型主动提问，单发运行测不了，见 §3.6.5②(b)） |
 | **对本目标不做** | 多 agent 编排 · 插件系统 · GUI · 打包分发 · 可观测性后端（每小时学到的 Rust 最少） |
 
 **其中一项回报特别大，值得单独点出来 —— 把 LLM 调用藏在一个 trait 后面**：
@@ -3822,7 +4027,7 @@ loop {
 - [x] ✅ **`run_command` 已加 `.stdin(Stdio::null())`**（2026-10-27）：三流现在全显式声明（stdout/stderr pipe + stdin null），不再继承父进程终端（§3.5 末 2026-10-26 v3）
 - [x] ✅ **`RunCommandArg` 已补 `#[serde(deny_unknown_fields)]`**（2026-10-27）：与另外三个 Arg 一致，模型传 `timeout` 现在会明确报参数有误，不再静默忽略
 - [x] ✅ **`run_command` 两条 bail 文案已修**（2026-10-27）：裸名那句不再谎称「未找到可执行文件」（改成「只能写裸名，不能带目录或路径」），白名单那句带 `ALLOW_CMD.join(", ")` 清单；外侧 context 改「无法执行命令 {}」（§3.5 末 2026-10-26 二次更正）
-- [ ] 🟠 **`run_command` 的 description 要写一句 `cargo check --message-format=short`**（**尚未落地**，`spec()` 现在只有 4 条）：`MAX_TOOL_OUTPUT` = 8192，80 个错的 crate 长格式 `cargo check` 是 **17,213 字节 / 643 行**、`--short` 是 6,533。实测 200 个 E0308 时 head=6144 只能装 **27 个（长格式）/ 99 个（short）** ⇒ 不写这句，模型会「修完前 27 个 → 再跑 → 再修」。属于纯文案，`spec()` 加第 5 条即可（§3.5 末 2026-10-27 实测）
+- [x] 🟠 **让模型用 `cargo check --message-format=short`**：`MAX_TOOL_OUTPUT` = 8192，80 个错的 crate 长格式 `cargo check` 是 **17,213 字节 / 643 行**、`--short` 是 6,533。实测 200 个 E0308 时 head=6144 只能装 **27 个（长格式）/ 99 个（short）** ⇒ 不写这句，模型会「修完前 27 个 → 再跑 → 再修」。**2026-10-27 已实现，但落在 prompt 而不是 `spec()`**：`main.rs` 的任务横幅里加了「可以使用“cargo check --message-format=short”命令减少输出」——只对当前任务生效；`spec()` 仍是 4 条（要变成**所有任务永久生效**，把第 5 条加进 `ToolKind::RunCommand` 的 description 即可，属纯文案）
 - [x] ✅ **截断拆成 `truncate_head` / `truncate_head_tail`（2026-10-27，`max_bytes` 不用调大）**：原来一份 `truncates` 只砍尾巴，而 **`cargo test` 的诊断恰好在尾部**（1200 行日志把 `panicked` / 断言值 / `test result: FAILED` 全推到 8192 之后 ⇒ 模型只看到 50 行 `test ok`）。现在按 `Invocation` 派发：`RunCommand` → 头 3/4 + 尾 1/4（实测尾部诊断只需 348 字节，2048 有 6 倍余量），其余工具 → 只留头。共用私有 `truncate_middle() -> (head_end, tail_start)`，`LINE_SNAP_MAX = 256`。**没抽「core + 两个壳」**：两份文案不同（`read_file` 要报「剩多少 + 用 rg 定位」，`run_command` 只报「中间省略多少」），core 里带 `if 策略` 就是假壳。实测 6 个用例全过（见 §3.5 末 2026-10-27）
 - [x] ✅ **回执超预算 ~50 字节：决定维持现状**（2026-10-27）：`truncate_head` 8199 / `truncate_head_tail` 8242 vs `max_bytes` 8192 —— 省略标记是切完之后**追加**的，所以该参数实际管的是「正文」。要么改名 `max_body` + 注释，要么切之前预留 ~150 字节；**50 字节不值得动逻辑**，记录在案（§3.5 末 2026-10-27）
 - [ ] 🟠 **`Executor::run` 对 `Err` 也要截断**：现在 `?` 直接上抛，`agent.rs` 只做 `format!("Error: {e:#}")` ⇒ 一个 80 错的 crate 可达 **17,213 字节 / 643 行**，全部原样进 history（`MAX_TOOL_OUTPUT` = 8192）。⚠️ 退出码全走 `Ok` 之后这条已大幅降级（`Err` 只剩 `spawn`/拒绝执行，文案都很短），属**防御性兜底**，V0 可不做（§3.5 末 2026-10-26 实测）
@@ -3831,6 +4036,38 @@ loop {
 - [x] **错误文案里的路径统一成 `args.path`**（2026-10-23 完成）：① ✔ `resolve_in` 的 `root.display()` 已删 ② ✔ `read_file`/`list_files` 的 `with_context` 已退化成裸 `?`，路径由 `raw_invoke` 用 `args.path` 补 ③ ✔ `WriteFile` 臂已加 `.with_context(|| format!("写入 {} 失败", args.path))`，`路径并不是合法文件!` 改成「目标已存在，但并不是普通文件!」（§3.5 末 2026-10-23 实测）
 - [x] **`resolve_for_write` 返回「canon 祖先 + 词法尾巴」（方案 B）**（2026-10-26 v6 完成）：`canon_祖先.join(tail)` + 空尾巴单判；**关键坑**是 `tail` 必须 `canon.strip_prefix(canon_tmp)?`（**词法**祖先），用 `canon_ancestor`（canon 后）会因 `VerbatimDisk` vs `Disk` 恒失败、再被 `unwrap_or(&canon)` 静默吞掉 ⇒ `join` 遇绝对路径替换 ⇒ 退回方案 A。v6 实测 **11/11**：沙箱内普通绝对路径（新建/覆盖）、大小写不同祖先（回执 `Sub\...` 证明走了真拼接）、junction 单层/多级、`../` 越界、深层建目录全过（§3.5 末 2026-10-26）
 - [ ] **`truncates` / `resolve_in` 两条单测**（现有 1 个 `test_resolve_write` 覆盖 write 四场景）：2026-10-27 已用 `Executor::run` **手动端到端**跑过 6 个用例（不超限原样返回 / 5000 行 rg 命中保尾 / 中文多字节 / 20KB 无换行单行 / 真实 `cargo test` 尾部诊断 / `cargo check` 200 错），但**单测仍是 0 覆盖** —— 手动测不防回归。要补：`truncate_middle("中".repeat(3000), 8192, 0)` 不 panic、`resolve_in(tmp, "../x")` 必须 `Err`、**junction 越界**（`mklink /J` 普通用户可建）、**覆盖已有文件**
-- [ ] 安全边界落地：scratch 目录 + 写/shell 确认 + 命令白名单 + 输出截断（**路径沙箱已落地** 2026-10-22；「`run_command` 上线时路径检查即失效，必须换 OS 沙箱/白名单/容器」见 §3.5 调研小节）
+- [ ] 安全边界落地：scratch 目录 + **操作审批** + 命令白名单 + 输出截断（路径沙箱 2026-10-22 ✔ / 白名单 ✔ / 截断 ✔；
+  「`run_command` 上线时路径检查即失效，必须换 OS 沙箱/白名单/容器」见 §3.5 调研小节）。
+  **审批（2026-10-27 重新定型，见 §3.6.5②）**：`Executor.confirm: Box<dyn Fn(&Invocation) -> bool>`，
+  `write_file` / `run_command` 两臂调用前先过它；CLI 传「打印 + 读一行 y/n」，**测试传 `|_| false`** ⇒ 这一层无交互可测。
+  「模型自己停下来问」（语义追问）不在本条，属 V1 交互式 REPL
 - [ ] 自答 §3.8 的 4 个问题
-- [ ] **验收**：拿 `my_api` 副本跑通一次真实修复（§3.6）
+- [ ] 🟠 **长文件根治 = 三件，且承重的是写侧**（2026-10-27 用户指出「加 offset 也没用，write 又没有插入工具」后改判；详见 §3.6.3 / §3.6.5）：
+  现状 `read_file` 头部截断 8192 + `write_file` 整文件覆盖 ⇒ 对 >8192 字节的文件「读一半再写回」= **静默丢内容**
+  （实测 `my_api/src/auth.rs` 18,488 字节，中间 10,368 字节不可见，该段里 `SqlitePool` 出现 7 次）。三件按优先级：
+  ① 🔴 **`edit_file(old_string, new_string)`**（5 号工具）—— 让「写」不再要求「手里有全文」，**这才是闭合条件**。
+  三态匹配：`0` / `1` / `n>1` 各自 bail 且文案可行动；`new_string` 允许以 `old_string` 为前缀（插入语义）；
+  0 匹配的文案要提「可能是行尾符差异」（实测 `my_api/src` 13 个文件全 LF，当前不踩）。
+  「插入」不需要独立工具、也**不要**给 `write_file` 加 `mode:` 参数（§3.4 单一策略决定点）；
+  ② ✅ 🔴 **`write_file` 大文件拒写守卫（2026-10-27 已落地）**：`meta.len() > max_bytes` ⇒ 拒 + 指路 `edit_file`。**阈值走参数**
+  （`write_file(path, content, max_bytes)` + `raw_invoke(&self, root, max_bytes)`）——
+  **2026-10-27 用户质疑后改判**：旧说法「直接引常量、不传参，否则改一个忘另一个」是纪律型论证，作废；
+  判据是「`max_bytes` 是字段还是 `const`」—— 字段即「它会变」的授权，故读字段（见 §3.6.3）。代价：合法的大文件整体重写被拒 —— V1 用
+  Claude Code 的「Edit/Write 前必须 Read 过」覆盖率追踪取代；现在这条是「静默毁 10KB → 明确拒绝」的纯增益；
+  ③ 🟡 **`read_file` 加 `offset`（行号，不是字节）**——唯一导航信号是 cargo 的 `src\x.rs:22:31`，模型没法把行号换算成字节
+  （**2026-10-27 自我更正**：早先写「按字节更自洽」是错的；Gemini CLI 用 `start_line`/`end_line`、Claude Code 用行 `offset`/`limit`
+  也是行）。字节上限只作最后安全网（防单行 20KB）。回执末尾给「用 `offset=N` 继续读」，文案抄 Gemini `read-file.ts`：
+  `Status: Showing lines {start}-{end} of {total} total lines. / Action: ...`
+  加第 5 个工具的实际成本：编译器会逼你补 **4 处**穷尽 match（`name()` / `spec()` / `parse_kind` / `raw_invoke`），
+  唯一没被逼的是 `ALL` 数组（已有「长度 + 名字唯一」测试钉着）⇒ 又一个 V1 `Box<dyn Tool>` 的论据。
+  ⚠️ **别用「给 `uv` 权限让它写 python 脚本读写」代替**，三条理由（2026-10-27 实测/核证）：
+  ① `uv run python -c "print(open(f).read())"` 的 stdout **走的是同一个 `truncate_head_tail(8192)`** ——
+  实测 18,489 字节照样被砍、中间 10,368 字节仍不可见，只是把「读文件」绕开了、没绕开「进 history 前的截断」；
+  ② 业界反证：Gemini CLI（`run_shell_command`）与 Claude Code（`Bash`）**都同时有** shell 和 `read_file` 分页
+  ⇒「有 shell 就不用分页」不成立；③ 往 `ALLOW_CMD` 加 `uv` = 加一个万能启动器，回执形状失控、模型会偏好用它绕开小工具。
+  ——安全**不是**理由：`cargo` 的 `build.rs` 本来就能执行任意代码，路径沙箱≠权限沙箱
+- [x] **验收靶场就绪**（2026-10-27）：`scratch/my_api` 副本 + `tools/scratch_bugs.py`（inject/clean/status）+
+  3 个注入错误（`handler.rs` E0308 / `models.rs` E0063 / `response.rs` E0308，全部 <8192 字节）。详见 **§3.6.1~3.6.3**
+- [x] **验收通过**（2026-10-27，**15 步**）：3 个注入错误全部修好，`cargo check --all-targets` 零告警、`cargo test`
+  **38 passed**（21 单元 + 17 集成），`auth.rs`（18,488 字节雷区）未被动。详见 **§3.6.4**（含 3 个「超出让编译器闭嘴」的行为，
+  以及最要紧的一条：**「通过编译」不足以约束语义** —— 它把第 2 个错误按 `tests/http.rs` 的意图删了字段，猜对了，但那是运气）

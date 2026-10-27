@@ -76,6 +76,21 @@ pub struct WriteFileArg {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct EditFileArg {
+    pub path: String,
+    pub old_string: String,
+    pub new_string: String,
+
+    #[serde(default = "default_replace")]
+    pub replace_all: bool,
+}
+
+fn default_replace() -> bool {
+    false
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunCommandArg {
     pub program: String,
 
@@ -88,6 +103,7 @@ pub enum Invocation {
     ReadFile(ReadFileArg),
     ListFiles(ListFilesArg),
     WriteFile(WriteFileArg),
+    EditFile(EditFileArg),
     RunCommand(RunCommandArg),
 }
 
@@ -118,6 +134,14 @@ impl Invocation {
                     })?;
                 Ok(Self::WriteFile(write_args))
             }
+            ToolKind::EditFile => {
+                let edit_args: EditFileArg =
+                    serde_json::from_str(args).map_err(|err| ToolError::WrongParams {
+                        name: kind.name().to_string(),
+                        details: err.to_string(),
+                    })?;
+                Ok(Self::EditFile(edit_args))
+            }
             ToolKind::RunCommand => {
                 let runcmd_args: RunCommandArg =
                     serde_json::from_str(args).map_err(|err| ToolError::WrongParams {
@@ -134,6 +158,10 @@ impl Invocation {
             Self::ReadFile(args) => format!("read_file, path : {}", args.path),
             Self::ListFiles(args) => format!("list_files, path : {}", args.path),
             Self::WriteFile(args) => format!("write_file, path : {}", args.path),
+            Self::EditFile(args) => format!(
+                "edit_file, path : {}, replace_all : {}\nold :\n{},\nnew :\n{}\n",
+                args.path, args.replace_all, args.old_string, args.new_string,
+            ),
             Self::RunCommand(args) => format!(
                 "run_command, program : {}, args : [{}]",
                 args.program,
@@ -163,6 +191,7 @@ pub enum ToolKind {
     ReadFile,
     ListFiles,
     WriteFile,
+    EditFile,
     RunCommand,
 }
 
@@ -171,6 +200,7 @@ impl ToolKind {
         ToolKind::ReadFile,
         ToolKind::ListFiles,
         ToolKind::WriteFile,
+        ToolKind::EditFile,
         ToolKind::RunCommand,
     ];
 
@@ -182,6 +212,7 @@ impl ToolKind {
             ToolKind::ListFiles => "list_files",
             ToolKind::WriteFile => "write_file",
             ToolKind::RunCommand => "run_command",
+            ToolKind::EditFile => "edit_file",
         }
     }
 
@@ -220,6 +251,22 @@ impl ToolKind {
                     "type": "object",
                     "properties": { "path": { "type": "string" }, "content" : { "type" : "string" } },
                     "required": ["path", "content"],
+                    "additionalProperties": false
+                }),
+                strict: true,
+            },
+            ToolKind::EditFile => FunctionDecl {
+                name: "edit_file",
+                description: "更新文件内容，路径相对沙箱根目录, 主要作用是追加/插入/替换, 返回替换信息。要求如下\n \
+                    1. 默认（replace_all = false）时 old_string 必须在文件里恰好出现一次；出现多次就报错，要补足上下文把它变成唯一。\
+                    2. replace_all = true 时允许出现多处，并全部替换；这时不要把 old_string 选得太通用（只由空格、}、单个关键字组成）。\
+                    3. 找不到（0 处）在两种情况下都算错。\
+                    4. 插入：old_string 挑一个锚点（通常是一整行），new_string 里把锚点原样保留再插入新行；不要试图用空串定位。"
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" }, "old_string":{"type" : "string"}, "new_string" : {"type" : "string"}, "replace_all" : { "type" : "boolean" } },
+                    "required": ["path", "old_string", "new_string", "replace_all"],
                     "additionalProperties": false
                 }),
                 strict: true,
