@@ -159,8 +159,11 @@ impl Invocation {
             Self::ListFiles(args) => format!("list_files, path : {}", args.path),
             Self::WriteFile(args) => format!("write_file, path : {}", args.path),
             Self::EditFile(args) => format!(
-                "edit_file, path : {}, replace_all : {}\nold :\n{},\nnew :\n{}\n",
-                args.path, args.replace_all, args.old_string, args.new_string,
+                "edit_file, path : {}, replace_all : {}, old_size : {}, new_size : {}",
+                args.path,
+                args.replace_all,
+                args.old_string.len(),
+                args.new_string.len(),
             ),
             Self::RunCommand(args) => format!(
                 "run_command, program : {}, args : [{}]",

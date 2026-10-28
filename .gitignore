@@ -30,3 +30,6 @@ rustc-ice-*.txt
 
 # --- agent 的沙箱靶场（一次性、可弃）---
 scratch/
+
+# --- 临时文件夹 --- 
+tmp

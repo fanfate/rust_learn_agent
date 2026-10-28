@@ -2899,6 +2899,67 @@ if meta.len() > max_bytes as u64 {
   ② **为什么**不能写（「你只可能看过前 `max_bytes`，尾部没见过」）—— 没有 ②，模型可能改成「先 `read_file` 再写」的
   同一错误循环。两句都能从现有变量拼出来，属纯文案，待补。
 
+##### edit_file 的代价：它买的是**可验证性**，不是内存（2026-10-28 实测）
+
+**机制**：`read_to_string` → 内存替换 → `fs::write` 全文写回。用户问「那对大文件还是得过内存的，只是不让 LLM 接触过多文本？」
+—— 机制对，**数量级不对**。实测（18,488 字节，release，200 次平均）：
+
+| 步骤 | 单次耗时 |
+|---|---|
+| `read_to_string` | 146 µs |
+| `matches().count()` + `replacen()`（纯内存搬运） | **6.2 µs** |
+| `fs::write` 落盘 | **22 ms** |
+
+内存搬运占 **0.03%**，耗时几乎全在写盘（22ms 是本机 Defender + D: 盘的值，不代表普遍；但**比例**成立：I/O 比内存贵 3~4 个数量级）。
+峰值分配稳定 **2.00×** 文件大小（`read` 的 `String` 与 `replacen` 新分配的 `String` 同时存在）：
+18.5KB → 37KB / 23ms；10MB → 21MB / 34ms；50MB → 105MB / 304ms。
+要压到 1× 可用 `String::replace_range(pos..pos+old.len(), new)` 原地改不重分配；但 `replace_all` 多处索引会移位、得倒序处理，V0 不值得。
+
+**真正的收益不是省 token，是「谁在执行搬运」**：
+
+| | `write_file` 整文件覆盖 | `edit_file` 局部替换 |
+|---|---|---|
+| 未修改部分经过谁 | 模型**逐字重新生成** | **进程内存**，逐字节就是原值 |
+| 出错位置数 | 全文每个字节 | 只有匹配点与 `new_string` |
+| 出错有信号吗 | **没有**（回执永远「成功写入 N 字节」，与抄对了逐字相同） | 有：0 处 / n>1 处直接 bail |
+| 模型必须「见过全文」吗 | **必须** | **不必** |
+
+最后一行是承重的：`write_file` 守卫能拒掉 >8192 的文件，正因为整文件覆盖的正确性**依赖「模型手里有全文」**；`edit_file` 的正确性不依赖这个。
+⇒ **它不是「能读更多」，而是「不需要看见全部也能改对」。** 省下的 token（18KB 逐字回写 ≈5-6k vs 局部改 ≈40，差 150×）是让正确做法
+在经济上可行的**条件**，不是目的本身。
+
+边界两条：① 只有文件大到 `read_to_string` 装不下（GB 级）时「过内存」才成问题，那时该上 `memmap2` / 流式，代码沙箱不会出现；
+② `fs::write` 是 **truncate 后写、非原子**，中途崩 = 文件残缺（`write_file` 一模一样，是两者共同欠的债）。
+
+##### 回执的行号：为什么只报「起始行」（2026-10-28 实测）
+
+**不变量**：替换区之前**一个字节都没动** ⇒ 前缀里 `\n` 的个数不变 ⇒ **起始行号在旧文本与新文本里是同一个数**。
+这是唯一不漂移的锚点，也正是「选起始行而不是结束行」的理由。
+
+| 场景 | 在旧文本上算 | 替换后同偏移算 | 新文本里的真实位置 |
+|---|---|---|---|
+| 单处替换（换成 3 行） | 4 | 4 | 4 |
+| `replace_all` 第 1 处 | 2 | 2 | 2 |
+| `replace_all` 第 2 处 | 4 | **3** | **5** |
+
+⇒ 三条落法（已实现）：
+- `replace_all = false`：报**起始行号**，取自 `base_file.find(old_string)`（此时 bail 已保证唯一）。
+- `replace_all = true`：**不报行号** —— 改多处，一个行号会让模型以为「都在这附近」，只报处数 + 总行数变化。
+- 🔴 **绝不在 `new_file` 上用 `new_string` 反查位置**。实测两个反例：`new_string = ""`（删除）时 `find("")` 得 0 ⇒ 报「第 1 行」
+  （实际第 3 行）；`new_string` 是文件里早就出现过的常见串（如 `Ok(())`）时，报的是**文件里第一处** —— 实测报第 2 行、实际第 305 行，差 303 行。
+  （2026-10-28 首版实现踩过这个坑，已改为数旧文本。）
+
+##### edit_file 落地后的 review（2026-10-28）
+
+逻辑已正确：空串先判 → 0 处 / n>1 都在**写盘之前** bail → 行号取自 `base_file`。余下：
+
+| 类 | 项 |
+|---|---|
+| **文案（影响自纠）** | ① 0 匹配缺行尾符提示（本章硬要求：不提 CRLF，模型会重读再失败再循环）② n>1 文案错别字「已确保」→「**以**确保」，且缺第二条出路「若确实要全部替换，把 `replace_all` 设为 `true`」③ `raw_invoke` 仍打 `diff 为 :`，而回执已是「替换 N 处; 总行数 …」—— 名不副实 |
+| **语义（现在对，靠巧合）** | `base_file.replace()` 是**全替换** API，却用在 `replace_all = false` 分支；结果正确只因 bail 保证了 n==1。应显式 `if replace_all { replace } else { replacen(.., 1) }`，否则将来放宽唯一性检查会**静默变成全改** |
+| 风格 | `re_line` 在 `replace_all` 时白算一次（挪进 else 分支即可）；`&base_file[..pos].bytes().filter(..).count() + 1` 里的 `&` 是噪声 |
+| 可留 | 目录经 `read_to_string` 报 os error 5（文案「读取文件失败」给了线索，但看不出是目录）；末尾追加换行不改变 `lines()` 计数 ⇒ 这类改动报「总行数 0 变化」 |
+
 #### 3.6.4 验收记录：**通过**（2026-10-27，15 步）
 
 任务横幅（`main.rs`）：`查看并尝试修复沙箱下的my_api文件夹内的rust错误,临时文件请放在沙箱下的tmp文件夹内。
@@ -2975,6 +3036,95 @@ Codex 是 `approval_policy`（`untrusted` / `on-request` / `never`）+ sandbox�
 
 ⇒ 文档口径修正：§3.7 分档表里「dry-run 确认」原本笼统列在「V0 就做」，现拆为
 **(a) 操作审批 = V0 收尾**、**(b) 语义追问 = V1–V2**。
+
+**④ 单测怎么写：`FileHelper` 与「准备/清理不做断言」（2026-10-28 落地）**
+
+给 `edit_file` 铺用例时，第一行测试就暴露**测试本身不可信**：`test_resolve_write` 硬编码 `scratch/tmp/new.txt`，
+跑完留残留 ⇒ 第二次运行时 `resolve_for_write` 走「目标已存在」分支，`write_file` 的 `create_dir_all` 重试分支
+**再也执行不到**。测试绿着，覆盖的分支已经换了。
+
+实证（同一个测试、同一份代码，只改前一次的残留）：
+
+| 前一次留下的状态 | 本次结果 |
+|---|---|
+| 干净 `scratch/tmp` | ok |
+| 上一轮的 `new.txt` 被设为只读 | **FAILED**：`assertion failed: s.is_ok()`（`tool.rs:388`）|
+| 清干净后复跑 | ok |
+
+⇒ **helper 要解决的是「从已知干净状态开始」（幂等性），不是「创建和删除文件」。**
+
+形状（`mod test` 内，不引 `tempfile`）：
+
+```rust
+struct FileHelper { path: PathBuf }
+impl FileHelper {
+    const TMP_ROOT: &str = "tmp";
+    fn new(case: &str) -> Self {
+        let dir_path = PathBuf::from(Self::TMP_ROOT).join(case);
+        let _ = fs::remove_dir_all(&dir_path);          // 不存在/是文件都忽略
+        fs::create_dir_all(&dir_path).expect("初始化临时目录失败");
+        let root = fs::canonicalize(&dir_path).expect("临时目录 canonicalize 失败");
+        Self { path: root }                             // 存 canon 过的
+    }
+    fn root(&self) -> &Path { &self.path }
+    fn get_path(&self, p: &str) -> PathBuf { self.path.join(p) }
+    // create_dir / delete_dir / create_file / delete_file：一律 let _ = ，只有 create_dir_all 保留 expect
+}
+impl Drop for FileHelper { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.path); } }
+```
+
+四条判据：
+
+| 判据 | 理由 |
+|---|---|
+| **`canonicalize` 收进 `new`，只算一次** | 把「测试形状 ≠ 生产形状」这个已踩过三次的坑**结构性**消掉；`root()` 直接给 canon 过的路径，用例不用再自己 canon |
+| **目录名 = 用例名，不用随机名** | 唯一性靠用例名（`cargo test` 默认并行）；**同名 + 开头清空是自愈的** —— 进程被 kill 时 `Drop` 不跑，随机名会永久积累 |
+| **`Drop` 用 `let _ =`** | 见下「陷阱二」：Drop 里 panic 在 unwind 中会 abort |
+| **准备/清理只「搬状态」，不对搬的结果下断言** | 「确保不存在」「确保存在且为空」都是幂等操作，`NotFound` 是无害的；只有 `create_dir_all`（后续全靠它）才值得 `expect` |
+
+**陷阱一：`let _ = expr.expect(..)` 不是「忽略错误」**（2026-10-28 实际踩到）
+
+```rust
+let _ = fs::remove_dir_all(&dir_path).expect("清除路径失败");   // ✗ 等于没改
+```
+
+`expect` 签名 `fn expect(self, msg) -> T`：吃 `Result<T,E>`、**返回 `T`**。⇒ `Err` 在到达 `let _ =` 之前就 panic 了。
+**自查判据：`let _ =` 后面的表达式里不该再出现 `.expect()` / `.unwrap()` / `?`**，三者都比 `let _ =` 先作用。
+正确写法就是 `let _ = fs::remove_dir_all(&dir_path);`。
+
+**陷阱二：`Drop` 里 `expect`，在断言失败时会 abort 整个进程**（实测）
+
+| 情形 | 表现 |
+|---|---|
+| 测试正常结束、仅 `Drop` panic | 正常失败，报 `Drop 里的 panic`，exit 101，其余用例照跑 |
+| **断言失败（正在 unwind）+ `Drop` panic** | **abort**：`exit code: 0xc0000409 STATUS_STACK_BUFFER_OVERRUN` |
+
+第二种的完整输出只有三行：断言信息**一个字都没打出来**、用例名后面连 `FAILED` 都没有、**排在后面的用例根本没跑**。
+`let _ =` 对它零成本，`expect` 的代价是「失败时丢掉失败信息」—— 代价不对称到不需要讨论概率。
+
+**陷阱三：`create_dir` 在「新克隆的仓库」里必然炸**
+
+`tmp/` 被 `.gitignore` 忽略 ⇒ 新克隆下来**必然没有**。实测 `rmdir tmp` 后 4 个用例全部
+`panicked at tool.rs:392: 初始化临时目录失败: Os { code: 3, kind: NotFound }`。
+`create_dir_all` 同时解决三件事：父目录自动建、已存在返回 `Ok(())`（避开 `AlreadyExists(183)` 的并发竞态，实测）、
+不需要「先探存在再建」的辅助函数。
+
+**断言要求（两条硬规矩）**
+
+1. **断言值，不断言 `is_ok()`**：`write_file` 返回 `usize` 就是为了让用例写 `assert_eq!(s.unwrap(), 1)`
+   ——「成功但写了 0 字节」是它唯一要防的情况；写 **`assert!(!is_ok())` 等于什么都没测**。
+2. **否定路径要断言「原文未变」+ 错误关键词**：现有 `assert!(p.is_err())` 只测了「有错」，哪天 `resolve_for_write`
+   因为**别的**原因也 `Err`，用例照样绿。正确形态 `let err = s.unwrap_err(); assert!(format!("{err:#}").contains("越界"))`。
+
+**用例分类（先说清哪些根本不用碰文件）**
+
+| 类别 | 用例 | 需要造文件吗 |
+|---|---|---|
+| 纯路径代数 | `../` 越界 / 绝对路径 / 空串 | **否**，只要一个真实存在的 root |
+| 需要文件系统 | 写入成功 / 父目录不存在 / 目标是目录 / 守卫触发 | 是 |
+| `edit_file` 待铺（8+2） | 唯一替换 · 插入 · `replace_all` 全替换且回执含处数 · 0 处 **且原文未变** · n>1 且 `replace_all=false` **且原文未变** · 空 `old_string` · 文件不存在 · `new_string=""` 删除成功**且回执行号 ≠ 1** · 中文多字节 · 回执含 `起始第 N 行` | 是 |
+
+正向用例的期望值必须**独立算出**（`input.replacen(old, new, 1)`），不复用被测代码的中间变量，否则测试与实现同错。
 
 ### 3.7 工程化分档
 
@@ -4035,7 +4185,9 @@ loop {
 - [x] **`Executor` 横切层 + `raw_invoke` 分派层**：`Executor{root, max_bytes}`（`new` 里 `canonicalize` 一次 = 不变量载体）、`run` = `raw_invoke` → **按 `Invocation` 派发截断策略**（`RunCommand` → 头+尾，其余 → 只留头，2026-10-27）；`raw_invoke` 私有、每臂先 `resolve_in`（**§3.5**：校验函数必须**返回**后续真正被使用的那个值，不是 `bool`/`()`）
 - [x] **错误文案里的路径统一成 `args.path`**（2026-10-23 完成）：① ✔ `resolve_in` 的 `root.display()` 已删 ② ✔ `read_file`/`list_files` 的 `with_context` 已退化成裸 `?`，路径由 `raw_invoke` 用 `args.path` 补 ③ ✔ `WriteFile` 臂已加 `.with_context(|| format!("写入 {} 失败", args.path))`，`路径并不是合法文件!` 改成「目标已存在，但并不是普通文件!」（§3.5 末 2026-10-23 实测）
 - [x] **`resolve_for_write` 返回「canon 祖先 + 词法尾巴」（方案 B）**（2026-10-26 v6 完成）：`canon_祖先.join(tail)` + 空尾巴单判；**关键坑**是 `tail` 必须 `canon.strip_prefix(canon_tmp)?`（**词法**祖先），用 `canon_ancestor`（canon 后）会因 `VerbatimDisk` vs `Disk` 恒失败、再被 `unwrap_or(&canon)` 静默吞掉 ⇒ `join` 遇绝对路径替换 ⇒ 退回方案 A。v6 实测 **11/11**：沙箱内普通绝对路径（新建/覆盖）、大小写不同祖先（回执 `Sub\...` 证明走了真拼接）、junction 单层/多级、`../` 越界、深层建目录全过（§3.5 末 2026-10-26）
-- [ ] **`truncates` / `resolve_in` 两条单测**（现有 1 个 `test_resolve_write` 覆盖 write 四场景）：2026-10-27 已用 `Executor::run` **手动端到端**跑过 6 个用例（不超限原样返回 / 5000 行 rg 命中保尾 / 中文多字节 / 20KB 无换行单行 / 真实 `cargo test` 尾部诊断 / `cargo check` 200 错），但**单测仍是 0 覆盖** —— 手动测不防回归。要补：`truncate_middle("中".repeat(3000), 8192, 0)` 不 panic、`resolve_in(tmp, "../x")` 必须 `Err`、**junction 越界**（`mklink /J` 普通用户可建）、**覆盖已有文件**
+- [ ] **`truncates` / `resolve_in` 两条单测**（`write_file` 侧 2026-10-28 已落地 **`FileHelper` + 4 个独立用例**：
+  新建 / 多级父目录（走 `create_dir_all` 重试）/ `../` 越界 / 目标是目录，**断言值与原文、不只 `is_ok`**；写法约定见 **§3.6.5④**）：
+  2026-10-27 已用 `Executor::run` **手动端到端**跑过 6 个用例（不超限原样返回 / 5000 行 rg 命中保尾 / 中文多字节 / 20KB 无换行单行 / 真实 `cargo test` 尾部诊断 / `cargo check` 200 错），但这两块**仍是 0 覆盖** —— 手动测不防回归。要补：`truncate_middle("中".repeat(3000), 8192, 0)` 不 panic、`resolve_in(tmp, "../x")` 必须 `Err`、**junction 越界**（`mklink /J` 普通用户可建）、**覆盖已有普通文件**（现在只测了「目标是目录」）
 - [ ] 安全边界落地：scratch 目录 + **操作审批** + 命令白名单 + 输出截断（路径沙箱 2026-10-22 ✔ / 白名单 ✔ / 截断 ✔；
   「`run_command` 上线时路径检查即失效，必须换 OS 沙箱/白名单/容器」见 §3.5 调研小节）。
   **审批（2026-10-27 重新定型，见 §3.6.5②）**：`Executor.confirm: Box<dyn Fn(&Invocation) -> bool>`，
@@ -4045,7 +4197,10 @@ loop {
 - [ ] 🟠 **长文件根治 = 三件，且承重的是写侧**（2026-10-27 用户指出「加 offset 也没用，write 又没有插入工具」后改判；详见 §3.6.3 / §3.6.5）：
   现状 `read_file` 头部截断 8192 + `write_file` 整文件覆盖 ⇒ 对 >8192 字节的文件「读一半再写回」= **静默丢内容**
   （实测 `my_api/src/auth.rs` 18,488 字节，中间 10,368 字节不可见，该段里 `SqlitePool` 出现 7 次）。三件按优先级：
-  ① 🔴 **`edit_file(old_string, new_string)`**（5 号工具）—— 让「写」不再要求「手里有全文」，**这才是闭合条件**。
+  ① ✅ 🔴 **`edit_file(old_string, new_string)`（2026-10-28 已落地）**（5 号工具）—— 让「写」不再要求「手里有全文」，**这才是闭合条件**。
+  余 3 条文案 + 1 条语义见 §3.6.3「edit_file 落地后的 review」。
+  单测：**`FileHelper`（幂等 guard）2026-10-28 已落地**（`write_file` 4 用例全绿、从无 `tmp/` 的干净状态起跑也绿）；
+  **`edit_file` 的 8+2 用例待铺**（清单与断言要求见 §3.6.5④）。
   三态匹配：`0` / `1` / `n>1` 各自 bail 且文案可行动；`new_string` 允许以 `old_string` 为前缀（插入语义）；
   0 匹配的文案要提「可能是行尾符差异」（实测 `my_api/src` 13 个文件全 LF，当前不踩）。
   「插入」不需要独立工具、也**不要**给 `write_file` 加 `mode:` 参数（§3.4 单一策略决定点）；

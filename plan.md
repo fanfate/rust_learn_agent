@@ -80,11 +80,12 @@
   **`MAX_TOOL_OUTPUT` 一个字没改**——同样的字节预算换双倍信息。
   ~~下一个动作 = 跑 V0 验收~~（**已完成 2026-10-27，15 步**，见 §〇 首条与 `plan_v0.md` §3.6.4）。
   **新的下一个动作 = V0 收尾（2026-10-27 重新定序，见 `plan_v0.md` §3.6.5）**：
-  🔴 **①`edit_file` + `write_file` 大文件拒写守卫（这两条必须一起）** —— 后者单独加没用、前者单独加会被绕过；
-  这才是「`read_file` 头部截断 + `write_file` 整文件覆盖 ⇒ 读一半写回静默丢内容」的**结构性**闭合
-  （`auth.rs` 18,488 字节，中间 10,368 不可见）。② `read_file` 的 **行号** `offset`（**不是字节** ——
-  唯一导航信号是 cargo 的 `file:line:col`，模型没法换算字节；早先「按字节更自洽」是错的）③ 日志改
-  `→ 工具名(参数)` / `← N 字节` + `truncate_middle` / `resolve_in` 单测 ④ 操作审批钩子
+ ✅ **①`edit_file` + `write_file` 大文件拒写守卫（均已落地）** —— 后者单独加没用、前者单独加会被绕过；
+ 这一对才是「`read_file` 头部截断 + `write_file` 整文件覆盖 ⇒ 读一半写回静默丢内容」的**结构性**闭合
+ （`auth.rs` 18,488 字节，中间 10,368 不可见）。② `read_file` 的 **行号** `offset`（**不是字节** ——
+ 唯一导航信号是 cargo 的 `file:line:col`，模型没法换算字节；早先「按字节更自洽」是错的）③ 日志改
+ `→ 工具名(参数)` / `← N 字节` + `truncate_middle` / `resolve_in` 单测（**`write_file` 侧 2026-10-28 已落地
+ `FileHelper` 幂等 guard + 4 用例全绿**；`edit_file` 的 8+2 用例待铺，写法约定见 §3.6.5④）④ 操作审批钩子
   （`Executor.confirm: Box<dyn Fn(&Invocation) -> bool>`，**测试传 `|_| false` ⇒ 无交互可测**）⑤ 之后才进 V1。
   ⚠️ **「意图确认」已拆成两件**：**(a) 操作审批** = V0 收尾（host 强制，行业一致：Codex `approval_policy`、
   Claude Code permission prompt）；**(b) 语义追问**（模型自己停下来问）= **V1 交互式 REPL**，
@@ -161,11 +162,11 @@ Python 改一行 prompt 直接跑；Rust 要等编译，还要跟所有权较劲
 
 | | |
 |---|---|
-| **已完成** | `.env` 三变量 · `config.rs` 五版定稿（方案 C 已落地） · 真实通道 **200** · **实验 2 / 2.5 闭环**（工具调用 → 回灌 → 收尾，prompt cache 命中 256） · **`model.rs` 类型齐了** · **`llm.rs` 真实 200** · **循环跑通**（`for step in 1..=max_steps` + 错误回灌 `Error: {e:#}`） · **四个工具全收工** `read_file`/`list_files`/`write_file`/`run_command`（路径沙箱：读侧 canon、写侧祖先 canon；命令：裸名+白名单+继承环境+三流显式） · **截断按输出性质分派**（命令头+尾、文件只留头） · **`write_file` 大文件拒写守卫**（2026-10-27，阈值传 `max_bytes` 参数） |
+| **已完成** | `.env` 三变量 · `config.rs` 五版定稿（方案 C 已落地） · 真实通道 **200** · **实验 2 / 2.5 闭环**（工具调用 → 回灌 → 收尾，prompt cache 命中 256） · **`model.rs` 类型齐了** · **`llm.rs` 真实 200** · **循环跑通**（`for step in 1..=max_steps` + 错误回灌 `Error: {e:#}`） · **四个工具全收工** `read_file`/`list_files`/`write_file`/`run_command`（路径沙箱：读侧 canon、写侧祖先 canon；命令：裸名+白名单+继承环境+三流显式） · **截断按输出性质分派**（命令头+尾、文件只留头） · **`write_file` 大文件拒写守卫**（2026-10-27，阈值传 `max_bytes` 参数） · **`edit_file` 落地**（2026-10-28，三态匹配 + 起始行号取自旧文本，见 §3.6.3 review） · **单测基座 `FileHelper`**（2026-10-28，幂等 guard，`write_file` 4 用例全绿，见 §3.6.5④） |
 | **正在写** | 无。**工具层与循环层都通了**，`cargo check` / `cargo test` 零 error 零告警，端到端实测 6 组通过 |
-| **下一个动作** | 🔴 **① `edit_file`**（`write_file` 大文件拒写守卫已于 2026-10-27 落地，阈值走参数，见 `plan_v0.md` §3.6.3）→ **② `read_file` 行号 `offset`** → **③ 日志 `→/←` + `truncate_middle`/`resolve_in` 单测** → **④ 操作审批钩子** → **⑤ 进 V1**（验收已于 2026-10-27 通过，15 步）见 `plan_v0.md` §3.6.5 |
+| **下一个动作** | 🔴 **① `read_file` 行号 `offset`**（`edit_file` 与 `write_file` 大文件拒写守卫均已落地，见 `plan_v0.md` §3.6.3）→ **② 日志 `→/←` + 补单测**（`write_file` 侧 4 用例已绿；`truncate_middle`/`resolve_in`/`edit_file` 仍 0 覆盖）→ **③ 操作审批钩子** → **④ 进 V1**（验收已于 2026-10-27 通过，15 步）见 `plan_v0.md` §3.6.5 |
 | **验收** | 在 `scratch/my_api` 副本上，说一句"让它通过编译"，agent 自主「读 → 改 → `cargo check` → 读报错 → 再改」，**中途不需介入** |
-| **欠账** | `config.rs` / `truncate_middle` / `resolve_in` 的单测（有意留到 V0 跑通后）；`model.rs::ChatRequest` 零调用点待删；**语义追问**（模型主动提问）要等多轮 REPL，属 V1 |
+| **欠账** | `config.rs` / `truncate_middle` / `resolve_in` / `edit_file` 的单测（`FileHelper` 已就位，剩下的只是铺用例）；`model.rs::ChatRequest` 零调用点待删；**语义追问**（模型主动提问）要等多轮 REPL，属 V1 |
 
 ### V0·1 归档索引（内容都在 `plan_v0.md`）
 
@@ -209,18 +210,19 @@ Python 教程（21.9k★）。**当"协议参照 + 概念词典 + 失败模式�
 
 ## 五、进度记录
 
-**V0** → 完整清单见 [`plan_v0.md` §五](./plan_v0.md)（**51 项已勾 / 12 项未勾**，截至 2026-10-27，**验收已通过**）。
+**V0** → 完整清单见 [`plan_v0.md` §五](./plan_v0.md)（**51 项已勾 / 12 项未勾**，截至 2026-10-28，**验收已通过**）。
 **工具层与循环层已全部打通**：四个工具（`read_file`/`list_files`/`write_file`/`run_command`）都在，
 路径沙箱读侧 canon + 写侧祖先 canon，命令侧裸名+白名单+继承环境+三流显式，截断按输出性质分派；
-`cargo check --all-targets` 零 error 零代码告警，`cargo test` 1 passed，`Executor::run` 端到端 6 组实测通过
+`cargo check --all-targets` 零 error 零代码告警，`cargo test` **4 passed**，`Executor::run` 端到端 6 组实测通过
 （含真实 `cargo test` 的尾部诊断、200 个编译错误的头部截断、`LLM_*` 不泄漏且链接正常）。
 
-剩下的 13 项里，**没有一项挡路 V0 验收**：单测 3 处、日志 `→/←` 1 处、`ChatRequest` 零调用点 1 处、
-`spec()` 加一句 flag 1 处，其余是 V1 才要的（`LlmClient`、`usage`、`tool_choice:"none"` 收尾、安全边界升级）
-和「自答 §3.8 的 4 问」。
-**V0 验收已通过（2026-10-27，15 步）。下一个动作 = `edit_file` → 行号 `offset` → 日志/单测 → 操作审批 → 进 V1**
-（`write_file` 的**大文件拒写守卫已于 2026-10-27 落地**，阈值走 `max_bytes` 参数而不是裸引常量——判据「字段即授权」见 `plan_v0.md` §3.6.3；
-`edit_file` 仍是承重的一条：只加 `offset` 会让模型「分块读完再逐字回写 18KB」，语义对但代价与转写风险都不可接受）。
+剩下的 12 项里，**没有一项挡路 V0 验收**：单测 3 处（`truncate_middle`/`resolve_in`/`edit_file` 的用例，`FileHelper` 基座已就位）、
+日志 `→/←` 1 处、`ChatRequest` 零调用点 1 处、`spec()` 加一句 flag 1 处，其余是 V1 才要的（`LlmClient`、`usage`、
+`tool_choice:"none"` 收尾、安全边界升级）和「自答 §3.8 的 4 问」。
+**V0 验收已通过（2026-10-27，15 步）。下一个动作 = 行号 `offset` → 日志/补单测 → 操作审批 → 进 V1**
+（`write_file` 拒写守卫 + **`edit_file`** + **单测基座 `FileHelper`** 均已落地，2026-10-28：三态匹配、`replace_all` 默认 false、
+起始行号取自**旧文本**——「在 `new_file` 上用 `new_string` 反查」实测会差 303 行；`edit_file` 的代价是峰值内存 2.00×、
+耗时全在 I/O；`FileHelper` 的幂等实证见 `plan_v0.md` §3.6.5④）。
 
 **V1**
 

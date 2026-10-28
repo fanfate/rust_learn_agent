@@ -82,7 +82,43 @@ fn edit_file(
     new_string: &str,
     replace_all: bool,
 ) -> anyhow::Result<String> {
-    todo!()
+    if old_string.is_empty() {
+        bail!("旧文本不能为空, 插入请挑一整行做锚点");
+    }
+
+    let base_file = fs::read_to_string(path).with_context(|| "读取文件失败")?;
+    let base_lines = base_file.lines().count();
+
+    let match_count = base_file.matches(old_string).count();
+
+    if match_count == 0 {
+        bail!("未找到旧文本匹配, 请逐字节匹配(含缩进),可能是 CRLF vs LF 差异");
+    } else if match_count > 1 && !replace_all {
+        bail!(
+            "未开启全部替换但找到多处旧文本匹配，请扩大旧文本范围以确保匹配唯一。若确实要全部替换，请置 replace_all 为 true"
+        );
+    }
+
+    let new_file = if replace_all {
+        base_file.replace(old_string, new_string)
+    } else {
+        base_file.replacen(old_string, new_string, 1)
+    };
+    let new_lines = new_file.lines().count();
+
+    fs::write(path, &new_file).with_context(|| "写入文件失败")?;
+
+    let re_line_str: String = if replace_all {
+        "".to_string()
+    } else {
+        let pos = base_file.find(old_string).unwrap();
+        let re_line = base_file[..pos].bytes().filter(|&b| b == b'\n').count() + 1;
+        format!(", 起始第 {re_line} 行")
+    };
+
+    Ok(format!(
+        "替换 {match_count} 处{re_line_str}; 总行数 {base_lines} -> {new_lines}"
+    ))
 }
 
 fn run_command(program: &str, args: &[String], root: &Path) -> anyhow::Result<String> {
@@ -288,7 +324,7 @@ impl Invocation {
                 let s = edit_file(&p, &args.old_string, &args.new_string, args.replace_all)
                     .with_context(|| format!("编辑 {} 失败", args.path))?;
                 Ok(format!(
-                    "成功编辑文件{}, diff 为 :\n{s}\n",
+                    "成功编辑文件{}, 结果 : {s}",
                     p.strip_prefix(root)
                         .expect("canon 必然以词法祖先为前缀")
                         .display()
@@ -343,33 +379,211 @@ impl Executor {
 mod test {
     use super::*;
 
-    #[test]
-    fn test_resolve_write() {
-        let root = fs::canonicalize("scratch/tmp").unwrap();
-        {
-            let p = resolve_for_write(&root, "new.txt").unwrap();
-            let s = write_file(&p, "x", MAX_TOOL_OUTPUT);
-            assert!(s.is_ok());
-            assert_eq!(fs::read_to_string(root.join("new.txt")).unwrap(), "x");
+    struct FileHelper {
+        path: PathBuf,
+    }
+
+    impl FileHelper {
+        const TMP_ROOT: &str = "tmp";
+
+        fn new(p: &str) -> Self {
+            let dir_path = PathBuf::from(Self::TMP_ROOT).join(p);
+            let _ = fs::remove_dir_all(&dir_path);
+            fs::create_dir_all(&dir_path).expect("初始化临时目录失败");
+            let root = fs::canonicalize(&dir_path).expect("临时目录 canonicalize 失败");
+            Self { path: root }
         }
 
-        {
-            let p = resolve_for_write(&root, "a/b/c.txt").unwrap();
-            let s = write_file(&p, "x", MAX_TOOL_OUTPUT);
-            assert!(s.is_ok());
-            assert_eq!(fs::read_to_string(root.join("a/b/c.txt")).unwrap(), "x");
+        fn root(&self) -> &Path {
+            &self.path
         }
-        {
-            let p = resolve_for_write(&root, "../c.txt");
-            assert!(p.is_err());
+
+        fn get_path(&self, p: &str) -> PathBuf {
+            let mut dir_path = self.path.clone();
+            dir_path.push(p);
+            dir_path
         }
-        {
-            let p = resolve_for_write(&root, "a/b").unwrap();
-            let s = write_file(&p, "x", MAX_TOOL_OUTPUT);
-            assert!(s.is_err());
-            if let Err(err) = s {
-                assert!(format!("{err:#}").contains("目标已存在"));
-            };
+
+        fn create_dir(&self, p: &str) -> PathBuf {
+            let dir_path = self.get_path(p);
+            self.delete_dir(p);
+            fs::create_dir_all(&dir_path).expect("创建失败");
+            dir_path
         }
+        fn delete_dir(&self, p: &str) {
+            let dir_path = self.get_path(p);
+            let _ = fs::remove_dir_all(&dir_path);
+        }
+
+        fn create_file(&self, p: &str, content: &str) {
+            let file_path = self.get_path(p);
+            fs::write(file_path, content).expect("新建文件失败");
+        }
+        fn delete_file(&self, p: &str) {
+            let file_path = self.get_path(p);
+            let _ = fs::remove_file(&file_path);
+        }
+    }
+
+    impl Drop for FileHelper {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn test_resolve_no_file_err() {
+        let root_file = FileHelper::new("test_resolve_no_file_err");
+        let edit_path = "new.txt";
+
+        let err = resolve_in(root_file.root(), edit_path).unwrap_err();
+        assert!(format!("{err:#}").contains("无法解析"));
+    }
+
+    #[test]
+    fn test_write_ok() {
+        let root_file = FileHelper::new("test_write_ok");
+        let root = root_file.root();
+        let p = resolve_for_write(root, "new.txt").unwrap();
+        let s = write_file(&p, "x", MAX_TOOL_OUTPUT);
+        assert_eq!(s.unwrap(), 1);
+        assert_eq!(fs::read_to_string(root.join("new.txt")).unwrap(), "x");
+    }
+
+    #[test]
+    fn test_write_multi_path_ok() {
+        let root_file = FileHelper::new("test_write_multi_path_ok");
+        let root = root_file.root();
+        let p = resolve_for_write(root, "a/b/c.txt").unwrap();
+        let s = write_file(&p, "x", MAX_TOOL_OUTPUT);
+        assert_eq!(s.unwrap(), 1);
+        assert_eq!(fs::read_to_string(root.join("a/b/c.txt")).unwrap(), "x");
+    }
+
+    #[test]
+    fn test_write_err() {
+        let root_file = FileHelper::new("test_write_err");
+        let root = root_file.root();
+        let p = resolve_for_write(root, "../c.txt");
+        let err = p.unwrap_err();
+        assert!(format!("{err:#}").contains("越界"));
+    }
+
+    #[test]
+    fn test_write_exist_err() {
+        let root_file = FileHelper::new("test_write_exist_err");
+        root_file.create_dir("a/b");
+        let root = root_file.root();
+
+        let p = resolve_for_write(root, "a/b").unwrap();
+        let s = write_file(&p, "x", MAX_TOOL_OUTPUT);
+        let err = s.unwrap_err();
+        assert!(format!("{err:#}").contains("目标已存在"));
+    }
+
+    #[test]
+    fn test_edit_ok() {
+        let root_file = FileHelper::new("test_edit_ok");
+        let edit_path = "new.txt";
+        root_file.create_file(edit_path, "abcdefg\n123456\n");
+
+        let p = resolve_in(root_file.root(), edit_path).unwrap();
+        let s = edit_file(&p, "12", "ba", false).unwrap();
+        assert!(s.contains("起始第 2 行"));
+        let r_s = fs::read_to_string(&p).unwrap();
+        assert_eq!(r_s.as_str(), "abcdefg\nba3456\n");
+    }
+
+    #[test]
+    fn test_edit_insert_ok() {
+        let root_file = FileHelper::new("test_edit_insert_ok");
+        let edit_path = "new.txt";
+        root_file.create_file(edit_path, "abcdefg\n123456\n");
+
+        let p = resolve_in(root_file.root(), edit_path).unwrap();
+        let s = edit_file(&p, "abcdefg\n", "abcdefg\nhello\n", false).unwrap();
+        assert!(s.contains("2 -> 3"));
+        let r_s = fs::read_to_string(&p).unwrap();
+        assert_eq!(r_s.as_str(), "abcdefg\nhello\n123456\n");
+    }
+
+    #[test]
+    fn test_edit_replace_all_ok() {
+        let root_file = FileHelper::new("test_edit_replace_all_ok");
+        let edit_path = "new.txt";
+        root_file.create_file(edit_path, "ababababab\nbabababa\n");
+
+        let p = resolve_in(root_file.root(), edit_path).unwrap();
+        let s = edit_file(&p, "a", "c", true).unwrap();
+        assert!(s.contains("替换 9 处"));
+        assert!(s.contains("2 -> 2"));
+        let r_s = fs::read_to_string(&p).unwrap();
+        assert_eq!(r_s.as_str(), "cbcbcbcbcb\nbcbcbcbc\n");
+    }
+
+    #[test]
+    fn test_edit_delete_ok() {
+        let root_file = FileHelper::new("test_edit_delete_ok");
+        let edit_path = "new.txt";
+        root_file.create_file(edit_path, "abcdefg\n123456\n");
+
+        let p = resolve_in(root_file.root(), edit_path).unwrap();
+        let s = edit_file(&p, "123456\n", "", false).unwrap();
+        assert!(s.contains("起始第 2 行"));
+        assert!(s.contains("2 -> 1"));
+        let r_s = fs::read_to_string(&p).unwrap();
+        assert_eq!(r_s.as_str(), "abcdefg\n");
+    }
+
+    #[test]
+    fn test_edit_chinese_ok() {
+        let root_file = FileHelper::new("test_edit_chinese_ok");
+        let edit_path = "new.txt";
+        root_file.create_file(edit_path, "你好，世界\n你好，未来\n");
+
+        let p = resolve_in(root_file.root(), edit_path).unwrap();
+        let s = edit_file(&p, "世界", "World", false).unwrap();
+        assert!(s.contains("起始第 1 行"));
+        let r_s = fs::read_to_string(&p).unwrap();
+        assert_eq!(r_s.as_str(), "你好，World\n你好，未来\n");
+    }
+
+    #[test]
+    fn test_edit_no_old_err() {
+        let root_file = FileHelper::new("test_edit_no_old_err");
+        let edit_path = "new.txt";
+        root_file.create_file(edit_path, "abcdefg\n123456\n");
+
+        let p = resolve_in(root_file.root(), edit_path).unwrap();
+        let err = edit_file(&p, "", "123", false).unwrap_err();
+        assert!(format!("{err:#}").contains("旧文本不能为空"));
+        let r_s = fs::read_to_string(&p).unwrap();
+        assert_eq!(r_s.as_str(), "abcdefg\n123456\n");
+    }
+
+    #[test]
+    fn test_edit_no_match_err() {
+        let root_file = FileHelper::new("test_edit_no_match_err");
+        let edit_path = "new.txt";
+        root_file.create_file(edit_path, "abcdefg\n123456\n");
+
+        let p = resolve_in(root_file.root(), edit_path).unwrap();
+        let err = edit_file(&p, "bbbb", "", false).unwrap_err();
+        assert!(format!("{err:#}").contains("未找到旧文本匹配"));
+        let r_s = fs::read_to_string(&p).unwrap();
+        assert_eq!(r_s.as_str(), "abcdefg\n123456\n");
+    }
+
+    #[test]
+    fn test_edit_match_many_err() {
+        let root_file = FileHelper::new("test_edit_match_many_err");
+        let edit_path = "new.txt";
+        root_file.create_file(edit_path, "123456\n123456\n123456\n");
+
+        let p = resolve_in(root_file.root(), edit_path).unwrap();
+        let err = edit_file(&p, "12", "", false).unwrap_err();
+        assert!(format!("{err:#}").contains("找到多处旧文本匹配"));
+        let r_s = fs::read_to_string(&p).unwrap();
+        assert_eq!(r_s.as_str(), "123456\n123456\n123456\n");
     }
 }
