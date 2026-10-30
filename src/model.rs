@@ -59,6 +59,7 @@ pub struct CustomCall {
 #[serde(deny_unknown_fields)]
 pub struct ReadFileArg {
     pub path: String,
+    pub offset: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,7 +156,9 @@ impl Invocation {
 
     pub fn info(&self) -> String {
         match self {
-            Self::ReadFile(args) => format!("read_file, path : {}", args.path),
+            Self::ReadFile(args) => {
+                format!("read_file, path : {}, offset : {}", args.path, args.offset)
+            }
             Self::ListFiles(args) => format!("list_files, path : {}", args.path),
             Self::WriteFile(args) => format!("write_file, path : {}", args.path),
             Self::EditFile(args) => format!(
@@ -223,11 +226,11 @@ impl ToolKind {
         match self {
             ToolKind::ReadFile => FunctionDecl {
                 name: "read_file",
-                description: "读取文件内容，路径相对沙箱根目录".to_string(),
+                description: "从 offset 行号(首行行号为1)开始读取文件内容，路径相对沙箱根目录".to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
-                    "properties": { "path": { "type": "string" } },
-                    "required": ["path"],
+                    "properties": { "path": { "type": "string" }, "offset" : {"type" : "integer", "minimum": 1} },
+                    "required": ["path", "offset"],
                     "additionalProperties": false
                 }),
                 strict: true,

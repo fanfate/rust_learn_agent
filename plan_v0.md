@@ -2753,9 +2753,13 @@ blanket impl），已实测编译通过。
    让 secret 根本不进环境。代价两条：① `dotenv_iter()` **不调 `remove_bom()`**（BOM 会污染第一个 key 名）
    ② 「真 env 优先」要自己实现（`Config::from_map(&get)` 正好是这个注入点 —— functional core 的价值在这里兑现）。
    ⇒ **列为 V1 前可选升级，V0 不做。**
-2. **回执比名义预算多约 50 字节**（`truncate_head` 8199 / `truncate_head_tail` 8242 vs `max_bytes` 8192）：
-   省略标记是在切完之后**追加**的 ⇒ `max_bytes` 实际管的是「正文」不是「整份回执」。
-   **2026-10-27 决定维持现状**（50 字节不值得动逻辑），若要修：改名 `max_body` 或切之前预留 ~150 字节。
+2. **回执比名义预算多 ~84~120 字节**（2026-10-30 四分支实测：`flat` 8245 / `longline` 8312 / `oneline` 8294 / `crlf` 8276
+   vs `max_bytes` 8192）：省略标记是切完之后**追加**的 ⇒ `max_bytes` 的语义是「**正文预算**」，不是「整份回执硬上限」。
+   **2026-10-30 定案（用户指出，推翻「是个待修的小问题」）**：这不是问题 —— 该常量管的是「工具结果本身能占多少字节」，
+   尾注是元信息，长度由我们自己控制且有界（≤~120B），不该为它引入「先算文案长度 → 再按剩余预算切正文」的两遍耦合。
+   真要硬上限，**调小常量**比在截断里预留更直白。⚠️ 唯一耦合：`write_file` 的大文件拒写守卫读的是**同一个** `max_bytes`，
+   调小它会连带压低「整文件重写」的允许阈值 ⇒ 真要动这个数，得先把它拆成两个参数（正文预算 / 拒写阈值）。
+   代码侧只需一句注释写明「这里是正文预算」；改名 `max_body` 属可选美化。
 3. `LLM_ENV_KEYS` 与 `from_map` 的键名仍是**两处写**。可以加一条测试钉住一个方向（清单里每个 key 都能让
    `from_map` 报 `Missing`），但危险的那个方向（新增字段忘了加清单）挡不住 ⇒ 只能靠**紧挨着写 + 注释**。
    别为这个把 `from_map` 改成 `ENV_KEYS[i]` 索引数组，更难读且加第 4 个字段照样忘。
@@ -3235,7 +3239,7 @@ export interface TruncationResult {
 | `is_truncated()` | `tail_start > head_end` | 纯比较 |
 | `split(text) -> (&str, &str)` | 字面切片 | **借用不复制**；绝不能 `lines().join()`（吃 `\r`、丢尾 `\n`） |
 | `omitted_bytes()` | `tail_start - head_end` | O(1)、**精确无歧义**（字节没有「残行归属」问题）；`middle_lines` 的替代品 |
-| `head_partial()` / `tail_partial()` | 切点是否紧跟 `\n` | 双重身份：既是行数修正项，又是文案分支开关（残行时**不能**提示 `offset=b+1`，会死循环） |
+| `head_partial()` / `tail_partial()` | 切点是否紧跟 `\n` | 双重身份：既是行数修正项（`lines().count() - partial`），又是文案分支开关。⚠️ 本行原写「残行时**不能**提示 `offset=b+1`，会死循环」——**2026-10-30 被实测推翻**，见 ⑦ |
 | `head_lines()` / `tail_lines()` | `lines().count() - partial as usize` | 只在「行号承重」处用（`read_file` 的 `b`） |
 
 **四个被删掉的成员，各有一个不同的死因**
@@ -3286,16 +3290,83 @@ fn truncate_head_tail(text: String, max_bytes: usize) -> String  // (max - max/4
 `now_len = head.len()` 可以（切片的固有属性）；第二轮再算一遍 `mid.lines().count()` 就不行。
 第二刀（`run_command` 真的需要续读时）把文案搬回工具边界、删掉 `Executor::run` 的 match。
 
-**遗留（下一次改动必须处理）**
+**⑥ 的遗留已全部结清（2026-10-29 记、2026-10-30 核）**
 
-- 🔴 **`tool.rs:237` 取错方法**：`let middle_len = truncation.tail_lines(&text);` ⇒ 应为 `omitted_bytes()`。
-  `tail_lines` 是个位数，当字节数用会写出「中间省略 12 字节」（`cargo test` 实际切掉 ~22KB）。
-  指纹：编译器已经在报 `ommited_bytes` never used。（另：拼写应为 `omitted_bytes`，代码里少一个 `t`）
-- `tool.rs:197` 的 `mut text: String` 已不需要（不再 `text.truncate()`），`cargo check` 报 `197:18`。
-- `is_truncated` 是 dead_code 但**不必急着消**：两个薄壳都用 `text.len() <= max_bytes` 提前返回（更便宜）；
-  它真正的消费者是 `read_file` 的「要不要给 `offset=b+1`」。
-- 🔴 **`Executor::run` 的 `_ => truncate_head(...)` 分支到时候必须拆**：`read_file` 要「第 a-b 行 / 共 N 行 / 用 offset=b+1 继续」，
-  而命令式文案「内容过长，只返回了前 N 行」**不含 offset 指引**，模型读到 8192 字节就不知道还能继续。
+- ✅ **`tool.rs:237` 取错方法**已修：`omitted_bytes()` 现在真的被用了（`tail_lines` 反而变成 never used，见 ⑦(e)）。
+- ✅ `mut text: String` 已去掉。
+- ✅ `is_truncated` 不再 dead_code —— 它成了 `read_file` 尾注的第一个分支判据（`!truncated ⇒ 原样返回无尾注`）。
+- ✅ **`Executor::run` 的 `ReadFile` 臂已拆成四分支**（原来的 `_ => truncate_head(...)` 已不再吞掉 `read_file`），
+  形态与 `b`/`K` 的公式见 ⑦(d)。
+
+**⑦ 尾注四分支：残行 ≠ 不可续读（2026-10-30，用户拿 `LINE_SNAP_MAX` 一问问倒）**
+
+⑥ 里写过一句「残行时**不能**提示 `offset=b+1`，会死循环」。用户的反问是：**这与 `LINE_SNAP_MAX` 设定不符**。
+他是对的，而且错两处 —— 一处措辞，一处结论。
+
+**(a) `LINE_SNAP_MAX` 保证残片「大」，不保证「整」**
+
+回退判据是 `head_end - pos < LINE_SNAP_MAX`（`pos` 是 `\n` 下标），而 `head_end - pos = 1 + 残片长度`。
+实测（`"x\n" + 1000B + "\n" + "b"*(k+500)`，切在 `1003+k`）：
+
+| 残片 k | head_end | partial | 残留字节 |
+|---|---|---|---|
+| 253 / 254 | 1003（回退） | false | 0 |
+| **255** | 1258（不回退） | **true** | **255** |
+| 2536 / 3192 | — | true | 2536 / 3192 |
+
+⇒ 恒等式：**`head_partial == true` ⇒ 残片 ≥ `LINE_SNAP_MAX - 1` = 255 字节**。所以「残行」不等于「只给了一半」：
+40 行 × 5000B 实测残片 **3192B = 该行 63.8%**。⑥ 那句把设定说反了 —— snap 存在的意义正是「小残片丢掉、大残片留着」。
+
+**(b) `offset=b+1` 是「从残行行首重读」，预算全新 ⇒ 一定前进**
+
+实测 `raw = text[5000..]`（195,000B）：`trunc(raw, 8192)` ⇒ `head_lines = 1`、残片 3192；
+用 `offset=2` 重读时第 2 行 5000B < 8192 ⇒ **整行返回**，还顺带给第 3 行前 3192B。
+代价是那 3192 字节重复出现一次；而「残行就当没给」抹掉的正是 `LINE_SNAP_MAX` 花预算换来的 63.8%。
+
+**真正的死循环只有一种：`head_lines == 0`，即「从 `offset` 起的**第一行本身**就超过 8192」**
+
+| 场景 | 从何处读 | `head_lines` | 结论 |
+|---|---|---|---|
+| 单行 20000B | 0 | **0** | `b = a + 0 - 1` **非法**；`offset` 原地打转 |
+| 5000 + 9000 两行 | 0 | 1 | 可给 `offset=2` |
+| 同上 | 第 2 行 | **0** | 到这里才撞死循环，「超长行」文案此刻才该出现 |
+
+⇒ 分支判据是 **`head_lines == 0`**，不是 `head_partial`；且**只能运行时判** —— 模型每次回来的那一读会自己撞上，
+不需要提前预测。
+
+**(c) 两个概念的职责分工（「不符」的根因就是把它俩混了）**
+
+| 概念 | 回答的问题 | 消费者 |
+|---|---|---|
+| `LINE_SNAP_MAX` / `head_partial` | **切在哪儿**、碎片要不要 | 预算分配；要不要披露残片 |
+| `b = a + head_lines - 1` | **`offset` 能不能安全跳到 `b+1`** | 续读导航 |
+
+`b` 的语义是「**最后一个能整行拿到的行号**」，不是「内容到此为止」—— 屏幕上越界那一截正是 snap 允许的，
+所以用**另一句话**披露，不塞进 `a-b`。
+
+**(d) 落地形态（2026-10-30 用户已改，`Executor::run` 的 `ReadFile` 臂）**
+
+| 条件 | 尾注 |
+|---|---|
+| `!is_truncated()` | 原样返回，无尾注 |
+| `head_lines == 0` | 「第 a 行超过单行上限 8192 字节，本工具无法整行返回；请用 `rg -n` 定位查看」 |
+| `!head_partial()` | 「只返回 a-b 行，原文共 N 行；请用 `offset=b+1` 继续」 |
+| 残行（≥255B） | 「只返回完整的 a-b 行，第 b+1 行仅前 K 字节，原文共 N 行；请用 `offset=b+1` 继续」 |
+
+`b = skip + show_lines`（≡ `a + head_lines - 1`）；`K = head_end - show_content.rfind('\n').map_or(0, |p| p + 1)`，
+一行算术、不需要新字段。**两处 off-by-one 已修**：旧代码 `skip + 1 + show_lines` 多报一行，恰好把 `b` 落在残行行号上
+（40×5000B 报「1 - 2 行」而第 2 行只有 3192/5000 字节）—— 那就是用户看到的「把残行算进 b」。
+
+**(e) 剩余（都不挡路）**
+
+- `tail_lines` / `tail_partial` 现在 **never used**（`truncate_head_tail` 改用 `omitted_bytes()`），`cargo check` 报 `201:8`。
+  按 ⑥ 的判据它们是**方法**不是字段，留着零成本，等「head+tail 两段各自行号」出现真实消费者再用。
+- 超长行文案里的 `8192` 是**硬编码**，与 `Executor.max_bytes` 字段重复 ⇒ 按「字段存在即授权」应插值 `self.max_bytes`（纯文案，待改）。
+- `raw.lines().count() + skip` 反推总行数是**第二个真值来源**（真值只有 `read_file` 手里有）。当前算术正确（N=40 实测 `39+1`），
+  但若将来 `read_file` 改成自截 + 自拼尾注，这份反推必须一起删 —— 否则两个来源迟早漂。
+
+对比 ⑥ 的结论，⑦ 没有推翻它：`Truncation` 仍然只装两个切点、仍然只提供边界与边界的算术。
+被推翻的只是**「边界之后该怎么说话」**这一层判断 —— 而这层本来就不属于 core。
 
 ### 3.7 工程化分档
 
@@ -4350,7 +4421,10 @@ loop {
 - [x] ✅ **`run_command` 两条 bail 文案已修**（2026-10-27）：裸名那句不再谎称「未找到可执行文件」（改成「只能写裸名，不能带目录或路径」），白名单那句带 `ALLOW_CMD.join(", ")` 清单；外侧 context 改「无法执行命令 {}」（§3.5 末 2026-10-26 二次更正）
 - [x] 🟠 **让模型用 `cargo check --message-format=short`**：`MAX_TOOL_OUTPUT` = 8192，80 个错的 crate 长格式 `cargo check` 是 **17,213 字节 / 643 行**、`--short` 是 6,533。实测 200 个 E0308 时 head=6144 只能装 **27 个（长格式）/ 99 个（short）** ⇒ 不写这句，模型会「修完前 27 个 → 再跑 → 再修」。**2026-10-27 已实现，但落在 prompt 而不是 `spec()`**：`main.rs` 的任务横幅里加了「可以使用“cargo check --message-format=short”命令减少输出」——只对当前任务生效；`spec()` 仍是 4 条（要变成**所有任务永久生效**，把第 5 条加进 `ToolKind::RunCommand` 的 description 即可，属纯文案）
 - [x] ✅ **截断拆成 `truncate_head` / `truncate_head_tail`（2026-10-27，`max_bytes` 不用调大）**：原来一份 `truncates` 只砍尾巴，而 **`cargo test` 的诊断恰好在尾部**（1200 行日志把 `panicked` / 断言值 / `test result: FAILED` 全推到 8192 之后 ⇒ 模型只看到 50 行 `test ok`）。现在按 `Invocation` 派发：`RunCommand` → 头 3/4 + 尾 1/4（实测尾部诊断只需 348 字节，2048 有 6 倍余量），其余工具 → 只留头。共用私有 `truncate_middle() -> (head_end, tail_start)`，`LINE_SNAP_MAX = 256`。**没抽「core + 两个壳」**：两份文案不同（`read_file` 要报「剩多少 + 用 rg 定位」，`run_command` 只报「中间省略多少」），core 里带 `if 策略` 就是假壳。实测 6 个用例全过（见 §3.5 末 2026-10-27）
-- [x] ✅ **回执超预算 ~50 字节：决定维持现状**（2026-10-27）：`truncate_head` 8199 / `truncate_head_tail` 8242 vs `max_bytes` 8192 —— 省略标记是切完之后**追加**的，所以该参数实际管的是「正文」。要么改名 `max_body` + 注释，要么切之前预留 ~150 字节；**50 字节不值得动逻辑**，记录在案（§3.5 末 2026-10-27）
+- [x] ✅ **回执超预算：不是问题，是语义（2026-10-30 用户定性）**：`max_bytes` 管的是「**正文预算**」，尾注是切完之后追加的
+  元信息（实测 84~120B，有界）。不该为它引入「先算文案长度再切正文」的两遍耦合；真要硬上限就**调小常量**。
+  ⚠️ 但 `write_file` 的拒写守卫共用同一个 `max_bytes`，调它会连带压低整文件重写阈值 ⇒ 要动先拆参数。
+  代码侧补一句注释即可（旧结论「~50 字节不值得动逻辑」作废——那时的数字是两条薄壳的，四分支后翻倍，见 §3.5 末 2026-10-30）
 - [ ] 🟠 **`Executor::run` 对 `Err` 也要截断**：现在 `?` 直接上抛，`agent.rs` 只做 `format!("Error: {e:#}")` ⇒ 一个 80 错的 crate 可达 **17,213 字节 / 643 行**，全部原样进 history（`MAX_TOOL_OUTPUT` = 8192）。⚠️ 退出码全走 `Ok` 之后这条已大幅降级（`Err` 只剩 `spawn`/拒绝执行，文案都很短），属**防御性兜底**，V0 可不做（§3.5 末 2026-10-26 实测）
 - [x] **`truncates` 修 panic**：`while !text.is_char_boundary(end) { end -= 1 }` 已补，并加了「原文 N 行 / M 字节」报告（2026-10-22）。**2026-10-27 已重命名并拆分**：`truncates` → `truncate_middle`（私有，返回切点）+ `truncate_head` / `truncate_head_tail`（两个具名策略）
 - [x] **`Executor` 横切层 + `raw_invoke` 分派层**：`Executor{root, max_bytes}`（`new` 里 `canonicalize` 一次 = 不变量载体）、`run` = `raw_invoke` → **按 `Invocation` 派发截断策略**（`RunCommand` → 头+尾，其余 → 只留头，2026-10-27）；`raw_invoke` 私有、每臂先 `resolve_in`（**§3.5**：校验函数必须**返回**后续真正被使用的那个值，不是 `bool`/`()`）
@@ -4365,7 +4439,7 @@ loop {
   `write_file` / `run_command` 两臂调用前先过它；CLI 传「打印 + 读一行 y/n」，**测试传 `|_| false`** ⇒ 这一层无交互可测。
   「模型自己停下来问」（语义追问）不在本条，属 V1 交互式 REPL
 - [ ] 自答 §3.8 的 4 个问题
-- [ ] 🟠 **长文件根治 = 三件，且承重的是写侧**（2026-10-27 用户指出「加 offset 也没用，write 又没有插入工具」后改判；详见 §3.6.3 / §3.6.5）：
+- [x] ✅ **长文件根治 = 三件，且承重的是写侧（2026-10-30 三件全落地）**（2026-10-27 用户指出「加 offset 也没用，write 又没有插入工具」后改判；详见 §3.6.3 / §3.6.5）：
   现状 `read_file` 头部截断 8192 + `write_file` 整文件覆盖 ⇒ 对 >8192 字节的文件「读一半再写回」= **静默丢内容**
   （实测 `my_api/src/auth.rs` 18,488 字节，中间 10,368 字节不可见，该段里 `SqlitePool` 出现 7 次）。三件按优先级：
   ① ✅ 🔴 **`edit_file(old_string, new_string)`（2026-10-28 已落地）**（5 号工具）—— 让「写」不再要求「手里有全文」，**这才是闭合条件**。
@@ -4380,7 +4454,7 @@ loop {
   **2026-10-27 用户质疑后改判**：旧说法「直接引常量、不传参，否则改一个忘另一个」是纪律型论证，作废；
   判据是「`max_bytes` 是字段还是 `const`」—— 字段即「它会变」的授权，故读字段（见 §3.6.3）。代价：合法的大文件整体重写被拒 —— V1 用
   Claude Code 的「Edit/Write 前必须 Read 过」覆盖率追踪取代；现在这条是「静默毁 10KB → 明确拒绝」的纯增益；
-  ③ 🟡 **`read_file` 加 `offset`（行号，不是字节）**——唯一导航信号是 cargo 的 `src\x.rs:22:31`，模型没法把行号换算成字节
+  ③ ✅ **`read_file` 加 `offset`（行号，不是字节）—— 2026-10-29 定设计、2026-10-30 落地**——唯一导航信号是 cargo 的 `src\x.rs:22:31`，模型没法把行号换算成字节
   （**2026-10-27 自我更正**：早先写「按字节更自洽」是错的；Gemini CLI 用 `start_line`/`end_line`、Claude Code 用行 `offset`/`limit`
   也是行）。字节上限只作最后安全网（防单行 20KB）。
   **2026-10-29 五家调研后设计定稿，见 §3.6.5⑤**：1-based 明写 `1-indexed` / **不加行号前缀**（省 15.6% 字节）/
@@ -4388,8 +4462,11 @@ loop {
   ✅ **`truncate_*` 已改成返回结构体（2026-10-29 落地，形态见 §3.6.5⑥）**：`Truncation{head_end, tail_start}` **只装两个切点**
   （`total_bytes` / `total_lines` / `kept_lines` / `middle_lines` 逐个论证后删除），行数由 `head_lines` / `tail_lines` 方法算；
   `truncate_head` / `truncate_head_tail` 暂留为「固定参数 + 拼文案」薄壳。
-  🔴 **`read_file` 自截 + offset 尾注尚未接入**：届时 `Executor::run` 的 `_ =>` 分支必须拆，否则 `read_file` 拿到的是
-  「内容过长，只返回了前 N 行」——**不含 `offset` 指引**。另 `tool.rs:237` 仍有 `tail_lines` 误当字节数的 bug（见 ⑥ 遗留）。
+  ✅ **尾注四分支已接入（2026-10-30）**：`Executor::run` 的 `ReadFile` 臂按 `!truncated` / `head_lines == 0`（超长单行）/
+  `!head_partial` / 残行 分四种文案，`b = skip + show_lines`、`K` = 残片字节数，两处 off-by-one 已修。
+  ⚠️ ⑥ 原写的「残行**不能**给 `offset=b+1`，会死循环」**已被实测推翻**（`LINE_SNAP_MAX` 保证残片 ≥255B；
+  从残行行首重读预算全新 ⇒ 一定前进），死循环的真正判据是 `head_lines == 0`，详见 §3.6.5⑦。
+  自查：`offset=0` 的下溢已由 `saturating_sub(1)` 堵住（schema 里也写了 `"minimum": 1`，但那条替不掉 `saturating_sub`）。
   加第 5 个工具的实际成本：编译器会逼你补 **4 处**穷尽 match（`name()` / `spec()` / `parse_kind` / `raw_invoke`），
   唯一没被逼的是 `ALL` 数组（已有「长度 + 名字唯一」测试钉着）⇒ 又一个 V1 `Box<dyn Tool>` 的论据。
   ⚠️ **别用「给 `uv` 权限让它写 python 脚本读写」代替**，三条理由（2026-10-27 实测/核证）：

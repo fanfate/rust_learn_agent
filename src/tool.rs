@@ -10,13 +10,30 @@ use std::{
     process::{Command, Stdio},
 };
 
-const MAX_TOOL_OUTPUT: usize = 8 * 1024;
+const MAX_TOOL_OUTPUT: usize = 8000;
 const LINE_SNAP_MAX: usize = 256;
 
 //工具函数
 
-fn read_file(path: &Path) -> anyhow::Result<String> {
-    Ok(fs::read_to_string(path)?)
+fn read_file(path: &Path, offset: usize) -> anyhow::Result<String> {
+    let base_content = fs::read_to_string(path)?;
+    let skip = offset.saturating_sub(1);
+
+    if skip == 0 {
+        Ok(base_content)
+    } else {
+        let full_lines = base_content.lines().count();
+        if offset > full_lines {
+            bail!("起始行号 {offset} 超过最大行号 {full_lines}");
+        }
+
+        if let Some((start_pos, _)) = base_content.match_indices("\n").nth(skip - 1) {
+            Ok(base_content[start_pos + 1..].to_string())
+        } else {
+            // cannot happen
+            bail!("未能找到该行 {offset}")
+        }
+    }
 }
 
 fn list_files(path: &Path) -> anyhow::Result<String> {
@@ -341,7 +358,7 @@ impl Invocation {
         match self {
             Invocation::ReadFile(args) => {
                 let p = resolve_in(root, &args.path)?;
-                read_file(&p).with_context(|| format!("读取 {} 失败", args.path))
+                read_file(&p, args.offset).with_context(|| format!("读取 {} 失败", args.path))
             }
             Invocation::ListFiles(args) => {
                 let p = resolve_in(root, &args.path)?;
@@ -409,6 +426,45 @@ impl Executor {
         let raw = inv.raw_invoke(&self.root, self.max_bytes)?;
         match inv {
             Invocation::RunCommand(_) => Ok(truncate_head_tail(raw, self.max_bytes)),
+            Invocation::ReadFile(args) => {
+                let truncation = Truncation::get_truncate(&raw, self.max_bytes, 0);
+
+                if !truncation.is_truncated() {
+                    Ok(raw)
+                } else {
+                    let skip = args.offset.saturating_sub(1);
+                    let full_lines = raw.lines().count() + skip;
+                    let (show_content, _) = truncation.split(&raw);
+                    if truncation.head_lines(&raw) == 0 {
+                        Ok(format!(
+                            "{show_content}...[第 {} 行超过单行上限 8192 字节，本工具无法整行返回, 原文共 {} 行；请用 rg -n 定位查看]",
+                            skip + 1,
+                            full_lines,
+                        ))
+                    } else if !truncation.head_partial(&raw) {
+                        let show_lines = truncation.head_lines(&raw);
+                        Ok(format!(
+                            "{show_content}...[内容过长，只返回 {}-{} 行，原文共 {full_lines} 行；请用 offset={} 继续]",
+                            skip + 1,
+                            skip + show_lines,
+                            skip + show_lines + 1,
+                        ))
+                    } else {
+                        let show_lines = truncation.head_lines(&raw);
+                        let partial_bytes =
+                            truncation.head_end - show_content.rfind("\n").map_or(0, |p| p + 1);
+
+                        Ok(format!(
+                            "{show_content}...[内容过长，只返回完整的 {}-{} 行，第 {} 行仅前 {} 字节，原文共 {full_lines} 行；请用 offset={} 继续]",
+                            skip + 1,
+                            skip + show_lines,
+                            skip + show_lines + 1,
+                            partial_bytes,
+                            skip + show_lines + 1,
+                        ))
+                    }
+                }
+            }
             _ => Ok(truncate_head(raw, self.max_bytes)),
         }
     }

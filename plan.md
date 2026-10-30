@@ -82,8 +82,9 @@
   **新的下一个动作 = V0 收尾（2026-10-27 重新定序，见 `plan_v0.md` §3.6.5）**：
  ✅ **①`edit_file` + `write_file` 大文件拒写守卫（均已落地）** —— 后者单独加没用、前者单独加会被绕过；
  这一对才是「`read_file` 头部截断 + `write_file` 整文件覆盖 ⇒ 读一半写回静默丢内容」的**结构性**闭合
- （`auth.rs` 18,488 字节，中间 10,368 不可见）。② `read_file` 的 **行号** `offset`（**不是字节** ——
- 唯一导航信号是 cargo 的 `file:line:col`，模型没法换算字节；早先「按字节更自洽」是错的）③ 日志改
+（`auth.rs` 18,488 字节，中间 10,368 不可见）。② ✅ `read_file` 的 **行号** `offset`（**不是字节** ——
+唯一导航信号是 cargo 的 `file:line:col`，模型没法换算字节；早先「按字节更自洽」是错的）**2026-10-30 已落地并带四分支尾注**
+（`!truncated` / 单行超限 / 完整行 / 残行，见 §3.6.5⑦）③ 日志改
  `→ 工具名(参数)` / `← N 字节` + `truncate_middle` / `resolve_in` 单测（**`write_file` 侧 2026-10-28 已落地
  `FileHelper` 幂等 guard + 4 用例全绿**；`edit_file` 的 8+2 用例待铺，写法约定见 §3.6.5④）④ 操作审批钩子
   （`Executor.confirm: Box<dyn Fn(&Invocation) -> bool>`，**测试传 `|_| false` ⇒ 无交互可测**）⑤ 之后才进 V1。
@@ -149,7 +150,7 @@ Python 改一行 prompt 直接跑；Rust 要等编译，还要跟所有权较劲
 | **V2** | 接回 `my_api`：会话落 sqlite + Axum 包一层 | `POST /chat` + SSE / WebSocket | 复用 `CurrentUser` 做到会话按用户隔离 |
 | **V3** | MCP client / server · 多后端抽象 | — | **触发条件**：手上真有一个 MCP server 要接，或要把 agent 暴露出去。不是为了「功能表更齐」 |
 
-**当前唯一在做的：V0 收尾**（`offset` → 日志/单测 → 审批钩子）。V1 之后的事不提前设计。
+**当前唯一在做的：V0 收尾**（~~`offset`~~ **2026-10-30 已落地** → 日志/单测 → 审批钩子）。V1 之后的事不提前设计。
 
 ### 2.1 判据：什么时候该停、该砍（2026-10-28）
 
@@ -256,17 +257,21 @@ Python 教程（21.9k★）。**当"协议参照 + 概念词典 + 失败模式�
 剩下的 12 项里，**没有一项挡路 V0 验收**：单测 3 处（`truncate_middle`/`resolve_in`/`edit_file` 的用例，`FileHelper` 基座已就位）、
 日志 `→/←` 1 处、`ChatRequest` 零调用点 1 处、`spec()` 加一句 flag 1 处，其余是 V1 才要的（`LlmClient`、`usage`、
 `tool_choice:"none"` 收尾、安全边界升级）和「自答 §3.8 的 4 问」。
-**V0 验收已通过（2026-10-27，15 步）。下一个动作 = 行号 `offset` → 日志/补单测 → 操作审批 → V0.5 → 进 V1**
+**V0 验收已通过（2026-10-27，15 步）。`read_file` 的 `offset` 也已落地（2026-10-30）⇒ 下一个动作 = 日志/补单测 → 操作审批 → V0.5 → 进 V1**
 （`write_file` 拒写守卫 + **`edit_file`** + **单测基座 `FileHelper`** 均已落地，2026-10-28：三态匹配、`replace_all` 默认 false、
 起始行号取自**旧文本**——「在 `new_file` 上用 `new_string` 反查」实测会差 303 行；`edit_file` 的代价是峰值内存 2.00×、
 耗时全在 I/O；`FileHelper` 的幂等实证见 `plan_v0.md` §3.6.5④）。
 **`offset` 的设计已定稿（2026-10-29，五家调研见 §3.6.5⑤）**：1-based 明写 `1-indexed` / **不加行号前缀**（省 15.6% 字节）/
-尾注必须有「第 a-b 行 · 共 N 行 · 用 offset=b+1 继续」/ 越界 **bail 报总行数**（Gemini 的静默收敛是反例）。
+尾注必须有「第 a-b 行 · 共 N 行 · 用 offset=b+1 继续」/ 越界 **bail 报总行数**（Gemini 的静默收敛是反例）/
+`offset=0` 用 `saturating_sub(1)` 归一（否则 debug 下 `nth(0-1)` 直接 underflow panic）。
 ✅ **`truncate_*` 返回结构体已落地并收敛到两个切点**（`Truncation{head_end, tail_start}`，2026-10-29 四轮追问后定稿）：
 `total_bytes` / `total_lines` / `kept_lines` / `middle_lines` 逐个论证后**删除** —— 判据是「core 只装源上没有、只能从计算过程
 得到的东西」，其余一律做方法（`head_lines` = `lines().count() - head_partial`）；`truncate_head` / `truncate_head_tail`
-暂留为「固定参数 + 拼文案」薄壳（判据：薄壳不许长出策略）。**尚未接入**：`read_file` 自截 + offset 尾注 ⇒ 届时
-`Executor::run` 的 `_ =>` 分支必须拆，否则 `read_file` 拿到的是不含 offset 指引的命令式文案。实测与遗留见 §3.6.5⑥。
+暂留为「固定参数 + 拼文案」薄壳（判据：薄壳不许长出策略）。
+✅ **`read_file` 的 offset 与尾注已接入（2026-10-30）**：`Executor::run` 的 `ReadFile` 臂按 `!truncated` / `head_lines==0`
+（单行超 8192，改指路 `rg -n`）/ `!head_partial` / 残行 分四种文案，`b = skip + show_lines`，残行另报「第 b+1 行仅前 K 字节」。
+⚠️ 一并**推翻**了上一版「残行不能给 `offset=b+1`，会死循环」：`LINE_SNAP_MAX` 保证残片 ≥255 字节（实测 40 行×5000B 残片 3192B = 63.8%），
+从残行行首重读预算全新 ⇒ 一定前进；死循环的真正判据是 `head_lines == 0`。详见 §3.6.5⑦。
 
 **V0.5（下一步的现实形态，2026-10-28 新增）**
 
