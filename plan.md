@@ -201,7 +201,7 @@ prompt、砍掉 80% 的通用负担、假定「用户只有一个人且就在旁
 |---|---|
 | **已完成** | `.env` 三变量 · `config.rs` 五版定稿（方案 C 已落地） · 真实通道 **200** · **实验 2 / 2.5 闭环**（工具调用 → 回灌 → 收尾，prompt cache 命中 256） · **`model.rs` 类型齐了** · **`llm.rs` 真实 200** · **循环跑通**（`for step in 1..=max_steps` + 错误回灌 `Error: {e:#}`） · **四个工具全收工** `read_file`/`list_files`/`write_file`/`run_command`（路径沙箱：读侧 canon、写侧祖先 canon；命令：裸名+白名单+继承环境+三流显式） · **截断按输出性质分派**（命令头+尾、文件只留头） · **`write_file` 大文件拒写守卫**（2026-10-27，阈值传 `max_bytes` 参数） · **`edit_file` 落地**（2026-10-28，三态匹配 + 起始行号取自旧文本，见 §3.6.3 review） · **单测基座 `FileHelper`**（2026-10-28，幂等 guard，`write_file` 4 用例全绿，见 §3.6.5④） |
 | **正在写** | 无。**工具层与循环层都通了**，`cargo check` / `cargo test` 零 error 零告警，端到端实测 6 组通过 |
-| **下一个动作** | 🔴 **① `read_file` 行号 `offset`**（`edit_file` 与 `write_file` 大文件拒写守卫均已落地，见 `plan_v0.md` §3.6.3）→ **② 日志 `→/←` + 补单测**（`write_file` 侧 4 用例已绿；`truncate_middle`/`resolve_in`/`edit_file` 仍 0 覆盖）→ **③ 操作审批钩子** → **④ 进 V1**（验收已于 2026-10-27 通过，15 步）见 `plan_v0.md` §3.6.5 |
+| **下一个动作** | 🔴 **① `read_file` 行号 `offset`**（设计已定稿、待实现：**1-based 明写 `1-indexed` · 不加行号前缀 · 尾注报「第 a-b 行 / 共 N 行 / 用 offset=b+1 继续」· 越界 bail 报总行数 · `truncate_head` 改返回结构体**，五家调研见 `plan_v0.md` §3.6.5⑤）→ **② 日志 `→/←` + 补单测**（`write_file` 4 + `edit_file` 13 用例已绿；`truncate_middle`/`resolve_in` 仍 0 覆盖）→ **③ 操作审批钩子** → **④ V0.5 真实任务 dogfooding** → **⑤ 进 V1**（验收已于 2026-10-27 通过，15 步）见 `plan_v0.md` §3.6.5 |
 | **验收** | 在 `scratch/my_api` 副本上，说一句"让它通过编译"，agent 自主「读 → 改 → `cargo check` → 读报错 → 再改」，**中途不需介入** |
 | **欠账** | `config.rs` / `truncate_middle` / `resolve_in` / `edit_file` 的单测（`FileHelper` 已就位，剩下的只是铺用例）；`model.rs::ChatRequest` 零调用点待删；**语义追问**（模型主动提问）要等多轮 REPL，属 V1 |
 
@@ -256,10 +256,17 @@ Python 教程（21.9k★）。**当"协议参照 + 概念词典 + 失败模式�
 剩下的 12 项里，**没有一项挡路 V0 验收**：单测 3 处（`truncate_middle`/`resolve_in`/`edit_file` 的用例，`FileHelper` 基座已就位）、
 日志 `→/←` 1 处、`ChatRequest` 零调用点 1 处、`spec()` 加一句 flag 1 处，其余是 V1 才要的（`LlmClient`、`usage`、
 `tool_choice:"none"` 收尾、安全边界升级）和「自答 §3.8 的 4 问」。
-**V0 验收已通过（2026-10-27，15 步）。下一个动作 = 行号 `offset` → 日志/补单测 → 操作审批 → 进 V1**
+**V0 验收已通过（2026-10-27，15 步）。下一个动作 = 行号 `offset` → 日志/补单测 → 操作审批 → V0.5 → 进 V1**
 （`write_file` 拒写守卫 + **`edit_file`** + **单测基座 `FileHelper`** 均已落地，2026-10-28：三态匹配、`replace_all` 默认 false、
 起始行号取自**旧文本**——「在 `new_file` 上用 `new_string` 反查」实测会差 303 行；`edit_file` 的代价是峰值内存 2.00×、
 耗时全在 I/O；`FileHelper` 的幂等实证见 `plan_v0.md` §3.6.5④）。
+**`offset` 的设计已定稿（2026-10-29，五家调研见 §3.6.5⑤）**：1-based 明写 `1-indexed` / **不加行号前缀**（省 15.6% 字节）/
+尾注必须有「第 a-b 行 · 共 N 行 · 用 offset=b+1 继续」/ 越界 **bail 报总行数**（Gemini 的静默收敛是反例）。
+✅ **`truncate_*` 返回结构体已落地并收敛到两个切点**（`Truncation{head_end, tail_start}`，2026-10-29 四轮追问后定稿）：
+`total_bytes` / `total_lines` / `kept_lines` / `middle_lines` 逐个论证后**删除** —— 判据是「core 只装源上没有、只能从计算过程
+得到的东西」，其余一律做方法（`head_lines` = `lines().count() - head_partial`）；`truncate_head` / `truncate_head_tail`
+暂留为「固定参数 + 拼文案」薄壳（判据：薄壳不许长出策略）。**尚未接入**：`read_file` 自截 + offset 尾注 ⇒ 届时
+`Executor::run` 的 `_ =>` 分支必须拆，否则 `read_file` 拿到的是不含 offset 指引的命令式文案。实测与遗留见 §3.6.5⑥。
 
 **V0.5（下一步的现实形态，2026-10-28 新增）**
 

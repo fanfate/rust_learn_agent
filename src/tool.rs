@@ -152,19 +152,62 @@ fn run_command(program: &str, args: &[String], root: &Path) -> anyhow::Result<St
 
 // 参数处理和输出后处理函数
 
-fn truncate_head(mut text: String, max_bytes: usize) -> String {
+struct Truncation {
+    head_end: usize,
+    tail_start: usize,
+}
+
+impl Truncation {
+    fn get_truncate(text: &str, head_bytes: usize, tail_bytes: usize) -> Self {
+        let (head_end, tail_start) = truncate_middle(text, head_bytes, tail_bytes);
+        Self {
+            head_end,
+            tail_start,
+        }
+    }
+
+    fn is_truncated(&self) -> bool {
+        self.tail_start > self.head_end
+    }
+
+    fn split<'a>(&self, text: &'a str) -> (&'a str, &'a str) {
+        (&text[..self.head_end], &text[self.tail_start..])
+    }
+
+    fn omitted_bytes(&self) -> usize {
+        self.tail_start - self.head_end
+    }
+
+    fn head_lines(&self, text: &str) -> usize {
+        text[..self.head_end].lines().count() - self.head_partial(text) as usize
+    }
+    fn tail_lines(&self, text: &str) -> usize {
+        text[self.tail_start..].lines().count() - self.tail_partial(text) as usize
+    }
+    fn head_partial(&self, text: &str) -> bool {
+        self.head_end < text.len() && !text[..self.head_end].ends_with("\n")
+    }
+    fn tail_partial(&self, text: &str) -> bool {
+        self.tail_start > 0
+            && self.tail_start < text.len()
+            && !text[..self.tail_start].ends_with("\n")
+    }
+}
+
+fn truncate_head(text: String, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text;
     }
 
     let (total_len, total_lines) = (text.len(), text.lines().count());
 
-    let (head, _) = truncate_middle(&text, max_bytes, 0);
-    text.truncate(head);
-    let now_lines = text.lines().count();
-    let now_len = text.len();
+    let truncation = Truncation::get_truncate(&text, max_bytes, 0);
+    let (head, _) = truncation.split(&text);
+    let now_lines = truncation.head_lines(&text);
+    let now_len = head.len();
+
     format!(
-        "{text}...内容过长，只返回了前{now_lines}行/{now_len}字节，原文共{total_lines}行/{total_len}字节\n"
+        "{head}...内容过长，只返回了前 {now_lines} 行/ {now_len} 字节，原文共 {total_lines} 行/ {total_len} 字节\n"
     )
 }
 
@@ -174,15 +217,11 @@ fn truncate_head_tail(text: String, max_bytes: usize) -> String {
     }
     let (total_len, total_lines) = (text.len(), text.lines().count());
 
-    let (head, tail) = truncate_middle(&text, max_bytes - max_bytes / 4, max_bytes / 4);
-
-    let middle_lines = &text[head..tail].lines().count();
-    let middle_len = &text[head..tail].len();
-
+    let truncation = Truncation::get_truncate(&text, max_bytes - max_bytes / 4, max_bytes / 4);
+    let (head, tail) = truncation.split(&text);
+    let middle_len = truncation.omitted_bytes();
     format!(
-        "{}\n...[中间省略{middle_lines}行/{middle_len}字节，原文{total_lines}行/{total_len}字节]\n{}",
-        &text[..head],
-        &text[tail..]
+        "{head}\n...[中间省略 {middle_len} 字节，原文 {total_lines} 行/ {total_len} 字节]\n{tail}"
     )
 }
 

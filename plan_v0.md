@@ -3007,7 +3007,7 @@ diff -rq my_api/src  scratch/my_api/src           → 只有 models.rs 不同（
 | 序 | 动作 | 理由 |
 |---|---|---|
 | 1 | **`edit_file` + `write_file` 大文件拒写守卫**（守卫 2026-10-27 已落地；`edit_file` 仍 `todo!()`） | 这两条**必须一起**，才把 §3.6.3 的静默丢内容**结构性**闭合（不是靠文档嘱咐） |
-| 2 | `read_file` 的**行号** `offset` | 解锁「尾部看不见」；在 1 之后它才是可选的加分项 |
+| 2 | `read_file` 的**行号** `offset` | 解锁「尾部看不见」；在 1 之后它才是可选的加分项。**设计已定、未实现**：见 ⑤（五家调研 + `truncate_*` 改返回结构体） |
 | 3 | 日志 `→ 工具名(参数)` / `← N 字节`、`truncate_middle` / `resolve_in` 单测 | 可观测性 + 防回归 |
 | 4 | **操作审批钩子**（见 ②） | 需 3 完成后才好观测「拒绝了什么」 |
 | 5 | 交互式 REPL + 语义追问 | V1 |
@@ -3125,6 +3125,177 @@ let _ = fs::remove_dir_all(&dir_path).expect("清除路径失败");   // ✗ 等
 | `edit_file` 待铺（8+2） | 唯一替换 · 插入 · `replace_all` 全替换且回执含处数 · 0 处 **且原文未变** · n>1 且 `replace_all=false` **且原文未变** · 空 `old_string` · 文件不存在 · `new_string=""` 删除成功**且回执行号 ≠ 1** · 中文多字节 · 回执含 `起始第 N 行` | 是 |
 
 正向用例的期望值必须**独立算出**（`input.replacen(old, new, 1)`），不复用被测代码的中间变量，否则测试与实现同错。
+
+**⑤ `read_file` 的 `offset`：五家调研 + `truncate` 该返回结构体（2026-10-29）**
+
+给 `read_file` 加 `offset` 看着是「切一下」，实际撞上一处接缝：`truncate_head` 的文案里写着「原文共 M 行」，
+而它的 `total_lines` 是**传进来那份 `String`** 的行数 —— 一旦 `read_file` 先按 offset 切片，这句就变成**假话**
+（模型读到「原文共 567 行」，文件其实 589 行 ⇒ 它会认为读完了）。**这是结构问题，不是文案问题。**
+故先调研五家，再定实现。
+
+**主表**
+
+| | 参数 | offset 基准 | 输出行号前缀 | 默认上限 | 越界 |
+|---|---|---|---|---|---|
+| **Claude Code** | `file_path` `offset` `limit` | **1-based** | ✅ `cat -n`：空格+行号+Tab（正则在用的形态 `/^\s*\d+\t(.*)$/`） | 2000 行 / 单行 2000 字符 | 空文件返回空标记 |
+| **Gemini CLI** | `file_path` `start_line` `end_line` | **1-based**，**end 含在内** | ❌ **不加** | `DEFAULT_MAX_LINES_TEXT_FILE` | `start>end` 报错；越界 `Math.min` **静默收敛** |
+| **opencode** | `filePath` `offset` `limit` | 🔴 **0-based** | ✅ `00001\| 内容`（5 位补零） | 2000 行 / 单行 2000 字符 | 未确证 |
+| **pi** | `path` `offset` `limit` | **1-based** | ❌ **不加** | **2000 行 / 50KB，先到先得** | **抛错**：`Offset N is beyond end of file (M lines total)` |
+| **Codex** | ⚠️ **未见原生 read 工具** | — | — | — | — |
+
+Codex 这一格是**存疑**而不是「没有」：`codex-rs/core/src/tools/handlers/` 里实际只有 `apply_patch.rs`、`view_image.rs`、
+`unified_exec.rs`、`shell_spec.rs`、`mcp.rs`，**没有 `read_file.rs`**；第三方资料说某版本有 `read_file(path, limit, offset, timeoutMs)`，
+但读不到源码 ⇒ 基准与格式不可信。能确认的是它**主线 shell 优先**（读文件靠 `sed -n` / `cat`），这也解释了为什么它给了
+`apply_patch` 却没有原生 read handler。
+
+**三个分歧点**
+
+| 分歧 | 分布 | 判据 |
+|---|---|---|
+| **1-based vs 0-based** | 4:1（opencode 是唯一 `args.offset \|\| 0`） | 五家**都把 `1-indexed` 写进 description** —— 因为训练数据里两派混着，不明说模型就会把 22 传成 21 |
+| **行号前缀** | 带：Claude Code、opencode；不带：Gemini CLI、pi | 带的这两家有**下游引用需求**（Claude Code 的 permission/UI 要定位；opencode 接了 **LSP**，诊断天然带行号）。**但五家全部在尾注报 `A-B of N`** ⇒ 行号前缀是可选装饰，尾注是必需品 |
+| **越界** | pi 抛错带总行数 / Gemini 静默收敛 | **pi 对**：空返回让模型分不清「文件是空的」和「跳过头了」 |
+
+**🔴 承重发现：pi 的 `truncate` 返回结构体，完全不拼文案**
+
+```ts
+export interface TruncationResult {
+  content: string;
+  truncated: boolean;  truncatedBy: "lines" | "bytes" | null;
+  totalLines: number;  totalBytes: number;
+  outputLines: number; outputBytes: number;
+  lastLinePartial: boolean;  firstLineExceedsLimit: boolean;
+  maxLines: number;  maxBytes: number;
+}
+```
+
+文案在 `read.ts` 里现拼：`[Showing lines {a}-{b} of {total}. Use offset={next} to continue.]`；
+而 `bash.ts` 调**同一个** `truncateHead`/`truncateTail`，拼**自己**的文案。
+
+⇒ 我上一轮给的「B 方案（把截断下沉进 `read_file`）」**只对了一半**。pi 的划法更干净：
+
+> **截断函数只算数（返回结构体），文案由知道 offset 的调用方拼。**
+
+这正是「core 里不许按策略分支」那条原则推到底：**谁产生文案，谁必须知道策略**。文案里带 `start_line`/`total`、
+带 `RunCommand` 的「头 3/4 + 尾 1/4」，就说明文案不属于截断函数。三个可直接搬的细节：
+
+- **Never returns partial lines**：头截断宁可少给一行，不给半行（现有 `LINE_SNAP_MAX = 256` 是同一意图的宽松版）
+- **`firstLineExceedsLimit`**：返回**空 content + 标志位**，由调用方提示 `[Line 42 is 200 KB, exceeds 50 KB limit...]`
+  —— 正好覆盖我们的「20KB 无换行单行」场景，而不是把残片塞给模型
+- **`splitLinesForCounting` 末尾要 pop `\n`**，否则多算一行（= Rust `lines()` 的行为）
+
+**两个「业界也踩」的坑**
+
+- **Gemini CLI 的 CRLF bug**：`content.split(/\r?\n/)` 再 `join('\n')` ⇒ **带 offset 的读取会破坏 CRLF 文件**，
+  模型拿到的内容与磁盘不一致。它的 `isTruncated` 还把「请求了 offset」当成「被截断了」。⇒ 见下「陷阱二」。
+- **Claude Code 丢尾换行**：逆向日志显示 `"foo\n"` 与 `"foo"` 在 Read 输出里等价（编辑器视图不需要尾换行）。
+  模型据此取 `old_string` 时可能差一个字节。
+
+**本项目的六个决定**
+
+| 决策 | 取 | 依据 |
+|---|---|---|
+| offset 基准 | **1-based**，`parameters` 与 `description` 都明写 `1-indexed` | 4/5 家；且与 cargo 的 `src\x.rs:22:31` 同坐标系 |
+| 行号前缀 | **不加** | 与 pi/Gemini 同组（`edit_file` 用字符串锚点，无行号引用需求）；实测省 15.6% 字节 ⇒ 8192 预算下多 20% 视野 |
+| 尾注 | **必须有**：`第 a-b 行 / 共 N 行 / 用 offset=b+1 继续` | 五家全部有；缺一个模型就不知道要不要继续 |
+| `truncate_*` | **返回结构体，且只装两个切点**：`Truncation{head_end, tail_start}`；其余（`is_truncated` / `split` / `omitted_bytes` / `*_lines` / `*_partial`）全做方法，文案上移 | pi 的 `TruncationResult` **只抄结构不抄字段** —— 那 10 个字段是「2000 行 / 50KB 双阈值」的产物；本项目单阈值，逐字段的死因见 ⑥ |
+| 越界 | **bail 并报总行数**（`offset=900 超出，该文件共 589 行`） | pi；Gemini 的静默收敛是反例 |
+| 单行超限 | **单独分支**：空内容 + 指明「第 N 行超限，请用 `rg -n` 定位」 | pi 的 `firstLineExceedsLimit` |
+
+**三个实现陷阱（均已实测）**
+
+1. **`offset - 1` 在 `offset = 0` 时 panic**（1-based 下 0 非法，但它一定会被传进来）：内部先归一化，0/None 都当 1。
+2. 🔴 **禁止 `lines().skip(n).collect::<Vec<_>>().join("\n")` 切片**：
+   ```
+   原文件 "a\r\nb\r\nc\r\n"
+     lines() 重组第 2 行起 = "b\nc"        ← \r 被剥掉、末尾 \n 也丢
+     字节切片 &s[3..]     = "b\r\nc\r\n"   ← 逐字节保真
+   ```
+   后果很具体：模型拿 `b\nc` 当 `old_string` 去 `edit_file` 一个 CRLF 文件 ⇒ **0 匹配**，
+   而我们刚在 0 匹配文案里写「可能是行尾符差异」—— 读侧自己吃了 `\r`，那句话就成了甩锅。
+   正确做法：**找第 N 个 `\n` 的字节位置再 `&text[pos..]`**，零拷贝、保真、越界自然得 `""`。
+3. **单行 20KB**：`truncate_middle` 的 `head/tail` 配额会把它切成两段残片。按 pi 的做法给独立分支。
+
+⚠️ 「行号前缀不加」是本项目自己的判断，**不是行业多数**（2:3）。若将来发现模型定位变差，回来的入口是
+`description`（补一句「行号前缀不是内容，`old_string` 不要带」），不是改回 `lines()` 重组。
+
+**⑥ 收敛：`Truncation` 只装两个切点（2026-10-29，四轮追问后定稿）**
+
+⑤ 定下的第一版是 `Truncation{head_end, tail_start, total_bytes, total_lines}` + `kept_lines()`。
+用户一句「`total_bytes` 描述的是原文本的属性吧？那让它存感觉毫无意义」推翻了其中一半。判据最后落成一条：
+
+> **core 只装「源上没有、只能从计算过程里得到」的东西。**
+> 源是 `text`，`Truncation` 只是源上的两个坐标，不是第二份文件元数据。
+
+**留下来的（2 字段 + 6 方法）**
+
+| 成员 | 形态 | 判据 |
+|---|---|---|
+| `head_end` / `tail_start` | 字段 | **唯一不可派生项**；`(text, head_end, tail_start)` 就是全部信息 |
+| `is_truncated()` | `tail_start > head_end` | 纯比较 |
+| `split(text) -> (&str, &str)` | 字面切片 | **借用不复制**；绝不能 `lines().join()`（吃 `\r`、丢尾 `\n`） |
+| `omitted_bytes()` | `tail_start - head_end` | O(1)、**精确无歧义**（字节没有「残行归属」问题）；`middle_lines` 的替代品 |
+| `head_partial()` / `tail_partial()` | 切点是否紧跟 `\n` | 双重身份：既是行数修正项，又是文案分支开关（残行时**不能**提示 `offset=b+1`，会死循环） |
+| `head_lines()` / `tail_lines()` | `lines().count() - partial as usize` | 只在「行号承重」处用（`read_file` 的 `b`） |
+
+**四个被删掉的成员，各有一个不同的死因**
+
+| 被删 | 死因 |
+|---|---|
+| `total_bytes` | `text.len()` **O(1)** 可派生；且**会诱导错判**——`total_bytes > tail_start - head_end` 看着像「有截断」，实际是「全文字节 > 省略字节」，几乎恒真 |
+| `total_lines` | 调用方 `text.lines().count()` 现算一次即可。pi 存 `totalLines` 是因为它**按行做阈值**、数行本来就顺手；**本项目按字节 snap 到行、全程不数行**，照抄只剩装饰 |
+| `kept_lines()` | 只有 head-only 才存在连续 `a..b`；`truncate_head_tail` 保留的是**两段不连续区间**，这个数没有可用语义（「保留 283 行」，哪 283 行？）。它其实是 `read_file` 的局部算术 `b = a + head_lines - 1`，不是 core 属性 |
+| `middle_lines` | ① **代数恒等**：实测 `text[h..t].lines().count() ≡ total - head_lines - tail_lines`（由 `total = head.lines + mid.lines + tail.lines - hp - tp` 直接推得）⇒ 零新信息，还白扫一遍；② **残行场景是假话**：`"aaa\nbbb\nccc\n"` 切成 head=`"aaa\nb"` / mid=`"bb\nc"` / tail=`"cc\n"` 时报「省略 2 行」，而**完全未显示的行是 0**（bbb 露了开头、ccc 露了结尾）。`run_command` 改用 `omitted_bytes()` —— 命令输出没有 offset 续读语义，行号对模型毫无用处 |
+
+**行数口径（唯一正确写法，已实测）**
+
+```rust
+let head_lines = text[..head_end].lines().count() - head_partial as usize;
+```
+
+两个「看起来更简单」的写法都错，而且错的方向相反：
+
+| 写法 | 反例 | 实测 |
+|---|---|---|
+| 只用 `lines().count()` | `"a\nb"` 切在 3（行中） | lines=**2**，实际只有 1 个完整行 |
+| 只用 `matches('\n').count()` | `"a\nb"` **未截断**、文件末尾无换行 | nl=**1**，实际 2 行 |
+| `lines() - partial` | 上两者 | 1 / 2 ✅ |
+
+原因：`lines()` 会把「末尾无 `\n` 的最后一段」原样当一行返回，而这段完不完整恰好由 `head_partial` 唯一确定。
+
+**`\r\n` 的四条约束**（不影响计数，但每条都能踩坑）
+
+1. 判据只能是 `\n`，不能是 `\r`：实测 `"a\r\n"` 与 `"a\n"` 都是 lines=1、nl=1、`partial=false`。
+2. 🔴 `lines()` **只用于数数，绝不能用于生成返回内容**：`lines().collect().join("\n")` 剥 `\r`、丢尾 `\n`，
+   模型拿它当 `old_string` ⇒ 0 匹配，而我们在 0 匹配文案里刚写了「可能是行尾符差异」。
+3. 切在 `\r` 与 `\n` 之间：snap 成功时**不可能**（`head_end = pos + 1`，`pos` 是 `\n` 的下标）；只有 snap 失败才可能，
+   而那时该行本就是残行。实测 `"a\r\nb\r\n"` 切在 2 ⇒ head=`"a\r"`、partial=true、`head_lines=0`。
+4. ⚠️ **CR-only（老 Mac）不支持**：`lines()` 不认 `\r`，全文件算 1 行、nl 全 0、snap 永远失败、`partial` 永远 true。
+   写注释声明即可（`my_api` 13 个文件全 LF）。
+
+**当前落地形态（2026-10-29，用户已改）**
+
+`truncate_middle` 是唯一的算法核；`truncate_head` / `truncate_head_tail` **暂时保留为薄壳** = 固定参数 + 拼文案：
+
+```rust
+fn truncate_head(text: String, max_bytes: usize) -> String       // get_truncate(&text, max_bytes, 0) + 文案
+fn truncate_head_tail(text: String, max_bytes: usize) -> String  // (max - max/4, max/4) + 文案
+```
+
+薄壳的判据不是「能不能留」，而是「**留了不能长出策略**」：允许固定参数 + 拼文案，**禁止自己算数字 / 自己判边界**。
+`now_len = head.len()` 可以（切片的固有属性）；第二轮再算一遍 `mid.lines().count()` 就不行。
+第二刀（`run_command` 真的需要续读时）把文案搬回工具边界、删掉 `Executor::run` 的 match。
+
+**遗留（下一次改动必须处理）**
+
+- 🔴 **`tool.rs:237` 取错方法**：`let middle_len = truncation.tail_lines(&text);` ⇒ 应为 `omitted_bytes()`。
+  `tail_lines` 是个位数，当字节数用会写出「中间省略 12 字节」（`cargo test` 实际切掉 ~22KB）。
+  指纹：编译器已经在报 `ommited_bytes` never used。（另：拼写应为 `omitted_bytes`，代码里少一个 `t`）
+- `tool.rs:197` 的 `mut text: String` 已不需要（不再 `text.truncate()`），`cargo check` 报 `197:18`。
+- `is_truncated` 是 dead_code 但**不必急着消**：两个薄壳都用 `text.len() <= max_bytes` 提前返回（更便宜）；
+  它真正的消费者是 `read_file` 的「要不要给 `offset=b+1`」。
+- 🔴 **`Executor::run` 的 `_ => truncate_head(...)` 分支到时候必须拆**：`read_file` 要「第 a-b 行 / 共 N 行 / 用 offset=b+1 继续」，
+  而命令式文案「内容过长，只返回了前 N 行」**不含 offset 指引**，模型读到 8192 字节就不知道还能继续。
 
 ### 3.7 工程化分档
 
@@ -4211,8 +4382,14 @@ loop {
   Claude Code 的「Edit/Write 前必须 Read 过」覆盖率追踪取代；现在这条是「静默毁 10KB → 明确拒绝」的纯增益；
   ③ 🟡 **`read_file` 加 `offset`（行号，不是字节）**——唯一导航信号是 cargo 的 `src\x.rs:22:31`，模型没法把行号换算成字节
   （**2026-10-27 自我更正**：早先写「按字节更自洽」是错的；Gemini CLI 用 `start_line`/`end_line`、Claude Code 用行 `offset`/`limit`
-  也是行）。字节上限只作最后安全网（防单行 20KB）。回执末尾给「用 `offset=N` 继续读」，文案抄 Gemini `read-file.ts`：
-  `Status: Showing lines {start}-{end} of {total} total lines. / Action: ...`
+  也是行）。字节上限只作最后安全网（防单行 20KB）。
+  **2026-10-29 五家调研后设计定稿，见 §3.6.5⑤**：1-based 明写 `1-indexed` / **不加行号前缀**（省 15.6% 字节）/
+  尾注必须有「第 a-b 行 · 共 N 行 · 用 offset=b+1 继续」/ 越界 **bail 并报总行数**（不静默收敛）/
+  ✅ **`truncate_*` 已改成返回结构体（2026-10-29 落地，形态见 §3.6.5⑥）**：`Truncation{head_end, tail_start}` **只装两个切点**
+  （`total_bytes` / `total_lines` / `kept_lines` / `middle_lines` 逐个论证后删除），行数由 `head_lines` / `tail_lines` 方法算；
+  `truncate_head` / `truncate_head_tail` 暂留为「固定参数 + 拼文案」薄壳。
+  🔴 **`read_file` 自截 + offset 尾注尚未接入**：届时 `Executor::run` 的 `_ =>` 分支必须拆，否则 `read_file` 拿到的是
+  「内容过长，只返回了前 N 行」——**不含 `offset` 指引**。另 `tool.rs:237` 仍有 `tail_lines` 误当字节数的 bug（见 ⑥ 遗留）。
   加第 5 个工具的实际成本：编译器会逼你补 **4 处**穷尽 match（`name()` / `spec()` / `parse_kind` / `raw_invoke`），
   唯一没被逼的是 `ALL` 数组（已有「长度 + 名字唯一」测试钉着）⇒ 又一个 V1 `Box<dyn Tool>` 的论据。
   ⚠️ **别用「给 `uv` 权限让它写 python 脚本读写」代替**，三条理由（2026-10-27 实测/核证）：
