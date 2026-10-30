@@ -421,8 +421,6 @@ impl Executor {
     }
 
     pub fn run(&self, inv: &Invocation) -> anyhow::Result<String> {
-        println!("开始调用工具...");
-        println!("Tool Info : {}", inv.info());
         let raw = inv.raw_invoke(&self.root, self.max_bytes)?;
         match inv {
             Invocation::RunCommand(_) => Ok(truncate_head_tail(raw, self.max_bytes)),

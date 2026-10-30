@@ -2,6 +2,7 @@ use anyhow::bail;
 
 use crate::{
     llm::OpencodeGoClient,
+    log::{LogKind, LogSink, Logger},
     model::{Invocation, Message, ToolKind},
     tool::Executor,
 };
@@ -16,6 +17,7 @@ pub async fn run_agent(
     client: &OpencodeGoClient,
     task: &str,
     max_steps: usize,
+    sink: &LogSink<'_>,
 ) -> anyhow::Result<()> {
     let system_prompt = Message::System {
         content: SYSTEM_PROMPT.to_string(),
@@ -29,9 +31,12 @@ pub async fn run_agent(
 
     let mut finished = false;
 
+    let mut logger = Logger::get_logger(sink)?;
+
+    logger.task(task);
+
     for step in 1..=max_steps {
-        println!("----------");
-        println!("开始第 {} 步", step);
+        logger.step(step);
 
         let mut resp = client.chat(&messages, &tools).await?;
         if resp.choices.is_empty() {
@@ -50,16 +55,16 @@ pub async fn run_agent(
         };
 
         if let Some(reasoning) = reasoning_content {
-            println!("AI 思考 : {}", reasoning);
+            logger.record(LogKind::Thought, reasoning);
         }
 
         if let Some(ai_content) = content {
-            println!("AI 回答 : {}", ai_content);
+            logger.record(LogKind::Answer, ai_content);
         }
 
         if tool_calls.is_empty() {
             if resp_content.finish_reason.as_deref() == Some("length") {
-                println!("输出被长度限制截断");
+                logger.record(LogKind::Error, "输出被长度限制截断");
             }
             finished = true;
             break;
@@ -76,17 +81,20 @@ pub async fn run_agent(
                             tool_call_id: tool_id.clone(),
                             content: "Error: 未找到符合的工具".to_string(),
                         });
+                        logger.record(LogKind::Error, "未找到符合的工具");
                         continue;
                     };
 
                     match Invocation::parse_kind(&tool_kind, &func_call.arguments) {
                         Ok(inv) => {
-                            let tool_res = match tool_exec.run(&inv) {
-                                Ok(out) => out,
-                                Err(err) => format!("Error: {err:#}"),
+                            logger.record(LogKind::ToolCall, &inv.info());
+
+                            let (log_kind, tool_res) = match tool_exec.run(&inv) {
+                                Ok(out) => (LogKind::ToolResult, out),
+                                Err(err) => (LogKind::Error, format!("Error: {err:#}")),
                             };
 
-                            println!("Tool Result :\n{}", tool_res);
+                            logger.record(log_kind, &tool_res);
 
                             tool_messages.push(Message::Tool {
                                 tool_call_id: tool_id.clone(),
@@ -99,6 +107,7 @@ pub async fn run_agent(
                                 tool_call_id: tool_id.clone(),
                                 content: format!("Error: {err:#}"),
                             });
+                            logger.record(LogKind::Error, &format!("{err:#}"));
                         }
                     }
                 }
@@ -107,6 +116,7 @@ pub async fn run_agent(
                         tool_call_id: tool_id.clone(),
                         content: format!("Error: {err:#}"),
                     });
+                    logger.record(LogKind::Error, &format!("{err:#}"));
                 }
             }
         }
@@ -116,9 +126,12 @@ pub async fn run_agent(
     }
 
     if !finished {
-        println!("未能在{max_steps}步内完成任务!");
+        logger.record(
+            LogKind::TaskResult,
+            &format!("未能在{max_steps}步内完成任务!"),
+        );
     } else {
-        println!("任务完成!");
+        logger.record(LogKind::TaskResult, "任务完成!");
     }
 
     Ok(())

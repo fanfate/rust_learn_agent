@@ -255,6 +255,9 @@ clap = { version = "4.6", features = ["derive"] }   # CLI 参数
 ```
 
 V0 后半段再加：`tracing` + `tracing-subscriber`（结构化日志）。
+> ⚠️ **2026-10-30 改判：V0 改手写 `Logger`**（见 §3.6.6）。`tracing` 解决的正是「库发事件、subscriber 决定去向」，
+> 方向没错，但现在只有 1 个模块要打日志、span / 字段过滤一个都用不上 ⇒ 收益 0，成本 2 个依赖 + `#[instrument]` 遍历。
+> **触发条件**：出现第二个要打日志的模块，或需要按字段过滤（如只看 `tool=read_file`）。
 流式相关的 `eventsource-stream` / `futures-util` **留到 V1**。
 
 > ⚠️ **`reqwest 0.13` 的 TLS 与 0.12 不同，注意这个坑**（已查 crates.io 上的 feature 表）：
@@ -3010,9 +3013,9 @@ diff -rq my_api/src  scratch/my_api/src           → 只有 models.rs 不同（
 
 | 序 | 动作 | 理由 |
 |---|---|---|
-| 1 | **`edit_file` + `write_file` 大文件拒写守卫**（守卫 2026-10-27 已落地；`edit_file` 仍 `todo!()`） | 这两条**必须一起**，才把 §3.6.3 的静默丢内容**结构性**闭合（不是靠文档嘱咐） |
-| 2 | `read_file` 的**行号** `offset` | 解锁「尾部看不见」；在 1 之后它才是可选的加分项。**设计已定、未实现**：见 ⑤（五家调研 + `truncate_*` 改返回结构体） |
-| 3 | 日志 `→ 工具名(参数)` / `← N 字节`、`truncate_middle` / `resolve_in` 单测 | 可观测性 + 防回归 |
+| 1 | **`edit_file` + `write_file` 大文件拒写守卫** ✅ **均已落地**（守卫 2026-10-27 / `edit_file` 2026-10-28） | 这两条**必须一起**，才把 §3.6.3 的静默丢内容**结构性**闭合（不是靠文档嘱咐） |
+| 2 | `read_file` 的**行号** `offset` ✅ **2026-10-30 已落地** | 解锁「尾部看不见」；在 1 之后它才是可选的加分项。设计见 ⑤，四分支尾注见 ⑦ |
+| 3 | ~~日志 `→ 工具名(参数)` / `← N 字节`~~ ✅ **2026-10-30 已做、形态改判**：`Logger` + `LogKind` + `LogSink`，文案集中在 `log.rs`、`Executor::run` 保持静默（见 **§3.6.6**）；`truncate_middle` / `resolve_in` 单测**仍未做** | 可观测性 ✅ / 防回归 ⬜ |
 | 4 | **操作审批钩子**（见 ②） | 需 3 完成后才好观测「拒绝了什么」 |
 | 5 | 交互式 REPL + 语义追问 | V1 |
 
@@ -3368,6 +3371,101 @@ fn truncate_head_tail(text: String, max_bytes: usize) -> String  // (max - max/4
 对比 ⑥ 的结论，⑦ 没有推翻它：`Truncation` 仍然只装两个切点、仍然只提供边界与边界的算术。
 被推翻的只是**「边界之后该怎么说话」**这一层判断 —— 而这层本来就不属于 core。
 
+#### 3.6.6 日志层：屏幕与文件的分工（2026-10-30 落地）
+
+**① 谁拥有屏幕**
+
+`Executor::run` 是库函数，它返回 `String` 就够，**它不该写 stdout**。三条理由按严重程度排：
+① TUI（ratatui 之类）要独占 stdout（alternate screen），任何零散 `println!` 都会撕裂渲染；
+② `cargo test` 抓不到、也关不掉；③ `inv.info()` 是**给日志看的格式**，不是给模型看的格式 ——
+让 core 决定显示什么，就是替前端做产品决策。
+
+⇒ 数据仍由调用方那条链产生（`inv.info()`、`tool_res.len()` 本来就都在 `agent.rs` 手里），
+只是**显示由 `agent.rs` 决定**。这与 §3.7.2 末 2026-10-21 那句「日志应在 `Executor::run`」不冲突：
+那句说的是**信息所有权**（对），没说**往哪打**（错）。判据一路是同一句：**谁拥有屏幕，谁决定显示多少**。
+
+**② 三个类型，三种职责**
+
+| 类型 | 装什么 | 为什么是这个形状 |
+|---|---|---|
+| `LogKind`（enum，6 变体） | 事件**种类** | **闭合集合** ⇒ `match` 逼你穷尽。标签是日志的 grep 锚点，写成 `&str` 时 `"tool_reslt"` 编译通过、搜索时才失效 |
+| `LogSink<'a>`（enum，2 变体 `File`/`Console`） | 落到**哪** | 也是闭合集合，但装的是**选择**不是状态。`Option<&str>` 也够用，代价是 `None` 会被读成「用默认路径」 |
+| `Logger`（struct） | 唯一状态 `Option<File>` | 与 §3.6.5⑥ 同一条判据：结构体只装「源上没有、只能从调用过程得到」的东西。`kind` / `body` 都是参数，不进字段 |
+
+**不是 `trait Sink`**：实现只有 1 个（文件）。TUI sink / 内存 sink 都还不存在 ⇒ 按「≥2 个真实实现才抽 trait」，
+现在抽就是假壳。**触发条件**：出现第二个 sink，或 V1 流式把「整块写入」改成「增量 + 结束标记」——
+那时 `record(kind, body)` 的签名本身就要拆，现在设计 `Event` 等于在没感觉到 delta 的形状之前先焊死
+（和 `Executor::run` 返回 `String` 是同一个病）。
+
+**③ `emit(file_text, console_text)`：签名就是不变式**
+
+文件和屏幕**可以不同，但必须来自同一次调用**。`ToolResult` 是唯一的差异点：有文件时屏幕只报
+`Tool Result : N 字节(全文见log文件)`，无文件时屏幕拿全文。这条不变式原来靠三处各记一遍维持，
+现在靠一个签名 —— 「屏幕撒谎」那个 bug 正是从「三处各记一遍」的缝里长出来的。
+
+**④ 「显式选择」与「自动降级」是两件事（本节的自更正）**
+
+先后说过的两句「打不开就降级」（对）和「用 `Result` 让启动失败」（也对）是互相矛盾的。分界线是**谁决定**：
+
+| | 谁决定 | 后果 |
+|---|---|---|
+| 自动降级 `open().ok()` | 库替你决定 | 你不知道有没有日志，屏幕还在说「全文见log文件」⇒ **错** |
+| 显式选择 `LogSink::Console` | 调用方决定 | 你知道自己没文件，屏幕也不撒谎 ⇒ **对** |
+
+所以 `new()` 用 `?` 上抛（**要了文件却没拿到就该报错，不该假装没事**），`new_no_file()` 只能由
+`LogSink::Console` 显式到达。要点是：**没有「要了文件却悄悄没有」的路径**。
+
+⚠️ 另一个更难发现的形态：`new_no_file()` 造出来但**没有选择点**（`agent.rs` 里硬编码 `Logger::new("data/run.log")`）——
+接口有降级、运行路径上选不到，等于常量。**一个只有一种取值的选项不是选项**。
+
+**⑤ 父目录：`create(true)` 不建父目录（实测）**
+
+```
+parent missing -> open ok? false      ← data/ 不存在时
+parent exists  -> open ok? true
+append result  -> "##### START TASK #####\nrun1\n##### START TASK #####\nrun2\n"
+```
+
+`data/` 在 `.gitignore` 里 ⇒ **新克隆必然没有**。旧写法 `open().ok()` 的实际后果是：第一次跑，屏幕打
+`Tool Result : 8247字节(全文见log文件)`，而文件根本不存在 —— **日志在最需要它的时候（首次运行）失声，还谎报**。
+现在 `new()` 里先 `create_dir_all(parent)?` 再 `open(path)?`。
+（顺带：`writeln!` 用 `append` 不 `truncate` ⇒ 跨 run 累积，靠 `##### START TASK #####` 分隔可用，
+但**同一任务串跑两次无法区分** ⇒ `task()` 该补时间戳或 `new()` 该 `truncate(true)`，二选一即可，别两头都默认。）
+
+**⑥ 四条错误路径，现在各有一个 `LogKind::Error` 调用点**
+
+改之前：`未找到符合的工具` / `parse_kind` 失败 / `payload()` 失败 三条都是 `format!("Error: {err:#}")`
+直接进 `tool_messages`，**既不落日志也不上屏** —— 模型收到 `Error:` 开始瞎试，而你手上零记录。
+而 `parse_kind` 失败通常意味着 `arguments` 形状不对（`#[serde(deny_unknown_fields)]` 一开就常见），
+恰是最该复盘的一类；已被记的那条（幻觉工具名）反而是最不重要的。
+
+另一条同类问题：`Executor` 的 `Err` 原来被记成 `ToolResult` ⇒ 屏幕打 `Tool Result : 43字节`，
+**「工具炸了」和「工具正常返回」长得一样**。现在 `run()` 的 `match` 直接产出 `(LogKind, String)`，
+一处决定「这是什么」，不再让 `{err:#}` 拍平的 error chain 伪装成结果。
+
+**⑦ 不用 `BufWriter`（不是遗漏）**
+
+`File` 直接写，`writeln!` 即落盘 ⇒ 进程被 kill / panic 时已写入的块一定在盘上。套了 `BufWriter`
+反而要担心最后一块随进程消失 —— 而「它为什么崩」正是要查的那一次。**另外写文件在 `println!` 之前**：
+`cargo run | head` 把 stdout 撑爆导致 `println!` panic 时，日志仍是完整的。
+
+**⑧ 有 START 无 END 是信号，别用 `Drop` 抹掉它**
+
+`task()` 写 `##### START TASK #####`，`##### END #####` 只在 `TaskResult` 分支写。所以
+`choices.is_empty()` 的 `bail!`、`非法 assistant message` 的 `bail!`、`client.chat(...)?` 的网络错误
+提前退出时，日志**只有 START 没有 END** —— 这本身就是「异常退出」的可读信号，**不要**给 `Logger` 加
+`Drop` 兜底去「补全」它。（待补：那两个 `bail!` 前面各记一条 `LogKind::Error`，否则「为什么没 END」还得靠猜。）
+
+**⑨ 待办（都不挡路）**
+
+- 🔴 `main.rs` 现在 `LogSink::Console` ⇒ 回执全文上屏。跑 `offset` 专场要换成 `LogSink::File("data/run.log")`，
+  否则三页 `read_file` 会把 `AI 思考` 刷出屏幕。
+- `Logger::get_logger(&sink)` 里 `sink` 已是 `&LogSink` ⇒ `&&LogSink`（`match *sink` 靠 default binding
+  modes 才编过），应直接传 `sink`。
+- 命名：`get_logger` → `from_sink`（Rust 不用 `get_` 前缀做构造）；`new` / `new_no_file` 已私有，入口单一 ✅。
+- `record` 把 `Thought` 全文打控制台 —— reasoning 通常比正文长得多，会比 `ToolResult` 更刷屏。
+  属「折叠」范畴，V1 或嫌烦了再说。
+
 ### 3.7 工程化分档
 
 判据只有一条：**这项工程化，每小时能让你学到多少 Rust，以及是否直接提升可靠性 / 可测性 / 安全性。**
@@ -3705,6 +3803,10 @@ fn raw_invoke(&self, root: &Path) -> anyhow::Result<String> {
    `WriteFile` 走 `_` 臂时**一行日志都没有**（第 3、4 步日志完全空白，看不出它调了什么、参数是什么）。
    日志应在 `Executor::run` —— 那里同时握有「哪个工具 / 入参 / 输出多少字节」，一次覆盖所有工具，
    且测试调用内层 IO 时不会被日志噪音污染。
+   ⚠️ **2026-10-30 二次更正**：本条只走了一半。**信息所有权**在 `Executor::run` 是对的，但**它在库函数里写
+   stdout 是错的**（TUI 独占屏幕、`cargo test` 抓不到也关不掉、`inv.info()` 是日志格式不是模型格式）。
+   最终形态：`Executor::run` 保持静默，`agent.rs` 用 `Logger` 决定显示什么 —— 调用方本来就逐字拥有那四要素，
+   上移不损失任何信息。见 **§3.6.6**。
 
 **修法（顺序）：**
 
@@ -4406,7 +4508,7 @@ loop {
 - [x] 终止条件 + 步骤上限（`for step in 1..=max_steps`，`tool_calls` 为空即 break；`finish_reason` 只用于 `length` 日志）
 - [x] **`ToolKind::ALL` 缩到「真能用的工具」**（2026-10-23 由「立刻实现」路径解决：`write_file` 已是真实现，`_` 臂已删）：`WriteFile` 已在 `ALL` 里、`spec()`/`parse_kind` 也全写好了，但 `raw_invoke` 走 `_ => bail!("工具尚不支持")` ⇒ **`write_file` 真的发给了模型**，实测模型白烧 2 步并猜出"临时故障 / 路径限制 / 大小写文件系统"三种错误假设（**§3.7.2 末 2026-10-22 实测**）。**2026-10-23 定：走「立刻实现」这条路，不缩 `ALL`** —— 顺序 = `write_file` → `run_command`
 - [x] **`raw_invoke` 的 `_` 臂换成显式 `Invocation::WriteFile(..)`**（2026-10-23 完成：`match` 三个臂穷尽、无 `_`，加变体会报 E0004；失败文案已带 `args.path`）：那个 `_` 是"漏臂静默"的唯一来源（换掉后加变体才会报 E0004）；顺带错误文案要带工具名 + 可用清单
-- [ ] **日志从 `read_file`/`list_files` 内部挪到 `Executor::run`**（**一半已做**：IO 函数里的 `println!` 已随 context 重构删掉，只剩 `run` 里两行。待改成 `→ 工具名(参数)` / `← N 字节`）：`run` 里同时握有工具名 / 入参 / 输出字节数
+- [x] ✅ **日志层（2026-10-30）**：`read_file`/`list_files` 内部的 `println!` → `Executor::run` → **最终落在 `agent.rs` 的 `Logger`**。判据演进：「信息所有权在 `Executor::run`」**对**（四要素齐全），但「库函数写 stdout」**错**（TUI 独占屏幕 / 测试关不掉 / `inv.info()` 是日志格式不是模型格式）—— 两者不冲突，因为调用方本来就逐字拥有那四要素。`LogKind` / `LogSink` / `Logger` 的分工、四条错误路径、屏幕与文件同源，见 **§3.6.6**
 - [ ] **`max_steps` 用尽后补一次 `tool_choice:"none"` 收尾**（V1）：实测耗尽时模型 `reasoning` 里已经写好结论（"report to user honestly"）却再没机会输出（**§3.7.2 末**）
 - [ ] `LlmClient` trait 立起来 —— **排在循环跑通之后**，签名从实际代码抄（§3.7.2）
 - [x] 4 个工具实现：`list_files` ✔ / `read_file` ✔（2026-10-22 完成：`sort()` 确定序、`join` 替 `fold`、`file_name()` 相对路径、`[DIR]`/`[FILE]` 前缀、非 UTF-8 显式标注） / `write_file` ✔（2026-10-23 v4：整文件覆盖 + 自动建父目录 + 祖先 canon） / `run_command` ✔（2026-10-27：裸名 + 白名单（都在 `raw_invoke`，裸名在前）+ **继承环境 + `env_remove` 自己的 key** + `current_dir` + 三流显式 + **退出码全走 `Ok`**；端到端实测通过，见 §3.5 末 2026-10-27）
