@@ -3129,7 +3129,7 @@ let _ = fs::remove_dir_all(&dir_path).expect("清除路径失败");   // ✗ 等
 |---|---|---|
 | 纯路径代数 | `../` 越界 / 绝对路径 / 空串 | **否**，只要一个真实存在的 root |
 | 需要文件系统 | 写入成功 / 父目录不存在 / 目标是目录 / 守卫触发 | 是 |
-| `edit_file` 待铺（8+2） | 唯一替换 · 插入 · `replace_all` 全替换且回执含处数 · 0 处 **且原文未变** · n>1 且 `replace_all=false` **且原文未变** · 空 `old_string` · 文件不存在 · `new_string=""` 删除成功**且回执行号 ≠ 1** · 中文多字节 · 回执含 `起始第 N 行` | 是 |
+| `edit_file` ✅ **8/10 已落地**（2026-11-02 实测） | 唯一替换 · 插入 · `replace_all` 全替换且回执含处数 · 0 处 **且原文未变** · n>1 且 `replace_all=false` **且原文未变** · 空 `old_string` · ~~文件不存在~~（由 `resolve_in` 失败路径覆盖）· `new_string=""` 删除成功**且回执行号 ≠ 1** · 中文多字节 · 回执含 `起始第 N 行` | 是 |
 
 正向用例的期望值必须**独立算出**（`input.replacen(old, new, 1)`），不复用被测代码的中间变量，否则测试与实现同错。
 
@@ -3370,6 +3370,36 @@ fn truncate_head_tail(text: String, max_bytes: usize) -> String  // (max - max/4
 
 对比 ⑥ 的结论，⑦ 没有推翻它：`Truncation` 仍然只装两个切点、仍然只提供边界与边界的算术。
 被推翻的只是**「边界之后该怎么说话」**这一层判断 —— 而这层本来就不属于 core。
+
+**⑧ 单测覆盖核对 + 待答自习题（2026-11-02，实测）**
+
+`cargo test` **13 passed** = `edit_file` 8 + `write_file` 4 + `resolve_in` 1（仅失败路径）；
+`cargo check --all-targets` 0 error + 5 处 dead_code；`cargo clippy --all-targets` 除 dead_code 外**零告警**；
+`cargo fmt --check` 1 处（`src/lib.rs` 模块顺序）。
+
+| 目标 | 缺口 |
+|---|---|
+| `truncate_middle` | **全部**（含 `"中".repeat(3000)`、`LINE_SNAP_MAX` 255/256 边界） |
+| `write_file` 越限守卫 | `meta.len() > max_bytes` 触发用例 + 断言**原文件未变** |
+| `resolve_in` | 成功路径（`== fs::canonicalize`）、`../` 越界、沙箱外绝对路径 |
+| `read_file(offset)` | `offset=0` 归一、越界报总行数、CRLF 切行 |
+| `list_files` / `run_command` | 空目录 / 白名单拒绝 / 裸名拒绝 / 退出码非 0 仍 `Ok` |
+| `Executor::run` 四分支尾注 | 全 0（只有 2026-10-27 的手动实测，不防回归） |
+
+判据：**不变量断言优先于逐例精确值** —— `head_end <= tail_start` + 两个切点都 `is_char_boundary`，一条能挡一类错。
+
+**六个待答自习题**（不给答案）：
+
+1. `Truncation::head_lines` 的 `- head_partial as usize`：`head_end == 0` 时 usize 下溢 —— 现在可达吗？用一条测试钉住「不可达」，还是改自洽？
+2. `read_file` 用 `match_indices("\n").nth(skip-1)` 而非 `lines().skip()`：末尾无换行 / CRLF / 超长单行下行为差异？内存各几倍？
+3. `fs::write` **不原子**：中途 Ctrl-C 会留半个文件吗？—— 这决定审批钩子要不要「写临时文件 + rename」。
+4. `run_command` 的 `wait_with_output` 没有超时：白名单命令挂住时发生什么？为什么它与 V1 的 `select!` 是同一件事，不是两件？
+5. `resp.choices.swap_remove(0)`：为什么不是 `remove(0)`？若改成在 `for` 里 take，会撞什么借用错误？
+6. `Logger::record` 在 File sink 下把 ToolResult 压成「N 字节(全文见 log 文件)」—— 这个 N 是**已截断后**的长度，「全文」也不是全文。调试「模型到底看到了什么」时它会怎么骗你？
+
+落点补充（不改 ① 的顺序）：③ 补单测 → **零行为变更重构**（清 5 处 dead_code、删 `ChatRequest`、`parse_kind` 抽 `parse_args`）→ ④ 审批钩子 → ⑤ V0.5。
+V1 内部建议 **eval 先于上下文管理**：上下文是策略，改策略需要能判断变好/变坏的尺子；且 eval 第一版不必跑真模型
+（scripted 假 client 即可，`LlmClient` 的抽取条件「循环跑通」已满足）。
 
 #### 3.6.6 日志层：屏幕与文件的分工（2026-10-30 落地）
 
@@ -4535,6 +4565,9 @@ loop {
 - [ ] **`truncates` / `resolve_in` 两条单测**（`write_file` 侧 2026-10-28 已落地 **`FileHelper` + 4 个独立用例**：
   新建 / 多级父目录（走 `create_dir_all` 重试）/ `../` 越界 / 目标是目录，**断言值与原文、不只 `is_ok`**；写法约定见 **§3.6.5④**）：
   2026-10-27 已用 `Executor::run` **手动端到端**跑过 6 个用例（不超限原样返回 / 5000 行 rg 命中保尾 / 中文多字节 / 20KB 无换行单行 / 真实 `cargo test` 尾部诊断 / `cargo check` 200 错），但这两块**仍是 0 覆盖** —— 手动测不防回归。要补：`truncate_middle("中".repeat(3000), 8192, 0)` 不 panic、`resolve_in(tmp, "../x")` 必须 `Err`、**junction 越界**（`mklink /J` 普通用户可建）、**覆盖已有普通文件**（现在只测了「目标是目录」）
+  🔴 **2026-11-02 核对结果**：`resolve_in` 只测了失败路径（`test_resolve_no_file_err`），`truncate_middle` 仍 **0 覆盖**；
+  另外**`write_file` 的越限守卫（`meta.len() > max_bytes`）也没有用例**——§3.6.5④ 的「守卫触发」那一行还没实现。
+  补测时的判据顺序（先易后难、先防回归后防 panic）：不变量断言（`head_end <= tail_start` + 两个切点都在 `is_char_boundary`）> 逐例精确值。
 - [ ] 安全边界落地：scratch 目录 + **操作审批** + 命令白名单 + 输出截断（路径沙箱 2026-10-22 ✔ / 白名单 ✔ / 截断 ✔；
   「`run_command` 上线时路径检查即失效，必须换 OS 沙箱/白名单/容器」见 §3.5 调研小节）。
   **审批（2026-10-27 重新定型，见 §3.6.5②）**：`Executor.confirm: Box<dyn Fn(&Invocation) -> bool>`，
@@ -4547,7 +4580,7 @@ loop {
   ① ✅ 🔴 **`edit_file(old_string, new_string)`（2026-10-28 已落地）**（5 号工具）—— 让「写」不再要求「手里有全文」，**这才是闭合条件**。
   余 3 条文案 + 1 条语义见 §3.6.3「edit_file 落地后的 review」。
   单测：**`FileHelper`（幂等 guard）2026-10-28 已落地**（`write_file` 4 用例全绿、从无 `tmp/` 的干净状态起跑也绿）；
-  **`edit_file` 的 8+2 用例待铺**（清单与断言要求见 §3.6.5④）。
+  **`edit_file` 8 用例已落地**（2026-11-02 实测 13 passed；10 条清单只缺「文件不存在」，而该场景由 `resolve_in` 失败路径覆盖）。
   三态匹配：`0` / `1` / `n>1` 各自 bail 且文案可行动；`new_string` 允许以 `old_string` 为前缀（插入语义）；
   0 匹配的文案要提「可能是行尾符差异」（实测 `my_api/src` 13 个文件全 LF，当前不踩）。
   「插入」不需要独立工具、也**不要**给 `write_file` 加 `mode:` 参数（§3.4 单一策略决定点）；

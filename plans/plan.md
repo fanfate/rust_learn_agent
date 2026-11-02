@@ -21,6 +21,8 @@
   详见 `plan_v0.md` **§3.6.4**。
 - ✅ 项目已 `cargo init`（`edition = "2024"`）
 - ✅ 前置能力已在 `my_api` 练过，**V2 阶段直接复用**：Axum 路由/中间件 · SQLx + 迁移 · JWT 鉴权 · 错误分层 · 集成测试
+  ⚠️ **不包含 SSE/流式**：`my_api` 全部是 `async fn → Json`，`grep -E "\bSse\b|EventSource|WebSocket|tokio::sync|mpsc|impl Stream"` **零命中**，
+  连 `futures` 都没引入（2026-11-02 实测）⇒ 服务端流式在本仓库仍是新的
 - ✅ 本机工具链：`rustc 1.99.1` / `cargo 1.99.1`
 - ✅ **接入方式已定案（2026-10-16）**：**统一走 OpenAI 兼容接口** —— `POST {LLM_BASE_URL}/chat/completions`。
   这是线上各家与本地推理服务（llama.cpp / Ollama / vLLM…）的**公约数**，所以 **"线上还是本地"不是一道取舍题**：
@@ -87,7 +89,8 @@
 （`!truncated` / 单行超限 / 完整行 / 残行，见 §3.6.5⑦）③ ✅ **日志层 2026-10-30 已落地**（`Logger` +
  `LogKind` + `LogSink`：文案集中在 `log.rs`、`Executor::run` 保持静默、屏幕与文件可不同但必须同源；
  原计划「日志改 `→/←`」作废，见 `plan_v0.md` §3.6.6）+ `truncate_middle` / `resolve_in` 单测（**`write_file` 侧 2026-10-28 已落地
- `FileHelper` 幂等 guard + 4 用例全绿**；`edit_file` 的 8+2 用例待铺，写法约定见 §3.6.5④）④ 操作审批钩子
+ `FileHelper` 幂等 guard + 4 用例全绿**；`edit_file` **8 用例已落地**（2026-11-02 实测；10 条清单里只缺「文件不存在」一条，
+ 而该场景由 `resolve_in` 失败路径覆盖），写法约定见 §3.6.5④）④ 操作审批钩子
   （`Executor.confirm: Box<dyn Fn(&Invocation) -> bool>`，**测试传 `|_| false` ⇒ 无交互可测**）⑤ 之后才进 V1。
   ⚠️ **「意图确认」已拆成两件**：**(a) 操作审批** = V0 收尾（host 强制，行业一致：Codex `approval_policy`、
   Claude Code permission prompt）；**(b) 语义追问**（模型自己停下来问）= **V1 交互式 REPL**，
@@ -147,7 +150,7 @@ Python 改一行 prompt 直接跑；Rust 要等编译，还要跟所有权较劲
 |---|---|---|---|
 | **V0** | 无框架 · 非流式 · CLI · 单文件约 300 行 | 一个能用的命令行 agent | 见 `plan_v0.md` §3.6（含 **dogfooding 一次真实修复**） |
 | **V0.5** | **不写新功能**：拿它去修你别的项目里的一个真 bug | 一份「它在哪里断掉」的记录 | 记录出 **≥3 个真实断点** ⇒ **V1 的范围由断点决定，不由本表决定** |
-| **V1** | 上下文管理 + 流式/取消 + 最小 eval（+ Skill） | 能连续跑多步真实任务、可中断、能被评测 | 流式分片能正确跨 chunk 累积 `tool_calls`；eval 能回答「改了 prompt 是变好还是变坏」 |
+| **V1** | 上下文管理 + 流式/取消 + 最小 eval（+ `grep` 工具 + Skill） | 能连续跑多步真实任务、可中断、能被评测 | 流式分片能正确跨 chunk 累积 `tool_calls`；eval 能回答「改了 prompt 是变好还是变坏」 |
 | **V2** | 接回 `my_api`：会话落 sqlite + Axum 包一层 | `POST /chat` + SSE / WebSocket | 复用 `CurrentUser` 做到会话按用户隔离 |
 | **V3** | MCP client / server · 多后端抽象 | — | **触发条件**：手上真有一个 MCP server 要接，或要把 agent 暴露出去。不是为了「功能表更齐」 |
 
@@ -201,9 +204,9 @@ prompt、砍掉 80% 的通用负担、假定「用户只有一个人且就在旁
 
 | | |
 |---|---|
-| **已完成** | `.env` 三变量 · `config.rs` 五版定稿（方案 C 已落地） · 真实通道 **200** · **实验 2 / 2.5 闭环**（工具调用 → 回灌 → 收尾，prompt cache 命中 256） · **`model.rs` 类型齐了** · **`llm.rs` 真实 200** · **循环跑通**（`for step in 1..=max_steps` + 错误回灌 `Error: {e:#}`） · **四个工具全收工** `read_file`/`list_files`/`write_file`/`run_command`（路径沙箱：读侧 canon、写侧祖先 canon；命令：裸名+白名单+继承环境+三流显式） · **截断按输出性质分派**（命令头+尾、文件只留头） · **`write_file` 大文件拒写守卫**（2026-10-27，阈值传 `max_bytes` 参数） · **`edit_file` 落地**（2026-10-28，三态匹配 + 起始行号取自旧文本，见 §3.6.3 review） · **单测基座 `FileHelper`**（2026-10-28，幂等 guard，`write_file` 4 用例全绿，见 §3.6.5④） · **`read_file` 行号 `offset`**（2026-10-30，四分支尾注见 §3.6.5⑦） · **日志层**（2026-10-30，`Logger`/`LogKind`/`LogSink`，`Executor::run` 保持静默，见 §3.6.6） |
+| **已完成** | `.env` 三变量 · `config.rs` 五版定稿（方案 C 已落地） · 真实通道 **200** · **实验 2 / 2.5 闭环**（工具调用 → 回灌 → 收尾，prompt cache 命中 256） · **`model.rs` 类型齐了** · **`llm.rs` 真实 200** · **循环跑通**（`for step in 1..=max_steps` + 错误回灌 `Error: {e:#}`） · **四个工具全收工** `read_file`/`list_files`/`write_file`/`run_command`（路径沙箱：读侧 canon、写侧祖先 canon；命令：裸名+白名单+继承环境+三流显式） · **截断按输出性质分派**（命令头+尾、文件只留头） · **`write_file` 大文件拒写守卫**（2026-10-27，阈值传 `max_bytes` 参数） · **`edit_file` 落地**（2026-10-28，三态匹配 + 起始行号取自旧文本，见 §3.6.3 review） · **单测基座 `FileHelper`**（2026-10-28，幂等 guard，`write_file` 4 + `edit_file` 8 用例全绿，见 §3.6.5④） · **`read_file` 行号 `offset`**（2026-10-30，四分支尾注见 §3.6.5⑦） · **日志层**（2026-10-30，`Logger`/`LogKind`/`LogSink`，`Executor::run` 保持静默，见 §3.6.6） |
 | **正在写** | 无。**工具层 / 循环层 / 日志层都通了**，`cargo check --all-targets` **零 error**（只剩 5 处 dead_code 告警：`tail_lines`/`tail_partial`/`delete_file`/`check_error`/`check_new`），端到端实测 6 组通过 |
-| **下一个动作** | ✅ ~~① `read_file` 行号 `offset`~~（2026-10-30 已落地，四分支尾注见 `plan_v0.md` §3.6.5⑦）· ✅ ~~② 日志层~~（2026-10-30 已落地：`Logger` + `LogKind` + `LogSink`，见 §3.6.6）→ 🔴 **③ 补单测**（`truncate_middle` / `resolve_in` 仍 0 覆盖；`write_file` 4 + `edit_file` 13 已绿）→ **④ 操作审批钩子** → **⑤ V0.5 真实任务 dogfooding**（从零建 crate + 修注入的 bug，记 ≥3 个断点）→ **⑥ 进 V1**（验收已于 2026-10-27 通过，15 步） |
+| **下一个动作** | ✅ ~~① `read_file` 行号 `offset`~~（2026-10-30 已落地，四分支尾注见 `plan_v0.md` §3.6.5⑦）· ✅ ~~② 日志层~~（2026-10-30 已落地：`Logger` + `LogKind` + `LogSink`，见 §3.6.6）→ 🔴 **③ 补单测**（2026-11-02 实测 **13 passed** = `write_file` 4 + `edit_file` 8 + `resolve_in` 1；缺口见 §五 2026-11-02 核对）→ **④ 操作审批钩子** → **⑤ V0.5 真实任务 dogfooding**（从零建 crate + 修注入的 bug，记 ≥3 个断点）→ **⑥ 进 V1**（验收已于 2026-10-27 通过，15 步） |
 | **验收** | 在 `scratch/my_api` 副本上，说一句"让它通过编译"，agent 自主「读 → 改 → `cargo check` → 读报错 → 再改」，**中途不需介入** |
 | **欠账** | `config.rs` / `truncate_middle` / `resolve_in` / `edit_file` 的单测（`FileHelper` 已就位，剩下的只是铺用例）；`model.rs::ChatRequest` 零调用点待删；**语义追问**（模型主动提问）要等多轮 REPL，属 V1 |
 
@@ -252,11 +255,11 @@ Python 教程（21.9k★）。**当"协议参照 + 概念词典 + 失败模式�
 **V0** → 完整清单见 [`plan_v0.md` §五](./plan_v0.md)（**51 项已勾 / 12 项未勾**，截至 2026-10-28，**验收已通过**）。
 **工具层与循环层已全部打通**：四个工具（`read_file`/`list_files`/`write_file`/`run_command`）都在，
 路径沙箱读侧 canon + 写侧祖先 canon，命令侧裸名+白名单+继承环境+三流显式，截断按输出性质分派；
-`cargo check --all-targets` 零 error 零代码告警，`cargo test` **4 passed**，`Executor::run` 端到端 6 组实测通过
+`cargo check --all-targets` 零 error（2026-11-02 实测：仅 5 处 dead_code），`cargo test` **13 passed**，`Executor::run` 端到端 6 组实测通过
 （含真实 `cargo test` 的尾部诊断、200 个编译错误的头部截断、`LLM_*` 不泄漏且链接正常）。
 
 剩下的 11 项里，**没有一项挡路 V0 验收**：单测（`truncate_middle`/`resolve_in` 仍 0 覆盖，`FileHelper` 基座已就位；
-`write_file` 4 + `edit_file` 13 用例已于 2026-10-28 落地）、~~日志 `→/←` 1 处~~ ✅ 2026-10-30 已落成
+`write_file` 4 + `edit_file` **8** 用例已于 2026-10-28 落地）、~~日志 `→/←` 1 处~~ ✅ 2026-10-30 已落成
 `Logger`（见 `plan_v0.md` §3.6.6）、`ChatRequest` 零调用点 1 处、`spec()` 加一句 flag 1 处，其余是 V1 才要的（`LlmClient`、`usage`、
 `tool_choice:"none"` 收尾、安全边界升级）和「自答 §3.8 的 4 问」。
 **V0 验收已通过（2026-10-27，15 步）。`read_file` 的 `offset` 与日志层均已落地（2026-10-30）⇒ 下一个动作 = 补单测 → 操作审批 → V0.5 实战 → 进 V1**
@@ -275,6 +278,20 @@ Python 教程（21.9k★）。**当"协议参照 + 概念词典 + 失败模式�
 ⚠️ 一并**推翻**了上一版「残行不能给 `offset=b+1`，会死循环」：`LINE_SNAP_MAX` 保证残片 ≥255 字节（实测 40 行×5000B 残片 3192B = 63.8%），
 从残行行首重读预算全新 ⇒ 一定前进；死循环的真正判据是 `head_lines == 0`。详见 §3.6.5⑦。
 
+**2026-11-02 核对（实测，替代上文所有「用例数」之类的数字）**
+
+| 项 | 实测 |
+|---|---|
+| `cargo check --all-targets` | 0 error；**5 处 dead_code**：`Truncation::tail_lines`/`tail_partial`、`FileHelper::delete_file`、`main::check_error`/`check_new` |
+| `cargo clippy --all-targets` | 同一批 dead_code 之外**零告警** ⇒ 风格层零基线，新增告警必是新写的 |
+| `cargo test` | **13 passed** = `edit_file` 8 + `write_file` 4 + `resolve_in` 1（仅失败路径） |
+| `cargo fmt --check` | 1 处：`src/lib.rs` 模块顺序（`pub mod log;` 位置） |
+
+**覆盖空白（这才是 ③ 的真清单）**：`truncate_middle` **0**；`resolve_in` 只有失败路径；`write_file` 的**越限守卫**（`meta.len() > max_bytes`）无用例；
+`read_file`/`list_files`/`run_command`/`Executor::run` 的截断**全 0 覆盖**（只有 2026-10-27 的 6 组手动实测，不防回归）。
+**两处文档漂移**（勿再当事实引用）：① 上文「`edit_file` 13 用例」实际 **8**；②「`edit_file` + `write_file` 守卫均已落地」——
+守卫**只在** `write_file` 里，`edit_file` 无阈值（大概率是设计如此：edit 不盲写整文件，但表述要改）。
+
 **V0.5（下一步的现实形态，2026-10-28 新增）**
 
 - [ ] 拿 agent 去修一个**真实 bug**（`my_api` 之外的、你确实要修的那种），全程记录它断在哪：
@@ -292,7 +309,49 @@ Python 教程（21.9k★）。**当"协议参照 + 概念词典 + 失败模式�
 - [ ] **最小 eval**：把 V0 验收那次「注入 3 个 bug 看能不能修」固定成可重复的（固定任务 + 固定判定）
   —— **没有 eval，后面所有 prompt / 工具改动都是猜**
 
-**第二档 · 低成本可选**：
+**第一档补充 · 三项便宜件**（2026-11-02 讨论后新增，每项 ≤半天，且都是 eval / 上下文的前置）：
+
+- [ ] `ChatResponse` 加 `Option<Usage>`，循环里累计并写日志 —— 成本可见 + 上下文管理的**输入指标**（`cached_tokens` 是裁剪效果的直接信号）
+- [ ] **重复调用检测**：上一步的 `(name, arguments)` 与再上一步相同 ⇒ 回执里加一句提示
+  （实测诱因已存在：`write_file` 声明了没实现白烧 2 步；真实模型也会反复撞同一个错）
+- [ ] **scripted 假 client**：抽 `LlmClient`（抽取条件「循环跑通」已满足）+ `VecDeque<ChatResponse>`，
+  离线测循环三分支（直接收尾 / 一次工具调用后收尾 / 工具报错回灌后仍能收尾）—— 这就是 eval 的种子
+
+**上下文管理的 4 条不变量（2026-11-02，全是「编译器一声不响」型）**
+
+1. **裁剪单位是 turn，不是 message**：`Assistant{tool_calls}` 与紧随其后的那批 `Tool` 必须**整组**增删；只删一半 ⇒
+   `tool_call_id` 无配对 ⇒ 400 或幻觉。建议把历史建模成 `Vec<Turn>`（§3.7.2 已讨论 `enum Turn<'a>`），裁剪 = `drain`，
+   不变量由类型承载，而不是靠「记得别删错」。
+2. **`system` 永不裁**；裁完要补一句「较早 N 轮已省略」—— 否则模型不知道自己忘了什么，会重复动作（已有实测诱因：白烧 2 步）。
+3. **`reasoning_content` 回灌待实测**：现在 `Assistant` 会把 `reasoning_content` 发回去；DeepSeek 系（`deepseek-v4.1-flash`）与
+   OpenAI 的回传规则不一致 ⇒ 这条错，裁剪后必现。**别凭记忆定**。
+4. **压缩（摘要）不在 V1**：它的单位同样是 turn（整组替换），且需要 usage 数据才能定阈值 ⇒ 先有测量，再谈策略。
+
+**执行顺序（2026-11-02 收敛，替代散落的「下一个动作」）**
+
+`补单测`（清单见 `plan_v0.md` §3.6.5⑧）→ `write_file` 守卫用例 → `grep` 工具 → 审批钩子 → V0.5 dogfooding
+→ V1 三件（eval → 上下文裁剪 → 流式取消）。
+中间可插「**零行为变更重构**」（清 5 处 dead_code / 删 `ChatRequest` / `parse_kind` 抽 `parse_args`）——
+它不产生新知识，纯粹是趁测试刚变绿时做（拖到后面就分不清「是我改坏还是本来坏的」）。
+
+**主动停线（2026-11-02 新增）**：V1 三件 + 一次真实任务成功 ⇒ 本项目转**维护模式**（只修 bug，不加功能）。
+V2 的信息量**取决于 V1 做了什么**（2026-11-02 修正：旧说法「技能面与 `my_api` 重叠、信息量最低」不准确 ——
+`my_api` 里 SSE 是零）。若 V1 已做完流式+取消，V2 的 SSE 生产者只是把同一个 `Stream` 接给 `Sse<...>`（≈20 行，无新知）；
+若 V1 没做，V2 会**逼你**补 chunk 边界/UTF-8/取消，但那时顺序是先做 V1。**V2 唯一真新的是「有状态会话 + 双向往返」**
+（并发会话 / 中断恢复 / 审批往返），属服务端会话工程，不是 agent 新知识 ⇒ 仍不挡停线。
+
+**第二档 · `grep` 工具**（2026-11-02：由 `plan_v0.md` §3.5 的「值得做（V1）」正式提到执行序列）
+
+- 判据用 Claude Code 把 `Grep` 从 `Bash` 独立出来的那三条：**要行号 · 要截断 · 要权限粒度**
+- 两条实现路线：**(a)** 复刻 ripgrep 库层（`grep-regex`/`grep-searcher`/`grep-printer` + `ignore`）——
+  ⚠️ ripgrep 的 **CLI 策略在仓库内 `crates/core`，不作为库发布**，所以「哪个文件、输出长什么样」得自己写；
+  **(b)** 手写 `regex` + `ignore` + 遍历（教学价值更高，边缘 case 自己填）。依赖清单与版本 **待 `cargo add --dry-run` 核实**（§0 第 5 条：先说明再确认）
+- **四个设计点（比选哪个 crate 重要）**：① 输出契约 `path:line:content`，行号 **1-based**，与 `read_file` 的 `offset`、
+  cargo 的 `file:line:col` 对齐；② **第三种截断策略**：按**匹配数**封顶 + 报总数 + 指路「收窄 pattern / path」
+  （read 只留头、命令头+尾，这里第一次出现「按条数而非字节」的理由）；③ **跳过要计数**（二进制 / 非 UTF-8 /
+  超大文件 / 被忽略目录）—— 静默跳过等于告诉模型「没有匹配」；④ **单一真相源**：落地后 **从 `ALLOW_CMD` 删掉 `rg`**
+
+**第二档附 · 低成本可选（Skill 等）**：
 
 - [ ] **Skill 支持**（≈1~2 小时，复用现有工具）：`list_skills` = `list_files` 加一层过滤、`read_skill` = `read_file`。
   价值三件：① system prompt 从**硬编码字符串**变成外部可编辑文档 ② **description 本身是 token 预算项**（100 个 skill 的
@@ -315,12 +374,19 @@ Python 教程（21.9k★）。**当"协议参照 + 概念词典 + 失败模式�
 **明确不做**（写下来比记在脑子里有用）：
 
 - 断线重连 / `id` 去重 / `retry` 退避 / 自定义 `event:` 类型
-- 多 provider 抽象 / 子 agent / 上下文压缩算法（抄不过别人，且没有真实约束）
+- 多 provider 抽象 / 子 agent / 上下文压缩算法（抄不过别人，且没有真实约束 ——
+  现在连「窗口爆掉」都**一次没遇到过**，且没有 usage 就不知道阈值该多少；单位同样是 turn 整组替换，属 V1 之后）
+- **把长期记忆做成检索**（向量库 / RAG）：**最小形态已在用** —— `AGENTS.md` + `plans/` 就是跨会话记忆；
+  agent 有工具，**能主动取**，不需要你猜它要什么（与 Skill 那条同一结论）
 
-**V2**
+**V2**（2026-11-02 重新定性：搬运部分 vs 真新部分）
 
-- [ ] 会话与消息落 sqlite（复用 `my_api` 的 sqlx 层 + 迁移工作流）
-- [ ] Axum 包一层：`POST /chat` + SSE / WebSocket
+- [ ] 会话与消息落 sqlite —— **搬的**是 sqlx + 迁移；**新的**是 schema 形状：history 是 agent 的状态
+  （assistant/tool 配对、`tool_call_id` 外键、可恢复位置），不是 CRUD 的行 ⇒ 要等 V1 上下文管理先回答「什么可以丢」
+- [ ] Axum 包一层：`POST /chat` + SSE / WebSocket —— 纯搬运，除非同时做下一条
+- [ ] 🔴 **审批/追问往返（V2 的真目标）**：单向 SSE 不够，需要 `POST /decision` + SSE 推事件（或 WebSocket）
+  —— 这是把「CLI 单发」变成「会话」的临界点，也是 V1 里那件**测不了**的 (b) 语义追问唯一能落地的地方
+  （模型停下来等一个后续 user message ⇒ 它问完不会随进程结束而丢）
 - [ ] 鉴权复用 `CurrentUser` → 会话按用户隔离
 
 **V3**
@@ -375,6 +441,26 @@ Python 教程（21.9k★）。**当"协议参照 + 概念词典 + 失败模式�
 **复利**：`chunk 边界不可控 + 增量状态` 这个模式，在 MCP 的 stdio 流、日志 tail、WebSocket 里会再出现一遍。
 另外它恰好是「**编译器一声不响**」的典型（切坏 UTF-8、丢事件，全编得过）⇒ 按 §2.1 的分界线，**属于自己写那一列**。
 
+#### 5.1.1 服务端侧（V2 才碰）：旧判断「Rust 的 SSE 跟 Python 的 `yield` 差别不大」是错的（2026-11-02）
+
+**错在最关键的地方**：`yield` 是 Python 的**语言特性**，而 Rust **没有 generator**（`gen` block 至今 unstable）。
+反向判据：**「Rust 里这件事和 Python 差不多」通常意味着还没碰到需要自己写状态机那一层。**
+
+生产者只有三种形态，代价不同：
+
+| 形态 | 代价 |
+|---|---|
+| `async_stream::stream!` 宏 | 引入第三方 crate；本质是展开成状态机 |
+| 手写 `impl Stream` + `poll_next` | 零依赖，但要自己管状态与 `Pin` |
+| `tokio::sync::mpsc` + 循环里 push | 最简单；起一个会话任务，消费者 `ReceiverStream` |
+
+接上 axum 只有一步：`Sse<impl Stream<Item = Result<Event, E>>>`（传输层 ≈20 行）——**难的全在生产者之后**：
+
+- **客户端断开 = 你的 future 被 drop** ⇒ 取消是 **RAII 语义**，不是 `GeneratorExit`；不显式处理 = agent 继续烧 token
+  （与 §5.1 的 `CancellationToken` 是同一件事，只是触发源从 Ctrl-C 变成对端关闭）
+- **背压是显式的**（bounded channel / `poll_ready`），Python 是隐式 `await`
+- 头已经发 200 后，中途错误只能编码成 event（这条 Python 也一样，不算新知）
+
 ---
 
 ## 六、通用提醒
@@ -383,3 +469,13 @@ Python 教程（21.9k★）。**当"协议参照 + 概念词典 + 失败模式�
   编译器和源码不会说谎。这条上个项目已经验证过多次。
 - **时间预期**：doc §5.3 那句仍然成立 —— "核心代码也就这么一个循环"是极度乐观的说法，
   真正的活在流式、可靠性、上下文那一圈。**按两周以上算，不是"一个周末"。**
+
+---
+
+## 七、V1 之后的学习路线（2026-11-02，只留指针）
+
+- **项目内（本文件管辖）**：P0 = §五 第一档三件 + 三项便宜件 → 到主动停线后转维护模式。
+- **个人长期路线（Rust / 函数式 / wasm / ECS 的取舍与顺序）不入库**：见本地 `plans/others/learning-roadmap.md`
+  （`.gitignore` 第 41 行已忽略 `plans/others/`）。
+- 结论一句话：那几个兴趣是**同一条轴（表达力/正确性）的三个刻度**，不是三个方向；同一时间只允许**一条轴主动推进**，
+  岔路 ≤3 周且必须回答「它回流到主线了吗」。
