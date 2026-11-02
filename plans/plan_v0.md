@@ -2757,7 +2757,7 @@ blanket impl），已实测编译通过。
    ② 「真 env 优先」要自己实现（`Config::from_map(&get)` 正好是这个注入点 —— functional core 的价值在这里兑现）。
    ⇒ **列为 V1 前可选升级，V0 不做。**
 2. **回执比名义预算多 ~84~120 字节**（2026-10-30 四分支实测：`flat` 8245 / `longline` 8312 / `oneline` 8294 / `crlf` 8276
-   vs `max_bytes` 8192）：省略标记是切完之后**追加**的 ⇒ `max_bytes` 的语义是「**正文预算**」，不是「整份回执硬上限」。
+   vs `max_bytes` **8000**（旧值 8192，见 §3.6.5⑦(e)）：省略标记是切完之后**追加**的 ⇒ `max_bytes` 的语义是「**正文预算**」，不是「整份回执硬上限」。
    **2026-10-30 定案（用户指出，推翻「是个待修的小问题」）**：这不是问题 —— 该常量管的是「工具结果本身能占多少字节」，
    尾注是元信息，长度由我们自己控制且有界（≤~120B），不该为它引入「先算文案长度 → 再按剩余预算切正文」的两遍耦合。
    真要硬上限，**调小常量**比在截断里预留更直白。⚠️ 唯一耦合：`write_file` 的大文件拒写守卫读的是**同一个** `max_bytes`，
@@ -2816,7 +2816,7 @@ blanket impl），已实测编译通过。
 
 #### 3.6.3 已知限制：长文件「读一半再整文件写回」会静默丢内容
 
-`read_file` 是**头部**截断（`MAX_TOOL_OUTPUT` = 8192），`write_file` 是**整文件覆盖** ⇒
+`read_file` 是**头部**截断（`MAX_TOOL_OUTPUT` **现为 8000**，旧值 8192），`write_file` 是**整文件覆盖** ⇒
 对一个 >8192 字节的文件「读一半 + 写回」= 后半段消失，而回执仍然报「成功写入 N 字节」，看不出异常。
 实测 `my_api/src/auth.rs` = **18,488 字节**，`truncate_head_tail(8192)` 后中间 **10,368 字节**不可见
 （该区段里 `SqlitePool` 出现 7 次）。
@@ -3364,33 +3364,77 @@ fn truncate_head_tail(text: String, max_bytes: usize) -> String  // (max - max/4
 
 - `tail_lines` / `tail_partial` 现在 **never used**（`truncate_head_tail` 改用 `omitted_bytes()`），`cargo check` 报 `201:8`。
   按 ⑥ 的判据它们是**方法**不是字段，留着零成本，等「head+tail 两段各自行号」出现真实消费者再用。
-- 超长行文案里的 `8192` 是**硬编码**，与 `Executor.max_bytes` 字段重复 ⇒ 按「字段存在即授权」应插值 `self.max_bytes`（纯文案，待改）。
+- 超长行文案里的 `8192` 是**硬编码** ⇒ ✅ **2026-11-02 已修：改为插值 `self.max_bytes`**。根因查清（git 历史）：`MAX_TOOL_OUTPUT` 原本是 `8 * 1024`（=8192），在 `1ee1968`（read tool 的 offset）里改成 **8000**，
+  但**文案和文档没跟着改** ⇒ 同一个数字三种记录（代码 8000 / 文案 8192 / 本文档 8192）。由 `test_run_read_long_line` 抓到：
+  8192 字节的行确实被截断（>8000），而文案自称上限 8192 ⇒ 模型会认为「我这行正好 8192，不该超」。
+  测试改成断言 `contains(&MAX_TOOL_OUTPUT.to_string())` ⇒ 谁也别再把数字写死。**教训：字面量 vs 常量，两处以上的数字早晚打架。**
 - `raw.lines().count() + skip` 反推总行数是**第二个真值来源**（真值只有 `read_file` 手里有）。当前算术正确（N=40 实测 `39+1`），
   但若将来 `read_file` 改成自截 + 自拼尾注，这份反推必须一起删 —— 否则两个来源迟早漂。
 
 对比 ⑥ 的结论，⑦ 没有推翻它：`Truncation` 仍然只装两个切点、仍然只提供边界与边界的算术。
 被推翻的只是**「边界之后该怎么说话」**这一层判断 —— 而这层本来就不属于 core。
 
-**⑧ 单测覆盖核对 + 待答自习题（2026-11-02，实测）**
+**⑧ 单测覆盖核对 + 测试 backlog（2026-11-02）**
 
-`cargo test` **13 passed** = `edit_file` 8 + `write_file` 4 + `resolve_in` 1（仅失败路径）；
-`cargo check --all-targets` 0 error + 5 处 dead_code；`cargo clippy --all-targets` 除 dead_code 外**零告警**；
+实测：`cargo test` **21 passed** = `edit_file` 8 + `write_file` **5**（含 `test_write_guard`）+ `resolve_in` 1 + `truncate` 2 + `run_read` **5**；
+`cargo check --all-targets` 0 error + **3 处 dead_code**（`delete_file`/`check_error`/`check_new`；`tail_lines`/`tail_partial` 已删除）；`cargo clippy` 除 dead_code 外**零告警**；
 `cargo fmt --check` 1 处（`src/lib.rs` 模块顺序）。
 
-| 目标 | 缺口 |
-|---|---|
-| `truncate_middle` | **全部**（含 `"中".repeat(3000)`、`LINE_SNAP_MAX` 255/256 边界） |
-| `write_file` 越限守卫 | `meta.len() > max_bytes` 触发用例 + 断言**原文件未变** |
-| `resolve_in` | 成功路径（`== fs::canonicalize`）、`../` 越界、沙箱外绝对路径 |
-| `read_file(offset)` | `offset=0` 归一、越界报总行数、CRLF 切行 |
-| `list_files` / `run_command` | 空目录 / 白名单拒绝 / 裸名拒绝 / 退出码非 0 仍 `Ok` |
-| `Executor::run` 四分支尾注 | 全 0（只有 2026-10-27 的手动实测，不防回归） |
+**backlog 按「静默失败风险 × 出过 bug 的历史」排，不按覆盖率排**
 
-判据：**不变量断言优先于逐例精确值** —— `head_end <= tail_start` + 两个切点都 `is_char_boundary`，一条能挡一类错。
+**P1（先做，做完截断层就有回归网；#1 #3 已于 2026-11-02 落地）**
 
-**六个待答自习题**（不给答案）：
+| # | 目标 | 断言要点 | 为什么值这个价 |
+|---|---|---|---|
+| 1 ✅ | **`Executor::run` 的 `ReadFile` 四分支**（已落地 5 条） | ① 未截断 → **逐字节等于**原文（无尾注）② `head_lines==0` → 含 `rg -n`、**不含** `offset=` ③ 完整行 → `1-N 行` 且 `offset=N+1` ④ 残行 → 含「仅前 K 字节」，K 独立算 ⑤ `offset=3` → `a=3`、`b=skip+head_lines` | **0 覆盖**；唯一把三个谓词组合起来的地方；`b` 的 off-by-one 真实出过事；也是 `max_bytes × offset` 唯一相乘处 |
+| 2 | **`truncate_middle` 不变量 + 吸附真值表** | 生产配置 `(8000,0)`/`(6000,2000)`（`truncate_head_tail` = `max - max/4`）：`he>=1`、两切点 `is_char_boundary`、`he<=ts`、`len-ts<=tail`；吸附：行内且距尾 <256；不吸附：20KB 无换行；**255 vs 256** 两条；另加 `(0,8)` 退化用例记录契约 | 手写用例想不到切点，不变量一条挡一类错 |
+| 3 ✅ | **`write_file` 越限守卫**（已落地 `test_write_guard`） | 造 `MAX_TOOL_OUTPUT+1` 字节 → `Err` 含「文件过大」，**读回断言原文一字未变** | 要测的是「`bail!` 在 `fs::write` **之前**」，只断言「有错」测不出顺序 |
 
-1. `Truncation::head_lines` 的 `- head_partial as usize`：`head_end == 0` 时 usize 下溢 —— 现在可达吗？用一条测试钉住「不可达」，还是改自洽？
+**P1 复核（2026-11-02 二次复核：已闭环项 + 仍缺项）**
+
+✅ **已闭环（勿再当缺口）**
+
+- **`test_write_guard` 一条顶四条**：`max_bytes = 10`（**≠ 常量**）⇒ 钉住「阈值走参数」；`10+1` 字节文件 → `Err` 且含阈值数字 + 原文未变；
+  再以 `max_bytes + 1` 重写同一文件 → `Ok` 且内容变为 `"b"` ⇒ 同时钉住「`>` 不是 `>=`」与「写真的发生了」。
+- `mult_lines_offset` / `mult_big_lines`：造数据改成 `(0..2000)` / `(0..10)`；且 `n` 改成在 `offset_content`（**offset 切出来的 raw**）上算 ⇒ 期望值不再依赖「行宽恒定」这个巧合。
+
+🔴 **仍缺：无**（2026-11-02 二次修完：`(0..2000)` + `offset={n+1}` 均已落地，21 passed）。
+⚠️ 仅剩可选：三条用例各自重算「切成多少行」⇒ 改一处要改三处；抽 `fn head_complete_lines(content: &str) -> usize` 即可（不挡路）。
+
+**P2（各 5~15 分钟）**
+
+| # | 目标 | 断言要点 |
+|---|---|---|
+| 4 | `resolve_in` | 成功路径 **`assert_eq!`** 与 `fs::canonicalize(root.join(p))` 相等；`../` 与沙箱外绝对路径各一条 `Err` 含「越界」；junction（`mklink /J`，可 `#[ignore]`） |
+| 5 | `run_command` | 白名单拒绝（`powershell`）· 裸名拒绝（带路径）· **非零退出仍 `Ok`**（`cargo no-such-subcmd` ≈101）· 空段不打标签 |
+| 6 | `read_file(offset)` | `offset=0` ≡ 1 · 越界 → `Err` 含总行数 · 末尾无换行 · **CRLF**（错误文案承诺过 CRLF 提示但没测） |
+| 7 | `list_files` | 空目录 → `"空目录"` · `[DIR]`/`[FILE]` 前缀 · 排序稳定 |
+
+**P3（协议层，便宜且防「静默改协议」）**
+
+| # | 目标 | 断言要点 |
+|---|---|---|
+| 8 | `Message` 序列化 | `Assistant{tool_calls: vec![], reasoning_content: None}` → JSON **只有** `role`+`content`；`Tool` 的键名；用 `to_value` 逐键比 |
+| 9 | `parse_kind` | 多余字段 → `WrongParams`（`deny_unknown_fields`）· 缺 `offset` → `Err` · `replace_all` 缺省 `false` · 未知名 → `from_name` 返回 `None` |
+| 10 | `ToolKind::ALL` 防漂移 | 长度 · 名字唯一 · `from_name(t.name()).unwrap().name() == t.name()`（`ToolKind` 没 derive `PartialEq`，用 `name()` 比） |
+
+**不测（写下来比记在脑子里管用）**
+
+- `Logger` 的**终端文案**（改一个字就红）⇒ 只测一条事实：File sink 压 `ToolResult`、Console 不压
+- 死代码（`delete_file` / `check_error` / `check_new`）：是删或接线，不是测试
+- `truncate_head_tail` 的整句文案 ⇒ 只断言「中间省略 **N** 字节」里的 N
+- **`tail_lines` / `tail_partial`：删，不给它写测试** —— 无消费者 ⇒ 语义不可判定（`"klmn"` 算 0 还是 1 两种口径都自洽）
+
+**判据**：期望值**独立算**（不用被测函数生成期望）· 否定路径断言**原文未变** ·
+新增一条：**每条用例失败时必须能说出「哪个决定坏了」**，说不出就是测了实现细节。
+**节奏**：先 1+3 → 2 → 4~7 逐个；1~3 完成后截断层有回归网，之后 grep 工具 / 审批钩子动这块才安全。
+
+**待答自习题**（#1 已答，余 5 条；不给答案）：
+
+1. ✅ **已答（2026-11-02，实测）**：`head_end == 0` **可达**，条件是 `head_bytes < 首字符的 UTF-8 宽度`（实测：0/1/2 对 3 字节汉字，0/1 对 `é`；ASCII 只有 0）。
+   修法是在**谓词**而不是消费端：`head_partial` 加 `head_end > 0`（空头没有「残行」），不用 `saturating_sub` ——
+   修完两个谓词同形 `0 < x < len && !text[..x].ends_with('\n')`，两个条件各自承重（缺 `>0` ⇒ `he=0` 下溢；缺 `<len` ⇒ `"abc"` 的 `head_lines` 从 1 变 0）。
+   一并确认：**`head_lines == 0` 是规格不是 bug** —— 它正是「第 a 行超过单行上限」的判据（四分支之首）。教训：**测试失败先问「我的期望值有规格吗」**。
 2. `read_file` 用 `match_indices("\n").nth(skip-1)` 而非 `lines().skip()`：末尾无换行 / CRLF / 超长单行下行为差异？内存各几倍？
 3. `fs::write` **不原子**：中途 Ctrl-C 会留半个文件吗？—— 这决定审批钩子要不要「写临时文件 + rename」。
 4. `run_command` 的 `wait_with_output` 没有超时：白名单命令挂住时发生什么？为什么它与 V1 的 `select!` 是同一件事，不是两件？

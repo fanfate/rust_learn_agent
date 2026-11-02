@@ -198,16 +198,9 @@ impl Truncation {
     fn head_lines(&self, text: &str) -> usize {
         text[..self.head_end].lines().count() - self.head_partial(text) as usize
     }
-    fn tail_lines(&self, text: &str) -> usize {
-        text[self.tail_start..].lines().count() - self.tail_partial(text) as usize
-    }
+
     fn head_partial(&self, text: &str) -> bool {
-        self.head_end < text.len() && !text[..self.head_end].ends_with("\n")
-    }
-    fn tail_partial(&self, text: &str) -> bool {
-        self.tail_start > 0
-            && self.tail_start < text.len()
-            && !text[..self.tail_start].ends_with("\n")
+        self.head_end > 0 && self.head_end < text.len() && !text[..self.head_end].ends_with("\n")
     }
 }
 
@@ -435,8 +428,9 @@ impl Executor {
                     let (show_content, _) = truncation.split(&raw);
                     if truncation.head_lines(&raw) == 0 {
                         Ok(format!(
-                            "{show_content}...[第 {} 行超过单行上限 8192 字节，本工具无法整行返回, 原文共 {} 行；请用 rg -n 定位查看]",
+                            "{show_content}...[第 {} 行超过单行上限 {} 字节，本工具无法整行返回, 原文共 {} 行；请用 rg -n 定位查看]",
                             skip + 1,
+                            self.max_bytes,
                             full_lines,
                         ))
                     } else if !truncation.head_partial(&raw) {
@@ -470,7 +464,13 @@ impl Executor {
 
 #[cfg(test)]
 mod test {
+    use crate::model::ReadFileArg;
+
     use super::*;
+
+    fn exec(root: &Path) -> Executor {
+        Executor::new(&root.to_string_lossy()).unwrap()
+    }
 
     struct FileHelper {
         path: PathBuf,
@@ -533,6 +533,7 @@ mod test {
         assert!(format!("{err:#}").contains("无法解析"));
     }
 
+    // test write file
     #[test]
     fn test_write_ok() {
         let root_file = FileHelper::new("test_write_ok");
@@ -574,6 +575,26 @@ mod test {
         assert!(format!("{err:#}").contains("目标已存在"));
     }
 
+    #[test]
+    fn test_write_guard() {
+        let max_bytes = 10;
+        let root_file = FileHelper::new("test_write_guard");
+        root_file.create_file("a.txt", "b".repeat(max_bytes + 1).as_str());
+        let root = root_file.root();
+
+        let p = resolve_for_write(root, "a.txt").unwrap();
+        let s = write_file(&p, "b", max_bytes);
+        let err = s.unwrap_err();
+        assert!(format!("{err:#}").contains("过大"));
+        assert!(format!("{err:#}").contains(&max_bytes.to_string()));
+        assert_eq!(fs::read_to_string(&p).unwrap(), "b".repeat(max_bytes + 1));
+
+        let s = write_file(&p, "b", max_bytes + 1);
+        assert!(s.is_ok());
+        assert_eq!(fs::read_to_string(&p).unwrap(), "b");
+    }
+
+    // test edit file
     #[test]
     fn test_edit_ok() {
         let root_file = FileHelper::new("test_edit_ok");
@@ -678,5 +699,128 @@ mod test {
         assert!(format!("{err:#}").contains("找到多处旧文本匹配"));
         let r_s = fs::read_to_string(&p).unwrap();
         assert_eq!(r_s.as_str(), "123456\n123456\n123456\n");
+    }
+
+    // test truncate
+    #[test]
+    fn test_truncate_not_truncated() {
+        let origin_text = "abc";
+        let t = Truncation::get_truncate(origin_text, 8, 0);
+        assert!(!t.is_truncated());
+    }
+
+    #[test]
+    fn test_truncate_over_head() {
+        let origin_text = "abcdefghijklmn";
+        let t = Truncation::get_truncate(origin_text, 4, 0);
+        let h_line = t.head_lines(origin_text);
+        assert_eq!(h_line, 0);
+    }
+
+    // test Executor::run
+    #[test]
+    fn test_run_read_ok() {
+        let root_file = FileHelper::new("test_run_read_ok");
+        let read_path = "a.txt";
+        root_file.create_file(read_path, "abc");
+
+        let s = exec(root_file.root())
+            .run(&Invocation::ReadFile(ReadFileArg {
+                path: "a.txt".to_string(),
+                offset: 1,
+            }))
+            .unwrap();
+
+        assert_eq!(s, "abc");
+    }
+
+    #[test]
+    fn test_run_read_long_line() {
+        let root_file = FileHelper::new("test_run_read_long_line");
+        let read_path = "a.txt";
+        root_file.create_file(read_path, "a".repeat(8001).as_str());
+
+        let s = exec(root_file.root())
+            .run(&Invocation::ReadFile(ReadFileArg {
+                path: "a.txt".to_string(),
+                offset: 1,
+            }))
+            .unwrap();
+
+        assert!(s.contains("rg -n"));
+        assert!(s.contains("无法整行返回"));
+        assert!(s.contains(&MAX_TOOL_OUTPUT.to_string()));
+    }
+
+    #[test]
+    fn test_run_read_mult_lines() {
+        let root_file = FileHelper::new("test_run_read_mult_lines");
+        let read_path = "a.txt";
+        let content = (0..2000).fold("".to_string(), |r, acc| format!("{r}line {acc}\n"));
+        root_file.create_file(read_path, &content);
+
+        let s = exec(root_file.root())
+            .run(&Invocation::ReadFile(ReadFileArg {
+                path: "a.txt".to_string(),
+                offset: 1,
+            }))
+            .unwrap();
+
+        let n = if content[..MAX_TOOL_OUTPUT].ends_with("\n") {
+            content[..MAX_TOOL_OUTPUT].lines().count()
+        } else {
+            content[..MAX_TOOL_OUTPUT].lines().count() - 1
+        };
+
+        assert!(s.contains(format!("只返回 1-{n} 行").as_str()));
+        assert!(s.contains(format!("offset={}", n + 1).as_str()));
+        assert!(s.contains("原文共 2000 行"));
+    }
+
+    #[test]
+    fn test_run_read_mult_big_lines() {
+        let root_file = FileHelper::new("test_run_read_mult_big_lines");
+        let read_path = "a.txt";
+        let content = (0..10).fold("".to_string(), |r, acc| {
+            format!("{r}{} {acc}\n", "lines".repeat(1000))
+        });
+        root_file.create_file(read_path, &content);
+
+        let s = exec(root_file.root())
+            .run(&Invocation::ReadFile(ReadFileArg {
+                path: "a.txt".to_string(),
+                offset: 1,
+            }))
+            .unwrap();
+
+        let k = MAX_TOOL_OUTPUT - content[..MAX_TOOL_OUTPUT].rfind("\n").map_or(0, |p| p + 1);
+        assert!(s.contains(format!("仅前 {k} 字节").as_str()));
+    }
+
+    #[test]
+    fn test_run_read_mult_lines_offset() {
+        let root_file = FileHelper::new("test_run_read_mult_lines_offset");
+        let read_path = "a.txt";
+        let content = (0..2000).fold("".to_string(), |r, acc| format!("{r}line {acc}\n"));
+        root_file.create_file(read_path, &content);
+
+        let s = exec(root_file.root())
+            .run(&Invocation::ReadFile(ReadFileArg {
+                path: "a.txt".to_string(),
+                offset: 3,
+            }))
+            .unwrap();
+
+        let offset_content = (2..2000).fold("".to_string(), |r, acc| format!("{r}line {acc}\n"));
+
+        let n = if offset_content[..MAX_TOOL_OUTPUT].ends_with("\n") {
+            offset_content[..MAX_TOOL_OUTPUT].lines().count()
+        } else {
+            offset_content[..MAX_TOOL_OUTPUT].lines().count() - 1
+        };
+
+        assert!(s.contains(format!("只返回 3-{} 行", n + 2).as_str()));
+        assert!(s.contains(format!("offset={}", n + 3).as_str()));
+        assert!(s.contains("原文共 2000 行"));
     }
 }
