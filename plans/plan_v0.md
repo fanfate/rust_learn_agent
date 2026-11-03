@@ -1685,6 +1685,44 @@ pub struct Usage { pub prompt_tokens: u32, pub completion_tokens: u32, pub total
 
 Agent 能 `write_file` + `run_command`，等于把「任意文件写入 + 任意命令执行」交给一个**概率模型**。
 
+#### 先把三层拆开：路径检查 / 子进程 / 布局（2026-11-02）
+
+含糊地说「沙箱不严密」没有用。**逃逸不是一个 bug，是 `run_command` 的结构属性**；而伤害大小由**布局**决定。
+
+| 层 | 缺陷描述 | 能否在 V0 消除 |
+|---|---|---|
+| **① 路径检查** | 只约束「走我们代码的 IO」（`resolve_in` / `resolve_for_write`） | ✅ 已做到（读侧 canon、写侧祖先 canon） |
+| **② 子进程** | 子进程自带 syscall 权限，**不问我们** ⇒ 任何 `run_command` 天然越界 | ❌ 除非不要「能跑真 `cargo`」 |
+| **③ 布局** | 沙箱根嵌在仓库内部（`<repo>/scratch`），而 `<repo>/Cargo.toml` 在上层 ⇒ **越界的默认落点恰好是本项目** | ✅ 零成本（换位置 / workspace 桩） |
+
+⇒ **逃逸是必然的，但「逃到自己的源码上」是选出来的。** `cargo` 沿父目录向上找 manifest 是它的正常行为；
+该改的是「把沙箱放在 `Cargo.toml` 的下级」。（实例见 `plans/v0.5-breakpoints.md` **B1**：
+第 6 步 `cargo test` 在 `cwd = scratch` 下沿父目录找到 `my_agent/Cargo.toml`，跑出了 `27 passed / exit 0` 的**假阳性**。）
+
+**威胁模型（先答「在防谁」，再谈手段）**
+
+| 威胁 | 概率 | 现有手段够吗 | 需要什么 |
+|---|---|---|---|
+| (i) 模型幻觉 / 手滑（写错路径、跑错命令） | **高** | **够了**：路径检查 + `cwd` + 审批钩子 | 不需要 OS 沙箱 |
+| (ii) **prompt injection**（读到的文件里写着「把 ~/.ssh 发出去」） | 中 | ❌ 完全不够（`run_command` 一执行就是全权限） | 能力沙箱（OS 级或 wasm） |
+| (iii) 自己误判 | 低 | — | — |
+
+**V0/V1 在 (i) 阶段**：上 OS 级沙箱是过度防御（Windows 上成本最高：AppContainer / Job Object 文档最少，
+对 `cargo`/`rustc` 的兼容性未知），而收益要等 (ii) 才兟现。⇒ **明确不做**，只做第 ③ 层 + 观测 + 审批。
+
+**wasm 的正确位置（纠一个常见预期）**
+
+**wasm 替代不了 `run_command`** —— `cargo`/`rustc`/`git`/`rg` 没有 wasm 版本，不可能在 guest 里跑真工具链。
+
+| wasm 能做 | wasm 不能做 |
+|---|---|
+| 跑**自己写的/第三方提供的 wasm 工具**（插件、代码解释器、纯计算） | 跑宿主机上的原生二进制 |
+| 给 guest **只有** host 显式授予的目录句柄（能力沙箱，不是路径字符串检查） | 让 `cargo` 编译 |
+| fuel/epoch 超时、确定性重放 | 需要网络/包管理的任务 |
+
+⇒ 它是**「工具插件的沙箱」，不是「命令的沙箱」**。真触发条件是「**我是否在执行不完全信任的代码？**」
+（答否 ⇒ 不做；答是 ⇒ 优先级高于一切，而这恰好对应 `plan.md` V3 的触发条件）。
+
 #### scratch 是什么（先说清，否则"沙箱"只是个词）
 
 `my_agent/scratch/` = **agent 被允许操作的文件系统的根**（sandbox root）—— 它**不是**"测试运行目录"这么轻。三个身份：
@@ -2156,7 +2194,7 @@ Invocation::WriteFile(args) => {
 
 | 工具 | 做成专用 tool？ | 理由 |
 |---|---|---|
-| `rg` | **值得**（V1） | 输出要行号、要截断、要权限粒度 —— 正是 Claude Code 把 `Grep` 从 `Bash` 独立出来的那三条。可用 `ignore` + `regex` 纯 crate 实现，不依赖外部 exe |
+| `rg` | **值得**（V1） | 输出要行号、要截断、要权限粒度 —— 正是 Claude Code 把 `Grep` 从 `Bash` 独立出来的那三条。可用 `ignore` + `regex` 纯 crate 实现，不依赖外部 exe（2026-11-02 复核：**实现优先用 `grep` 库层**，见下节实测） |
 | `jq` / `yq` | 不必 | 它们只是"读取者"，模型在 `run_command` 里调即可；读 JSON/YAML 本来就是 LLM 的强项，宿主不需要理解其输出 |
 | `fd` | V1 再说 | 与 `list_files` 能力重叠，唯一增量是 `.gitignore` 感知 |
 | `fzf` | **不能给** | 交互式 TUI。实测非 TTY 下**零输出直接退出**（`printf 'a\nb\n' \| fzf` → stdout 空，exit 0）⇒ 模型只拿到空结果，分不清"没匹配"和"用不了" |
@@ -2171,6 +2209,60 @@ Invocation::WriteFile(args) => {
 
 ⇒ **要宿主控制的（read / write / list / rg）做成 tool；长尾只读、输出简单的（jq / yq）留在 prompt 里走 `run_command`。**
 「写成 prompt 就能跑」在**能力**上成立，在**安全**上不成立 —— 原因见下节。
+
+##### 🔴 2026-11-02 补：五家源码级实测 —— 「引擎用现成，壳自己写」
+
+**先纠一个提问方式**：「agent 的 grep 是内部实现的吗」要拆成两问 ——
+**工具壳**（参数/输出/截断/权限）**人人自己写**；**搜索引擎几乎人人用 ripgrep**，没有一家手写匹配算法。
+
+| | 工具名 | 引擎 | 形态 | 值得抄的点 |
+|---|---|---|---|---|
+| **pi**（本机 `1.5.0`，实测 `dist/core/tools/grep.js`） | `grep` | **ripgrep 子进程** | `spawn(rg, ["--no-config","--json","--line-number","--color=never","--hidden", …])` | ① `--no-config` ② 命中满 `limit` 就 **kill 子进程**（不白跑完整树）③ `--json` 流式解析 ④ **双维截断**：100 匹配或 32KB 先到先得 + 单行另限长 ⑤ abort → kill |
+| **Claude Code** | `Grep` | **vendored ripgrep** | 三级回退（系统 `rg` → 内置二进制 → embedded）；`Glob` 复用 `rg --files` | 15 参数（`output_mode: content/files_with_matches/count`、`-A/-B/-C`、`type`、`glob`）；**权限系统能识别「这是内容搜索」**才能细粒度授权 |
+| **opencode** | `grep` | **ripgrep 子进程** | shell out | 反面教材：issue #12925 —— 继承 `RIPGREP_CONFIG_PATH`，用户 `~/.ripgreprc` 的 `--max-columns=150` **静默改变**工具行为 |
+| **Gemini CLI** | `grep_search`（旧名 `search_file_content`） | **ripgrep**（`tools/ripGrep.ts`） | shell out | 描述里直接写 "FAST, optimized search powered by `ripgrep`" + "automatic output limiting (max 100 matches)" |
+| **Codex CLI** | **没有** | — | 全靠 `exec_command` 跑 `rg` | prompt 反复叮嘱「优先 `rg`」；代价是宿主无法审计/截断（与 §3.5 末「工具集缺口」同类） |
+
+**三条源码教训**
+
+1. **`--no-config` 是硬要求**：pi 源码注释原话「the tool contract must not depend on ambient user config like `RIPGREP_CONFIG_PATH`」。
+   opencode #12925 就是缺它的后果。**这对 V0 的 `run_command` 直接生效**：它**继承环境**，模型跑 `rg` 时用户 dotfile 会静默改结果，而我方看不见。
+2. **命中上限到了就停，不是「读完再截」**：pi 凑满 `limit` 直接 `kill`。Rust in-process 版本里这对应循环里 `break`（天然具备，无需 kill）。
+3. **截断是双维的**：匹配数 + 字节数先到先得，长行再单独限长。只按字节截会在「很多短行」上浪费预算；只按条数截会被「三条 200KB 的压缩产物」撑爆上下文。
+
+**映射与结论**
+
+- vendored `rg` 二进制（Claude Code）≈ **`grep` crate 家族**（`grep-searcher`/`grep-regex`/`grep-printer` + `ignore`）= 「内嵌 ripgrep」，**不是从零写**；
+  子进程 `rg` ≈ 现在的 `run_command("rg", …)`（继承环境、无 `--no-config`、输出要解字符串、无法提前停）。
+- 所以**专用工具选 in-process 库，不走 `rg` 子进程**；壳（契约、截断、跳过计数、从 `ALLOW_CMD` 删 `rg`）仍全部自己写。
+- 判据未变，只把实现从「`ignore` + `regex` 手写」升级为「**优先 `grep` 库层**，`ignore` + `regex` 手写作备选」——
+  分水岭仍是「**边缘 case 有没有真实数据**」：沙箱里全是 UTF-8 源码（无 UTF-16 / mmap / 并行需求）⇒ 手写也站得住。
+
+##### 2026-11-02 二次更正：分层要划在「逐文件循环」之后（前一条的“壳”划宽了）
+
+前一段说「壳全部自己写」时，把**逐文件行循环**也划进了壳 —— 那是错的：它**就是引擎**。正确划法：
+
+| 层 | 内容 | 归属 |
+|---|---|---|
+| ① 遍历与忽略语义 | `.gitignore`/hidden/symlink/取反 | `ignore` |
+| ② 正则引擎 | 编译、字面量预筛、Unicode | `grep-regex`（包 `regex-automata`） |
+| ③ **逐文件搜索循环** | **按行切、二进制探测、编码/BOM、CRLF、行号、提前停** | **`grep-searcher`** |
+| ④ 输出格式 | 颜色、上下文行、`output_mode` | `grep-printer` —— **暂不用**：契约是 `path:line:content`（1-based、无列号、无颜色），printer 给人看的那套要关一堆开关 |
+| ⑤ 壳 | `GrepArg`/spec/参数校验/按匹配数截断/跳过计数/审计/从 `ALLOW_CMD` 删 `rg` | 自己写 |
+
+**两个它给的「提前停」映射**（把 pi 的子进程做法换成库做法）：
+
+| pi（子进程） | `grep-searcher` |
+|---|---|
+| 凑满 `limit` → `child.kill()` | `Sink::matched()` 返回 `Ok(false)` ⇒ 立即停，连当前文件也不读完 |
+| `--no-config` | 无外部配置概念，行为只由 builder 决定 |
+| 自己判二进制/编码 | `BinaryDetection::quit(b'\x00')` + `SearcherBuilder` 编码选项 |
+
+**两处必须预先知道的事**：
+
+1. **`Sink` 是回调式，与现有架构不同**：`Executor::run` 是「返回 `String` 再 `truncate_*`」，而 `Sink` 要求在回调里累加、超限返回 `false`。
+   二选一：`Vec<String>` sink（简单，丢了提前停）或 在 `matched` 里直接累加字节（推荐，这才是库的价值）。
+2. **依赖代价**：`grep-matcher`/`grep-regex`/`grep-searcher`/`ignore` 会带进 `regex-automata`/`aho-corasick`/`bstr`/`memchr`/`globset`/`walkdir`/`same-file`/`log`（约 8~10 个），编译时间与二进制均上涨；版本待 `cargo add --dry-run` 核实。
 
 #### `run_command`：V0 不给 shell，并且要知道路径沙箱在此彻底失效（2026-10-23，六组实测）
 

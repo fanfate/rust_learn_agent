@@ -49,7 +49,7 @@ impl Logger {
     }
 
     pub fn task(&mut self, task: &str) {
-        let task_info = format!("##### START TASK #####\n任务开始 : {task}\n");
+        let task_info = format!("\n##### START TASK #####\n任务开始 : {task}\n");
         self.emit(&task_info, &task_info);
     }
 
@@ -70,7 +70,7 @@ impl Logger {
                 format!("开始调用工具...\nTool Info : {body}")
             }
             LogKind::ToolResult => {
-                format!("Tool Result : {body}")
+                format!("Tool Result :\n{body}")
             }
             LogKind::Error => {
                 format!("Error : {body}")
