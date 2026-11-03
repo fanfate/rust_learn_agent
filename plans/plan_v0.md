@@ -3387,10 +3387,27 @@ fn truncate_head_tail(text: String, max_bytes: usize) -> String  // (max - max/4
 | # | 目标 | 断言要点 | 为什么值这个价 |
 |---|---|---|---|
 | 1 ✅ | **`Executor::run` 的 `ReadFile` 四分支**（已落地 5 条） | ① 未截断 → **逐字节等于**原文（无尾注）② `head_lines==0` → 含 `rg -n`、**不含** `offset=` ③ 完整行 → `1-N 行` 且 `offset=N+1` ④ 残行 → 含「仅前 K 字节」，K 独立算 ⑤ `offset=3` → `a=3`、`b=skip+head_lines` | **0 覆盖**；唯一把三个谓词组合起来的地方；`b` 的 off-by-one 真实出过事；也是 `max_bytes × offset` 唯一相乘处 |
-| 2 | **`truncate_middle` 不变量 + 吸附真值表** | 生产配置 `(8000,0)`/`(6000,2000)`（`truncate_head_tail` = `max - max/4`）：`he>=1`、两切点 `is_char_boundary`、`he<=ts`、`len-ts<=tail`；吸附：行内且距尾 <256；不吸附：20KB 无换行；**255 vs 256** 两条；另加 `(0,8)` 退化用例记录契约 | 手写用例想不到切点，不变量一条挡一类错 |
+| 2 ✅ | **`truncate_middle` 手算精确值 + 吸附阈值对**（已落地 6 条：`test_truncate_m_*`） | 见下方「#2 落地记录」 | ❗**不变量只能证明「没切坏」，不能证明「切得对」**（naive clamp 能过全部四条） |
 | 3 ✅ | **`write_file` 越限守卫**（已落地 `test_write_guard`） | 造 `MAX_TOOL_OUTPUT+1` 字节 → `Err` 含「文件过大」，**读回断言原文一字未变** | 要测的是「`bail!` 在 `fs::write` **之前**」，只断言「有错」测不出顺序 |
 
-**P1 复核（2026-11-02 二次复核：已闭环项 + 仍缺项）**
+**P1 #2 落地记录（2026-11-02）——不变量是安全网，不是规格**
+
+| 用例 | 输入 | 手算期望 | 防的决定 |
+|---|---|---|---|
+| `test_truncate_m_short` | `"abc"` (8,0) | `(3,3)` | 早退 `len <= head+tail` |
+| `test_truncate_m_no_ascii_head` | `"中"×3000`(9000B) (8000,0) | `he=7998` | 字符边界回退（`8000 % 3 == 2`） |
+| `test_truncate_m_no_ascii_tail` | `"中"×3000` (0,8) | `(0,8994)` | 零头预算契约退化 |
+| `test_truncate_m_ascii_head` | `"a"×9000` (8000,0) | `he=8000` | 无 `\n` ⇒ 不吸附 |
+| `test_truncate_m_lines_head` | `"a\n"×8000`(16000B) (6000,2000) | `(6000,14002)` | `truncate_head_tail` 真实配置 |
+| `test_truncate_m_snap` | `7745a+\n+1000b` 对比 `7744b+\n+1000a` | `7746` 对比 `8000` | `head_end - pos < 256` 里的 `<` |
+
+**判据（新增，与「期望值独立算」并列）：测试主体必须是「手算得出的期望值」；性质断言只能补充。**
+「对任何输入都成立」的断言是在给实现自证 —— naive clamp（无吸附）能通过 `he>=1` / 边界 / `he<=ts` / `len-ts<=tail` 全部四条。
+
+⚠️ **遗留**：`test_truncate_m_no_ascii_tail` 与 `test_truncate_m_lines_head` 里写的是 `text[ts..].is_char_boundary(0)` —— `0` 永远是边界 ⇒ **恒真断言**（等于没测）；应为 `text.is_char_boundary(ts)`。
+
+
+**P1 其他复核结论（2026-11-02）**
 
 ✅ **已闭环（勿再当缺口）**
 

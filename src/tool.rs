@@ -823,4 +823,62 @@ mod test {
         assert!(s.contains(format!("offset={}", n + 3).as_str()));
         assert!(s.contains("原文共 2000 行"));
     }
+
+    #[test]
+    fn test_truncate_m_short() {
+        let base_s = "abc";
+        let (he, ts) = truncate_middle(base_s, 8, 0);
+        assert_eq!(he, 3);
+        assert_eq!(ts, 3);
+        assert!(base_s[..he].is_char_boundary(he) && he <= ts);
+    }
+
+    #[test]
+    fn test_truncate_m_no_ascii_head() {
+        let text = "中".repeat(3000);
+        let (he, ts) = truncate_middle(&text, 8000, 0);
+        assert_eq!(he, 7998);
+        assert!(text[..he].is_char_boundary(he) && he <= ts);
+    }
+
+    #[test]
+    fn test_truncate_m_no_ascii_tail() {
+        let text = "中".repeat(3000);
+        let (he, ts) = truncate_middle(&text, 0, 8);
+        assert_eq!((he, ts), (0, 8994));
+        assert!(text[..he].is_char_boundary(he) && text.is_char_boundary(ts) && he <= ts);
+    }
+
+    #[test]
+    fn test_truncate_m_ascii_head() {
+        let text = "a".repeat(9000);
+        let (he, ts) = truncate_middle(&text, 8000, 0);
+        assert_eq!(he, 8000);
+        assert!(text[..he].is_char_boundary(he) && he <= ts);
+    }
+
+    #[test]
+    fn test_truncate_m_lines_head() {
+        let text = "a\n".repeat(8000);
+        let (he, ts) = truncate_middle(&text, 6000, 2000);
+        assert_eq!((he, ts), (6000, 14002));
+        assert!(text[..he].is_char_boundary(he) && text.is_char_boundary(ts) && he <= ts);
+    }
+
+    #[test]
+    fn test_truncate_m_snap() {
+        let mut a = "a".repeat(7745); // 8000 - 7745 = 255 < 256 
+        a.push('\n');
+        a.push_str(&"b".repeat(1000));
+
+        let (he, _) = truncate_middle(&a, 8000, 0);
+        assert_eq!(he, 7746);
+
+        let mut b = "b".repeat(7744); // 8000 - 7744 = 256 
+        b.push('\n');
+        b.push_str(&"a".repeat(1000));
+
+        let (he, _) = truncate_middle(&b, 8000, 0);
+        assert_eq!(he, 8000);
+    }
 }
