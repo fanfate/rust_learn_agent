@@ -281,7 +281,7 @@ fn resolve_in(root: &Path, p: &str) -> anyhow::Result<PathBuf> {
     };
 
     let canon = fs::canonicalize(&target)
-        .with_context(|| format!("无法解析路径 {p} , 可用 list_files '.' 查看根目录"))?;
+        .with_context(|| format!("无法解析路径 {p} , 可用 list_files 命令查看沙箱目录情况"))?;
     if !canon.starts_with(root) {
         bail!("路径越界: {p}");
     }
@@ -390,8 +390,23 @@ impl Invocation {
                         ToolKind::ALLOW_CMD.join(", ")
                     );
                 }
-                run_command(&args.program, &args.args, root)
-                    .with_context(|| format!("无法执行命令 {}", args.program))
+
+                let work_dir = resolve_in(root, args.workdir.as_deref().unwrap_or("."))
+                    .context("workdir 无效")?;
+                if !work_dir.is_dir() {
+                    bail!(
+                        "workdir {} 不是目录！",
+                        args.workdir.as_deref().unwrap_or(".")
+                    );
+                }
+
+                run_command(&args.program, &args.args, &work_dir).with_context(|| {
+                    format!(
+                        "无法执行命令 {}, 工作目录 : {}",
+                        args.program,
+                        args.workdir.as_deref().unwrap_or(".")
+                    )
+                })
             }
         }
     }

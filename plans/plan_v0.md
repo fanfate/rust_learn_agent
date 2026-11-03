@@ -2396,7 +2396,47 @@ MAX_TOOL_OUTPUT                      -> 8,192 字节
 - 实用建议写进 system prompt：编译检查用 `cargo check --message-format=short`（实测 6.5KB vs 17KB，同样的信息量）。
 
 
-#### `write_file` 是整文件覆盖，不是插入（2026-10-23，实测）
+#### `run_command`：五家对照（2026-11-02，pi 为源码级实测，其余为源码/文档级）
+
+问的是两件事：**整体逻辑**（参数、进程模型、超时、截断）和**回执**（模型到底看到什么）。
+
+| | 工具名/参数 | 进程模型 | 超时 | 回执（模型看到的文本） | 截断与逃生舱 |
+|---|---|---|---|---|---|
+| **pi**（`dist/core/tools/bash.js` + `bash-executor.js`，本机阅读） | `bash{command: string, timeout?: number}` —— **无 cwd 参数**，cwd 来自会话（`ctx.cwd`） | **shell 命令串**；`spawn` + 流式 `onData`（节流推送）+ 可 abort | 可选，无默认；超时 → `killProcessTree` | 正文 = stdout+stderr **合并**（剥 ANSI / sanitize 二进制 / 删 `\r`）；空输出 `(no output)`；非零退出码在**正文尾部**追加 `Command exited with code N` 且 **`isError: true`**；abort → `Command aborted`；超时 → `Command timed out after Ns`；**`exitCode === null` 直接当错误**：`Command terminated without an exit code` | **tail 截断**（保留最后 N 行 / 50KB 先到先得）+ 三种尾注（按行/按字节/最后一行部分截断）+ **完整输出落 temp 文件并在尾注里给路径**；另给`structuredContent{output,truncated,full_output_path,exit_code,wall_time_seconds}`供程序化调用 |
+| **Codex**（`codex-rs`） | `ShellToolCallParams{command: Vec<String>, workdir?: String, timeout_ms?: u64, with_escalated_permissions?, justification?}` —— **有 `workdir`** | argv（`Vec<String>`，**无 shell**）；新版默认 **unified exec**（`exec_command` + `write_stdin`，PTY/session，未完成返回 `session_id` 继续轮询） | 默认 **10s**（`DEFAULT_EXEC_COMMAND_TIMEOUT_MS`）→ 返回 session_id | `format_exec_output_for_model`：**首行 `Exit code: N` + `Wall time: X seconds`**（+ 仅截断时报 `Total output lines: N`），正文跟在后面（Go SDK 就是靠 `Exit code:` 头解析的）；信号/超时用**合成码**：`SIGKILL_CODE=9`、`TIMEOUT_CODE=64`、`EXEC_TIMEOUT_EXIT_CODE=124`、signal → `128+signal` | 截断 + 行数报告；unified exec 给 `log_path` |
+| **opencode**（`packages/opencode/src/tool/bash.ts`） | `{command: string, timeout?: ms, workdir?: string, description: string(5-10词)}` —— **有 `workdir`**，描述默认 `${Instance.directory}` | shell 串；**用 tree-sitter 解析命令**（识别 `cd`/`push-location` 与文件变更 → 权限系统）；`spawn` | 默认 2min / 最大 10min | 正文 + 退出码（未拿到源码原文，未断言具体标签） | 2000 行 / 50KB（可 `OPENCODE_EXPERIMENTAL_BASH_MAX_OUTPUT_LENGTH` 调）+ **完整输出落文件**；metadata 另限 30k 字符 |
+| **Gemini CLI**（`packages/core/src/tools/shell.ts`） | shell 串（无 `workdir`） | shell 串；live 缓冲区 100k 字符（截断时保留两字节 UTF-8 边界） | 有 | 取消时 **把已产生的部分输出送给模型**（PR #20501） | **head 20% + tail 80% + `[N characters omitted]`**（PR #18446）；又用 PR #28401 把模型可见输出硬顶在 **32 KiB**；阀值曾按“剩余上下文”动态算（PR #8379） |
+| **Claude Code**（闭源，仅文档/issue 级） | `Bash{command, timeout?, description?, run_in_background?}`；**无 cwd 参数**，靠**持久 shell 的 `cd`** | 每命令**独立进程**，但 **cwd 跨命令持久**；shell 状态（export）不持久 | 上限 600000ms | **越界时在输出后追加 `Shell cwd was reset to <path>`**（issue #13412/#42837）—— **唯一一家把 cwd 写进回执的**，而且是**异常才打** | 截断 + 完整输出落文件（文档级） |
+
+**四条可抄（按对我们的价值排序）**
+
+1. **`cwd` 参数是主流**（Codex `workdir`、opencode `workdir`；我们清单 #4 同形）。opencode 的工具描述直接写
+   「**AVOID using `cd &&` patterns - use `workdir` instead**」—— 我们没 shell，模型根本 `cd` 不了，更需要这句话占位。
+2. **cwd 只在异常时进回执** —— Claude Code 的 `Shell cwd was reset to X` 就是“模型以为在 A、实际在 B”时的现成答案；
+   但它**无条件打印**导致用户开 issue 叫它闭嘴（#13412）⇒ 正好反向验证我们「**只在 `cwd != 根` 时打印**」的判据。
+   另一个佐证：pi 核心不带 cwd（因为 cwd 是会话常量），但社区扩展 `pi-unified-exec` 的回执里就有 `cwd: /home/you/project` —— **只有当 cwd 可能变化/被轮询时才需要归因**。
+3. **“没有退出码”必须是一个错误** —— pi 直接 `throw Command terminated without an exit code`；Codex 造合成码。
+   我们现在的 `unwrap_or(-1)` 是**第三档、最差**：既无合成语义又不算错误，模型只能靠 `-1` 猜。
+4. **完整输出落文件 = 逃生舱**（pi / opencode / Codex 全有）。我们已无成本具备：`read_file` 就在手上，
+   沙箱里落一个 `tmp/out-*.log` 并把路径写进尾注，模型就能自己二次检索，而不是只能“再跑一次同样的命令”。
+
+**两条我们已对（不必改）**
+
+- **退出码前置显式行**：与 Codex 同派（我们：`命令退出码: N` 在首行）。pi 是后置（正文被截断时也能看到），各有理，但**不能两边都缺**。
+- **截断要报“被截断了”**：我们 `truncate_head_tail` 的 `...[中间省略 N 字节，原文 M 行/ K 字节]...` 属 Gemini 头尾派，五家全有同类标记。
+
+**三个真缺口（应进 V0.5 清单）**
+
+| 缺口 | 现状 | 五家怎么做 | 风险 |
+|---|---|---|---|
+| **无超时** | `spawn()?.wait_with_output()?`，无 timeout、无取消 | Codex 10s + session 轮询；opencode 2min/最大 10min；pi 可选 | 模型跑 `cargo watch` / `npm start` / 读 stdin 的命令 ⇒ **整个 agent 循环挂死，且 V0 无取消手段** |
+| **无逃生舱** | 超 8000 字节只给“省略 N 字节”，不给原文出处 | 落文件 + 尾注路径 | 被截断的中间段永久丢失，模型只能重跑（重跑可能又是 8000 字节的中间段） |
+| **`-1` 掩盖信号/超时** | `status.code().unwrap_or(-1)` | pi 当错误；Codex 合成码 | 模型无法区分“程序自己 return -1”与“被 kill” |
+
+**一个已记的漂移**：本节旧文“定案”写 `退出码 N` + `--- stdout ---` + `--- stderr ---`，而代码实际是
+`命令退出码: N` / `返回结果:` / `错误信息:` —— 语义一致、标签不一致。不急着改，但**别让文档继续假装一致**。
+
+
 
 用户问「writefile 本质上是覆盖整个 file 而非插入对吧」——**对，就是 `fs::write` 的语义**。实测：
 

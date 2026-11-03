@@ -97,6 +97,9 @@ pub struct RunCommandArg {
 
     #[serde(default)]
     pub args: Vec<String>,
+
+    #[serde(default)]
+    pub workdir: Option<String>,
 }
 
 #[derive(Debug)]
@@ -169,9 +172,10 @@ impl Invocation {
                 args.new_string.len(),
             ),
             Self::RunCommand(args) => format!(
-                "run_command, program : {}, args : [{}]",
+                "run_command, program : {}, args : [{}], workdir : {}",
                 args.program,
-                args.args.join(", ")
+                args.args.join(", "),
+                args.workdir.as_deref().unwrap_or(".")
             ),
         }
     }
@@ -282,13 +286,15 @@ impl ToolKind {
                 description: format!(
                     "运行命令行命令。\n1.没有 shell：不支持管道、重定向、通配符、变量展开; \n\
                         2.program 只接受裸名，且必须在白名单里，白名单为: [{}];\n\
-                        3.工作目录固定在沙箱根，路径都相对它;\n\
-                        4.返回：退出码 + stdout + stderr；输出过长会被截断",
+                        3.工作目录使用相对路径的话，以沙箱根为基准, 不传 workdir 就是沙箱根;\n\
+                        4.工作目录每次命令独立，不持久;\n\
+                        5.不支持 cd;\n\
+                        6.返回：退出码 + stdout + stderr；输出过长会被截断",
                     Self::ALLOW_CMD.join(", ")
                 ),
                 parameters: serde_json::json!({
                     "type": "object",
-                    "properties": { "program": { "type": "string" }, "args" : { "type" : "array", "items" : {"type" : "string"} } },
+                    "properties": { "program": { "type": "string" }, "args" : { "type" : "array", "items" : {"type" : "string"} }, "workdir" : { "type" : "string"} },
                     "required": ["program"],
                     "additionalProperties": false
                 }),
