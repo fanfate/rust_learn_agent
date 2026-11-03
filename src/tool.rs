@@ -404,9 +404,8 @@ pub struct Executor {
 }
 
 impl Executor {
-    pub fn new(root: &str) -> anyhow::Result<Self> {
-        let mut root = PathBuf::from(root);
-        root = root.canonicalize()?;
+    pub fn new(root: &Path) -> anyhow::Result<Self> {
+        let root = root.canonicalize()?;
         Ok(Self {
             root,
             max_bytes: MAX_TOOL_OUTPUT,
@@ -469,7 +468,7 @@ mod test {
     use super::*;
 
     fn exec(root: &Path) -> Executor {
-        Executor::new(&root.to_string_lossy()).unwrap()
+        Executor::new(root).unwrap()
     }
 
     struct FileHelper {

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use dotenvy::dotenv;
 
 pub const LLM_ENV_KEYS: &[&str] = &["LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY"];
@@ -52,6 +54,7 @@ pub struct Config {
     pub llm_base_url: String,
     pub llm_model: String,
     pub llm_api_key: String,
+    pub sandbox_root: PathBuf,
 }
 
 impl std::fmt::Debug for Config {
@@ -60,6 +63,7 @@ impl std::fmt::Debug for Config {
             .field("llm_base_url", &self.llm_base_url)
             .field("llm_model", &self.llm_model)
             .field("llm_api_key", &"***")
+            .field("sandbox_root", &self.sandbox_root)
             .finish()
     }
 }
@@ -74,10 +78,19 @@ impl Config {
         let llm_base_url = format_url(get_map("LLM_BASE_URL", get)?);
         let llm_model = get_map("LLM_MODEL", get)?;
         let llm_api_key = get_map("LLM_API_KEY", get)?;
+        let sandbox_root_res = get_map("SAND_BOX_ROOT", get);
+        let sandbox_root = match sandbox_root_res {
+            Err(ConfigError::Empty { name: _ }) | Err(ConfigError::Missing { name: _ }) => {
+                PathBuf::from("scratch")
+            }
+            Ok(res) => PathBuf::from(res),
+            Err(err) => return Err(err),
+        };
         Ok(Self {
             llm_base_url,
             llm_model,
             llm_api_key,
+            sandbox_root,
         })
     }
 }

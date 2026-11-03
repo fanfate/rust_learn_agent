@@ -1699,6 +1699,16 @@ Agent 能 `write_file` + `run_command`，等于把「任意文件写入 + 任意
 该改的是「把沙箱放在 `Cargo.toml` 的下级」。（实例见 `plans/v0.5-breakpoints.md` **B1**：
 第 6 步 `cargo test` 在 `cwd = scratch` 下沿父目录找到 `my_agent/Cargo.toml`，跑出了 `27 passed / exit 0` 的**假阳性**。）
 
+**布局的候选与探针结论（2026-11-02 实测）**：`[workspace]` 桩已被**否证** ——`cargo new` 会改写 `members`（护树自动失效），
+而 `members = []` 期间子项目的 `--manifest-path` 反而报「believes it's in a workspace when it's not」。
+⇒ 只剩 **A 沙箱移出仓库**（根部报 `could not find Cargo.toml … or any parent`）或 **D root 做 dummy package**（静默但无害）。
+完整四种对照见 `plans/v0.5-breakpoints.md` 的「布局探针」表。
+
+**决策（2026-11-02）：不修布局** —— 保持 `scratch` 在仓库内，改「约定 + 观测」：后续 dogfooding 用 uv/Python 或 npm/NodeJS 语料，
+不用 Rust 项目（避免与真项目打架）；Rust 只在 `scratch/my_api` 副本上用 `--manifest-path`。
+附带一条硬规则：**新增 `ALLOW_CMD` 前先跑一次 B1 探针**（该工具会不会向上找项目根）；`git` 永远不进白名单（它向上找 `.git`）。
+残留风险（模型仍在沙箱根跑 `cargo add/fmt`）靠回执 `cwd` + 审批钩子压，详见 `plans/v0.5-breakpoints.md`。
+
 **威胁模型（先答「在防谁」，再谈手段）**
 
 | 威胁 | 概率 | 现有手段够吗 | 需要什么 |

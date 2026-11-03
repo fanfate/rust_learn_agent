@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::bail;
 
 use crate::{
@@ -18,6 +20,7 @@ pub async fn run_agent(
     task: &str,
     max_steps: usize,
     sink: &LogSink<'_>,
+    sandbox_root: &Path,
 ) -> anyhow::Result<()> {
     let system_prompt = Message::System {
         content: SYSTEM_PROMPT.to_string(),
@@ -27,7 +30,7 @@ pub async fn run_agent(
     };
     let mut messages = vec![system_prompt, user_task];
     let tools = ToolKind::tools();
-    let tool_exec = Executor::new("scratch")?;
+    let tool_exec = Executor::new(sandbox_root)?;
 
     let mut finished = false;
 
