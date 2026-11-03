@@ -2422,7 +2422,7 @@ MAX_TOOL_OUTPUT                      -> 8,192 字节
 
 **两条我们已对（不必改）**
 
-- **退出码前置显式行**：与 Codex 同派（我们：`命令退出码: N` 在首行）。pi 是后置（正文被截断时也能看到），各有理，但**不能两边都缺**。
+- **退出码前置显式行**：与 Codex 同派（我们：`命令退出码 : N` 在首行）。pi 是后置（正文被截断时也能看到），各有理，但**不能两边都缺**。
 - **截断要报“被截断了”**：我们 `truncate_head_tail` 的 `...[中间省略 N 字节，原文 M 行/ K 字节]...` 属 Gemini 头尾派，五家全有同类标记。
 
 **三个真缺口（应进 V0.5 清单）**
@@ -2433,8 +2433,8 @@ MAX_TOOL_OUTPUT                      -> 8,192 字节
 | **无逃生舱** | 超 8000 字节只给“省略 N 字节”，不给原文出处 | 落文件 + 尾注路径 | 被截断的中间段永久丢失，模型只能重跑（重跑可能又是 8000 字节的中间段） |
 | **`-1` 掩盖信号/超时** | `status.code().unwrap_or(-1)` | pi 当错误；Codex 合成码 | 模型无法区分“程序自己 return -1”与“被 kill” |
 
-**一个已记的漂移**：本节旧文“定案”写 `退出码 N` + `--- stdout ---` + `--- stderr ---`，而代码实际是
-`命令退出码: N` / `返回结果:` / `错误信息:` —— 语义一致、标签不一致。不急着改，但**别让文档继续假装一致**。
+**标签已统一（2026-11-02）**：回执五个标签统一为 `名称 : 值`（`命令退出码 : ` / `返回结果 : ` / `错误信息 : ` / `工作目录 : ` / `cwd : `）。
+上文引用的旧实测输出（`命令退出码 1:`、`命令退出码: N`）保留原样 —— 那是当时的真实回执，不要改历史。
 
 
 
@@ -3518,8 +3518,8 @@ fn truncate_head_tail(text: String, max_bytes: usize) -> String  // (max - max/4
 
 **⑧ 单测覆盖核对 + 测试 backlog（2026-11-02）**
 
-实测：`cargo test` **21 passed** = `edit_file` 8 + `write_file` **5**（含 `test_write_guard`）+ `resolve_in` 1 + `truncate` 2 + `run_read` **5**；
-`cargo check --all-targets` 0 error + **3 处 dead_code**（`delete_file`/`check_error`/`check_new`；`tail_lines`/`tail_partial` 已删除）；`cargo clippy` 除 dead_code 外**零告警**；
+实测：`cargo test` **33 passed**（2026-11-02 复测）= `edit_file` 8 + `write_file` **5**（含 `test_write_guard`）+ `resolve_in` 1 + `truncate` **8** + `run_read` **5** + `cwd_notice` **6**；
+`cargo check --all-targets` 0 error + **2 处 dead_code**（`delete_file`/`check_error`；`check_new` 已由 `main.rs` 使用）；`cargo clippy` 除 dead_code 外**零告警**；
 `cargo fmt --check` 1 处（`src/lib.rs` 模块顺序）。
 
 **backlog 按「静默失败风险 × 出过 bug 的历史」排，不按覆盖率排**
@@ -3546,7 +3546,14 @@ fn truncate_head_tail(text: String, max_bytes: usize) -> String  // (max - max/4
 **判据（新增，与「期望值独立算」并列）：测试主体必须是「手算得出的期望值」；性质断言只能补充。**
 「对任何输入都成立」的断言是在给实现自证 —— naive clamp（无吸附）能通过 `he>=1` / 边界 / `he<=ts` / `len-ts<=tail` 全部四条。
 
-⚠️ **遗留**：`test_truncate_m_no_ascii_tail` 与 `test_truncate_m_lines_head` 里写的是 `text[ts..].is_char_boundary(0)` —— `0` 永远是边界 ⇒ **恒真断言**（等于没测）；应为 `text.is_char_boundary(ts)`。
+**P1 #4 ✅ `cwd_notice` 六条（2026-11-02 随 `workdir` 落地）**
+
+纯函数 `fn cwd_notice(root, workdir: Option<&str>, resolved_path) -> Option<String>`，六条用例的完整表在
+`plans/v0.5-breakpoints.md` 的「六条必测用例」（`None` / `""` / `"."` / 复述 / 归一 / 绝对路），均为**精确字符串断言**。
+两条必须成对：**`Some("")` 与 `Some(".")` 都要 `None`** —— 只归一右侧会让 `""` 变成 `cwd : .`（实测三种实现对照表见那份文件）。
+
+⚠️ **遗留（已修 ✓）**：`test_truncate_m_no_ascii_tail` 与 `test_truncate_m_lines_head` 里的 `text[ts..].is_char_boundary(0)`
+曾是**恒真断言**，已改为 `text.is_char_boundary(ts)`（2026-11-02 复查 `tool.rs:889/905`）。
 
 
 **P1 其他复核结论（2026-11-02）**
@@ -3565,7 +3572,7 @@ fn truncate_head_tail(text: String, max_bytes: usize) -> String  // (max - max/4
 | # | 目标 | 断言要点 |
 |---|---|---|
 | 4 | `resolve_in` | 成功路径 **`assert_eq!`** 与 `fs::canonicalize(root.join(p))` 相等；`../` 与沙箱外绝对路径各一条 `Err` 含「越界」；junction（`mklink /J`，可 `#[ignore]`） |
-| 5 | `run_command` | 白名单拒绝（`powershell`）· 裸名拒绝（带路径）· **非零退出仍 `Ok`**（`cargo no-such-subcmd` ≈101）· 空段不打标签 |
+| 5 | `run_command` | 白名单拒绝（`powershell`）· 裸名拒绝（带路径）· **非零退出仍 `Ok`**（`cargo no-such-subcmd` ≈101）· 空段不打标签 · **`workdir` 四条**（`../` 越界 / 指向文件 → 「不是目录」/ 不存在 / 子目录真的生效——最后一条需真子进程 `rg --files`） |
 | 6 | `read_file(offset)` | `offset=0` ≡ 1 · 越界 → `Err` 含总行数 · 末尾无换行 · **CRLF**（错误文案承诺过 CRLF 提示但没测） |
 | 7 | `list_files` | 空目录 → `"空目录"` · `[DIR]`/`[FILE]` 前缀 · 排序稳定 |
 

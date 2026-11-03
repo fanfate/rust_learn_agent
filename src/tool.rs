@@ -156,12 +156,12 @@ fn run_command(program: &str, args: &[String], root: &Path) -> anyhow::Result<St
     let res_out = String::from_utf8_lossy_owned(output.stdout);
     let res_error = String::from_utf8_lossy_owned(output.stderr);
 
-    let mut res_str = format!("命令退出码: {res_code}\n");
+    let mut res_str = format!("命令退出码 : {res_code}\n");
     if !res_out.is_empty() {
-        res_str = format!("{res_str}返回结果: {res_out}\n");
+        res_str = format!("{res_str}返回结果 : {res_out}\n");
     }
     if !res_error.is_empty() {
-        res_str = format!("{res_str}错误信息: {res_error}\n");
+        res_str = format!("{res_str}错误信息 : {res_error}\n");
     }
 
     Ok(res_str)
@@ -344,6 +344,25 @@ fn normalize_path(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(out)
 }
 
+fn cwd_notice(root: &Path, workdir: Option<&str>, resolved_path: &Path) -> Option<String> {
+    let rel = resolved_path
+        .strip_prefix(root)
+        .expect("必然以词法祖先为前缀");
+    let rel = if rel.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        rel
+    };
+    if let Some(w) = workdir
+        && !w.is_empty()
+        && Path::new(w) != rel
+    {
+        Some(format!("cwd : {}", rel.display()))
+    } else {
+        None
+    }
+}
+
 // tool call
 
 impl Invocation {
@@ -400,13 +419,20 @@ impl Invocation {
                     );
                 }
 
-                run_command(&args.program, &args.args, &work_dir).with_context(|| {
-                    format!(
-                        "无法执行命令 {}, 工作目录 : {}",
-                        args.program,
-                        args.workdir.as_deref().unwrap_or(".")
-                    )
-                })
+                let run_res =
+                    run_command(&args.program, &args.args, &work_dir).with_context(|| {
+                        format!(
+                            "无法执行命令 {}, 工作目录 : {}",
+                            args.program,
+                            args.workdir.as_deref().unwrap_or(".")
+                        )
+                    })?;
+
+                if let Some(w) = cwd_notice(root, args.workdir.as_deref(), &work_dir) {
+                    Ok(format!("{w}\n{run_res}"))
+                } else {
+                    Ok(run_res)
+                }
             }
         }
     }
@@ -894,5 +920,59 @@ mod test {
 
         let (he, _) = truncate_middle(&b, 8000, 0);
         assert_eq!(he, 8000);
+    }
+
+    #[test]
+    fn test_cwd_none() {
+        let root = Path::new("test_cwd_none");
+        let resolved = Path::new("test_cwd_none");
+
+        let res = cwd_notice(root, None, resolved);
+        assert!(res.is_none())
+    }
+
+    #[test]
+    fn test_cwd_empty() {
+        let root = Path::new("test_cwd_empty");
+        let resolved = Path::new("test_cwd_empty");
+
+        let res = cwd_notice(root, Some(""), resolved);
+        assert!(res.is_none())
+    }
+
+    #[test]
+    fn test_cwd_root() {
+        let root = Path::new("test_cwd_root");
+        let resolved = Path::new("test_cwd_root");
+
+        let res = cwd_notice(root, Some("."), resolved);
+        assert!(res.is_none())
+    }
+
+    #[test]
+    fn test_cwd_same() {
+        let root = Path::new("test_cwd_same");
+        let resolved = Path::new("test_cwd_same/sub");
+
+        let res = cwd_notice(root, Some("sub"), resolved);
+        assert!(res.is_none())
+    }
+
+    #[test]
+    fn test_cwd_absolute() {
+        let root = Path::new("D:/test_cwd_absolute");
+        let resolved = Path::new("D:/test_cwd_absolute/sub");
+
+        let res = cwd_notice(root, Some("D:/test_cwd_absolute/sub"), resolved);
+        assert_eq!(res, Some("cwd : sub".to_string()));
+    }
+
+    #[test]
+    fn test_cwd_multi_hop() {
+        let root = Path::new("test_cwd_multi_hop");
+        let resolved = Path::new("test_cwd_multi_hop/x");
+
+        let res = cwd_notice(root, Some("sub/../x"), resolved);
+        assert_eq!(res, Some("cwd : x".to_string()));
     }
 }
