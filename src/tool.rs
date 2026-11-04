@@ -504,7 +504,7 @@ impl Executor {
 
 #[cfg(test)]
 mod test {
-    use crate::model::ReadFileArg;
+    use crate::model::{ReadFileArg, RunCommandArg};
 
     use super::*;
 
@@ -974,5 +974,62 @@ mod test {
 
         let res = cwd_notice(root, Some("sub/../x"), resolved);
         assert_eq!(res, Some("cwd : x".to_string()));
+    }
+
+    #[test]
+    fn test_run_cmd_over_path() {
+        let root_file = FileHelper::new("test_run_cmd_over_path");
+
+        let s = exec(root_file.root()).run(&Invocation::RunCommand(RunCommandArg {
+            program: "cargo".to_string(),
+            args: vec!["test".to_string()],
+            workdir: Some("../../".to_string()),
+        }));
+        let err = s.unwrap_err();
+        assert!(format!("{err:#}").contains("越界"));
+    }
+
+    #[test]
+    fn test_run_cmd_no_path() {
+        let root_file = FileHelper::new("test_run_cmd_no_path");
+
+        let s = exec(root_file.root()).run(&Invocation::RunCommand(RunCommandArg {
+            program: "cargo".to_string(),
+            args: vec!["test".to_string()],
+            workdir: Some("prj1".to_string()),
+        }));
+        let err = s.unwrap_err();
+        assert!(format!("{err:#}").contains("无法解析路径"));
+    }
+
+    #[test]
+    fn test_run_cmd_is_file() {
+        let root_file = FileHelper::new("test_run_cmd_is_file");
+        root_file.create_file("prj1", "a");
+
+        let s = exec(root_file.root()).run(&Invocation::RunCommand(RunCommandArg {
+            program: "cargo".to_string(),
+            args: vec!["test".to_string()],
+            workdir: Some("prj1".to_string()),
+        }));
+        let err = s.unwrap_err();
+        assert!(format!("{err:#}").contains("不是目录"));
+    }
+
+    #[test]
+    fn test_run_cmd_ok() {
+        let root_file = FileHelper::new("test_run_cmd_ok");
+        root_file.create_dir("prj1");
+
+        let s = exec(root_file.root())
+            .run(&Invocation::RunCommand(RunCommandArg {
+                program: "cargo".to_string(),
+                args: vec!["init".to_string(), "test_prj1".to_string()],
+                workdir: Some("prj1".to_string()),
+            }))
+            .unwrap();
+        assert!(s.contains("命令退出码"));
+        assert!(root_file.root().join("prj1/test_prj1/Cargo.toml").exists());
+        assert!(!root_file.root().join("test_prj1").exists());
     }
 }
