@@ -2438,6 +2438,30 @@ MAX_TOOL_OUTPUT                      -> 8,192 字节
 
 
 
+#### 五家的日志形态（2026-11-02 调研，pi 为本地文件实测）
+
+| | 主日志（transcript） | 时间戳 | 每条带什么 | 位置 |
+|---|---|---|---|---|
+| **pi**（本机 `~/.pi/agent/sessions/` 实测） | **JSONL**，`{id, parentId, type, timestamp}` | **每条**，毫秒 RFC3339（`2026-11-02T02:32:44.461Z`） | `id` + **`parentId`（树，支持分支/回退）**；首行 header 带 `cwd`/`version`；条目类型含 `message`/`model_change`/`thinking_level_change`/`usage`/`compaction` | `~/.pi/agent/sessions/--<cwd 拍平>--/<ISO>_<uuid>.jsonl` |
+| **Codex** | **JSONL** rollout | **每条** ISO-8601 | `{"timestamp","type","payload"}`；首行 `session_meta` 带 `cwd`；**子 agent 独立文件** | `~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<uuid>.jsonl` |
+| **Claude Code** | **JSONL** transcript | **每条** ISO-8601 | `type`/`message`/`sessionId`/`uuid`/**`cwd`（每条都存）** | `~/.claude/projects/<cwd 拍平>/<session>.jsonl` + 子 agent 子目录 |
+| **Gemini CLI** | **JSONL** chat record | **每条**（`BaseMessageRecord.timestamp`） | `sessionId`/`projectHash`/`startTime`/`lastUpdated` | `~/.gemini/tmp/<projectHash>/chats/session-<ts>-<id8>.jsonl`；另有独立 OTEL `telemetry.log` |
+| **我家 `log.rs`** | 纯文本叙事 | **无** | 无 | `data/run.log`（**在仓库里**，append） |
+
+**四个共同模式**
+
+1. **时间戳是“每条”，不是“每次 run 一条”** —— 五家全部 per-entry。只有这样才能算出“哪一段慢”，而不是“整体慢”。
+2. **`cwd` 冗余存在每条里** —— Claude Code 的理由最硬：它把 cwd 的分隔符拍平成 `-` 当目录名，**有损且不可逆** ⇒ 必须每条再存真 `cwd`。
+   与 `cwd_notice` 同一条判据：**派生信息有损，就把原始值冗余记下来**。
+3. **会话/运行 id 是必需字段** —— append 模式下没 id 就只能靠“读到哪了”猜；而时钟可被调（`SystemTime` 会跳变），id 不能靠文件位置代。
+4. **两层分离** —— 结构化 transcript（恢复/回放/成本/eval）+ 独立 debug/telemetry。**没有一家把“人类可读叙事”当主日志**。
+
+**一句话差别**：它们把日志当**数据**，我们把日志当**叙事**。V0.5 阶段叙事更值（只有一个人读），
+但“每条带时间 + 每次 run 有 id”是数据化的最低成本 —— 现在加零摩擦，以后加要改所有调用点。
+具体决策见 `plans/v0.5-breakpoints.md` 的「#3 的判据」。
+
+#### `write_file` 是整文件覆盖，不是插入（2026-10-23，实测）
+
 用户问「writefile 本质上是覆盖整个 file 而非插入对吧」——**对，就是 `fs::write` 的语义**。实测：
 
 ```
