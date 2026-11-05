@@ -133,7 +133,7 @@ impl Logger {
             && self.file.is_some()
         {
             let terminal_record = format!(
-                "{instant_time}Tool Result : {} 字节(全文见log文件)",
+                "{instant_time}Tool Result : {} 字节(详情见log文件)",
                 body.len()
             );
             self.emit(&full_record, &terminal_record);

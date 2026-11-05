@@ -6,6 +6,7 @@ use anyhow::{Context, bail};
 use std::{
     ffi::OsStr,
     fs,
+    hash::{DefaultHasher, Hash, Hasher},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -202,6 +203,16 @@ impl Truncation {
     fn head_partial(&self, text: &str) -> bool {
         self.head_end > 0 && self.head_end < text.len() && !text[..self.head_end].ends_with("\n")
     }
+
+    fn tail_lines(&self, text: &str) -> usize {
+        text[self.tail_start..].lines().count() - self.tail_partial(text) as usize
+    }
+
+    fn tail_partial(&self, text: &str) -> bool {
+        self.tail_start > 0
+            && self.tail_start < text.len()
+            && !text[self.tail_start..].ends_with("\n")
+    }
 }
 
 fn truncate_head(text: String, max_bytes: usize) -> String {
@@ -231,7 +242,9 @@ fn truncate_head_tail(text: String, max_bytes: usize) -> String {
     let (head, tail) = truncation.split(&text);
     let middle_len = truncation.omitted_bytes();
     format!(
-        "{head}\n...[中间省略 {middle_len} 字节，原文 {total_lines} 行/ {total_len} 字节]\n{tail}"
+        "{head}...[已显示 1-{} 行 + {}-{total_lines} 行, 省略 {middle_len} 字节，原文 {total_lines} 行/ {total_len} 字节]\n...{tail}",
+        truncation.head_lines(&text),
+        total_lines - truncation.tail_lines(&text) + 1,
     )
 }
 
@@ -445,6 +458,8 @@ pub struct Executor {
 }
 
 impl Executor {
+    const OUTPUT_TMP: &str = "tmp/agent_output";
+
     pub fn new(root: &Path) -> anyhow::Result<Self> {
         let root = root.canonicalize()?;
         Ok(Self {
@@ -453,52 +468,83 @@ impl Executor {
         })
     }
 
+    fn spill_name(content: &str) -> String {
+        let mut h = DefaultHasher::new();
+        content.hash(&mut h);
+        format!("{:016x}.log", h.finish())
+    }
+
+    fn clear_tmp(&self) {
+        let tmp = self.root.join(Self::OUTPUT_TMP);
+        if tmp.exists() {
+            let _ = fs::remove_dir_all(tmp);
+        }
+    }
+
+    fn spill(&self, text: &str) -> std::io::Result<PathBuf> {
+        let file_name = Self::spill_name(text);
+        let tmp_path = self.root.join(Self::OUTPUT_TMP);
+        fs::create_dir_all(&tmp_path)?;
+        let file_path = tmp_path.join(&file_name);
+        fs::write(&file_path, text)?;
+        Ok(PathBuf::from(Self::OUTPUT_TMP).join(&file_name))
+    }
+
     pub fn run(&self, inv: &Invocation) -> anyhow::Result<String> {
         let raw = inv.raw_invoke(&self.root, self.max_bytes)?;
-        match inv {
-            Invocation::RunCommand(_) => Ok(truncate_head_tail(raw, self.max_bytes)),
+
+        let full = if raw.len() > self.max_bytes {
+            Some(raw.clone())
+        } else {
+            None
+        };
+
+        let shown = match inv {
+            Invocation::RunCommand(_) => truncate_head_tail(raw, self.max_bytes),
             Invocation::ReadFile(args) => {
                 let truncation = Truncation::get_truncate(&raw, self.max_bytes, 0);
 
                 if !truncation.is_truncated() {
-                    Ok(raw)
+                    raw
                 } else {
                     let skip = args.offset.saturating_sub(1);
                     let full_lines = raw.lines().count() + skip;
                     let (show_content, _) = truncation.split(&raw);
                     if truncation.head_lines(&raw) == 0 {
-                        Ok(format!(
+                        format!(
                             "{show_content}...[第 {} 行超过单行上限 {} 字节，本工具无法整行返回, 原文共 {} 行；请用 rg -n 定位查看]",
                             skip + 1,
                             self.max_bytes,
                             full_lines,
-                        ))
+                        )
                     } else if !truncation.head_partial(&raw) {
                         let show_lines = truncation.head_lines(&raw);
-                        Ok(format!(
+                        format!(
                             "{show_content}...[内容过长，只返回 {}-{} 行，原文共 {full_lines} 行；请用 offset={} 继续]",
                             skip + 1,
                             skip + show_lines,
                             skip + show_lines + 1,
-                        ))
+                        )
                     } else {
                         let show_lines = truncation.head_lines(&raw);
                         let partial_bytes =
                             truncation.head_end - show_content.rfind("\n").map_or(0, |p| p + 1);
 
-                        Ok(format!(
+                        format!(
                             "{show_content}...[内容过长，只返回完整的 {}-{} 行，第 {} 行仅前 {} 字节，原文共 {full_lines} 行；请用 offset={} 继续]",
                             skip + 1,
                             skip + show_lines,
                             skip + show_lines + 1,
                             partial_bytes,
                             skip + show_lines + 1,
-                        ))
+                        )
                     }
                 }
             }
-            _ => Ok(truncate_head(raw, self.max_bytes)),
-        }
+            _ => truncate_head(raw, self.max_bytes),
+        };
+
+        Ok(shown)
     }
 }
 
