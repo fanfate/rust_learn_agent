@@ -228,23 +228,7 @@ fn truncate_head(text: String, max_bytes: usize) -> String {
     let now_len = head.len();
 
     format!(
-        "{head}...内容过长，只返回了前 {now_lines} 行/ {now_len} 字节，原文共 {total_lines} 行/ {total_len} 字节\n"
-    )
-}
-
-fn truncate_head_tail(text: String, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text;
-    }
-    let (total_len, total_lines) = (text.len(), text.lines().count());
-
-    let truncation = Truncation::get_truncate(&text, max_bytes - max_bytes / 4, max_bytes / 4);
-    let (head, tail) = truncation.split(&text);
-    let middle_len = truncation.omitted_bytes();
-    format!(
-        "{head}...[已显示 1-{} 行 + {}-{total_lines} 行, 省略 {middle_len} 字节，原文 {total_lines} 行/ {total_len} 字节]\n...{tail}",
-        truncation.head_lines(&text),
-        total_lines - truncation.tail_lines(&text) + 1,
+        "{head}...[内容过长，只返回了前 {now_lines} 行/ {now_len} 字节，原文共 {total_lines} 行/ {total_len} 字节]"
     )
 }
 
@@ -462,10 +446,12 @@ impl Executor {
 
     pub fn new(root: &Path) -> anyhow::Result<Self> {
         let root = root.canonicalize()?;
-        Ok(Self {
+        let me = Self {
             root,
             max_bytes: MAX_TOOL_OUTPUT,
-        })
+        };
+        me.clear_tmp();
+        Ok(me)
     }
 
     fn spill_name(content: &str) -> String {
@@ -490,23 +476,60 @@ impl Executor {
         Ok(PathBuf::from(Self::OUTPUT_TMP).join(&file_name))
     }
 
+    fn spill_info(&self, text: &str, omitted: usize) -> String {
+        match self.spill(text) {
+            Ok(p) => {
+                format!("完整输出在文件 : `{}` 内", p.display())
+            }
+            Err(e) => {
+                format!("完整输出落盘失败 : {e}, 未显示 {omitted} 字节不可取回")
+            }
+        }
+    }
+
     pub fn run(&self, inv: &Invocation) -> anyhow::Result<String> {
         let raw = inv.raw_invoke(&self.root, self.max_bytes)?;
-
-        let full = if raw.len() > self.max_bytes {
-            Some(raw.clone())
+        if raw.len() <= self.max_bytes {
+            Ok(raw)
         } else {
-            None
-        };
+            let shown = match inv {
+                Invocation::RunCommand(_) => {
+                    let (total_len, total_lines) = (raw.len(), raw.lines().count());
+                    let truncation = Truncation::get_truncate(
+                        &raw,
+                        self.max_bytes - self.max_bytes / 4,
+                        self.max_bytes / 4,
+                    );
+                    let (head, tail) = truncation.split(&raw);
 
-        let shown = match inv {
-            Invocation::RunCommand(_) => truncate_head_tail(raw, self.max_bytes),
-            Invocation::ReadFile(args) => {
-                let truncation = Truncation::get_truncate(&raw, self.max_bytes, 0);
+                    let omitted = truncation.omitted_bytes();
+                    let spill_info = self.spill_info(&raw, omitted);
+                    format!(
+                        "{head}...[已显示 1-{} 行 + {}-{total_lines} 行, 原文 {total_lines} 行/ {total_len} 字节;\n{spill_info}]\n...{tail}",
+                        truncation.head_lines(&raw),
+                        total_lines - truncation.tail_lines(&raw) + 1,
+                    )
+                }
 
-                if !truncation.is_truncated() {
-                    raw
-                } else {
+                Invocation::ListFiles(_) => {
+                    let (total_len, total_lines) = (raw.len(), raw.lines().count());
+
+                    let truncation = Truncation::get_truncate(&raw, self.max_bytes, 0);
+                    let (head, _) = truncation.split(&raw);
+                    let now_lines = truncation.head_lines(&raw);
+                    let now_len = head.len();
+
+                    let omitted = truncation.omitted_bytes();
+                    let spill_info = self.spill_info(&raw, omitted);
+
+                    format!(
+                        "{head}...[内容过长，只返回了前 {now_lines} 行/ {now_len} 字节，原文共 {total_lines} 行/ {total_len} 字节\n{spill_info}]"
+                    )
+                }
+
+                Invocation::ReadFile(args) => {
+                    let truncation = Truncation::get_truncate(&raw, self.max_bytes, 0);
+
                     let skip = args.offset.saturating_sub(1);
                     let full_lines = raw.lines().count() + skip;
                     let (show_content, _) = truncation.split(&raw);
@@ -540,11 +563,12 @@ impl Executor {
                         )
                     }
                 }
-            }
-            _ => truncate_head(raw, self.max_bytes),
-        };
 
-        Ok(shown)
+                _ => truncate_head(raw, self.max_bytes),
+            };
+
+            Ok(shown)
+        }
     }
 }
 
