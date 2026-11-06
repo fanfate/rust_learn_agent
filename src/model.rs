@@ -100,6 +100,13 @@ pub struct RunCommandArg {
 
     #[serde(default)]
     pub workdir: Option<String>,
+
+    #[serde(default = "default_timeout")]
+    pub timeout: usize,
+}
+
+fn default_timeout() -> usize {
+    120
 }
 
 #[derive(Debug)]
@@ -172,10 +179,11 @@ impl Invocation {
                 args.new_string.len(),
             ),
             Self::RunCommand(args) => format!(
-                "run_command, program : {}, args : [{}], workdir : {}",
+                "run_command, program : {}, args : [{}], workdir : {}, timeout : {} s",
                 args.program,
                 args.args.join(", "),
-                args.workdir.as_deref().unwrap_or(".")
+                args.workdir.as_deref().unwrap_or("."),
+                args.timeout
             ),
         }
     }
@@ -289,12 +297,16 @@ impl ToolKind {
                         3.工作目录使用相对路径的话，以沙箱根为基准, 不传 workdir 就是沙箱根;\n\
                         4.工作目录每次命令独立，不持久;\n\
                         5.不支持 cd;\n\
-                        6.返回：退出码 + stdout + stderr；输出过长会被截断",
+                        6.返回：退出码 + stdout + stderr；输出过长会被截断;\n\
+                        7.超时选项 timeout 的单位是秒(second)，默认值是 120 ，最大值为 600 ，设置为 0 时会被恢复成默认值",
                     Self::ALLOW_CMD.join(", ")
                 ),
                 parameters: serde_json::json!({
                     "type": "object",
-                    "properties": { "program": { "type": "string" }, "args" : { "type" : "array", "items" : {"type" : "string"} }, "workdir" : { "type" : "string"} },
+                    "properties": { "program": { "type": "string" }, 
+                        "args" : { "type" : "array", "items" : {"type" : "string"} }, 
+                        "workdir" : { "type" : "string"}, 
+                        "timeout" : {"type" : "integer", "maximum" : 600} },
                     "required": ["program"],
                     "additionalProperties": false
                 }),

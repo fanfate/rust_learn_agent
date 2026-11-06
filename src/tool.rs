@@ -7,6 +7,7 @@ use std::{
     ffi::OsStr,
     fs,
     hash::{DefaultHasher, Hash, Hasher},
+    io::{self, Read},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -139,7 +140,12 @@ fn edit_file(
     ))
 }
 
-fn run_command(program: &str, args: &[String], root: &Path) -> anyhow::Result<String> {
+fn run_command(
+    program: &str,
+    args: &[String],
+    root: &Path,
+    timeout: usize,
+) -> anyhow::Result<String> {
     let mut cmd = Command::new(program);
 
     let disallow_path = config::LLM_ENV_KEYS;
@@ -151,17 +157,55 @@ fn run_command(program: &str, args: &[String], root: &Path) -> anyhow::Result<St
     cmd.stderr(Stdio::piped());
     cmd.stdin(Stdio::null());
 
-    let output = cmd.args(args).spawn()?.wait_with_output()?;
+    let mut child_cmd = cmd.args(args).spawn()?;
+    let child_out = child_cmd.stdout.take();
+    let child_err = child_cmd.stderr.take();
 
-    let res_code = output.status.code();
-    let res_out = String::from_utf8_lossy_owned(output.stdout);
-    let res_error = String::from_utf8_lossy_owned(output.stderr);
+    let out_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut out) = child_out {
+            out.read_to_end(&mut buf)?;
+        }
+        Ok::<_, std::io::Error>(buf)
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut err) = child_err {
+            err.read_to_end(&mut buf)?;
+        }
+        Ok::<_, std::io::Error>(buf)
+    });
 
-    let mut res_str = if let Some(code) = res_code {
-        format!("命令退出码 : {code}\n")
-    } else {
-        "命令退出码 : (无，被信号终止)\n".to_string()
+    let (status, elapsed) = wait_with_timeout(&mut child_cmd, timeout as u64)?;
+
+    let mut res_str = match status {
+        Some(status) => {
+            if let Some(res_code) = status.code() {
+                format!("命令退出码 : {}\n", res_code)
+            } else {
+                "命令退出码 : (无，被信号终止)\n".to_string()
+            }
+        }
+        None => {
+            // child_cmd.kill()?;
+            // child_cmd.wait()?;
+            kill_process_tree(&mut child_cmd)?;
+            format!(
+                "命令退出码 : (无，命令超时({timeout}s), 实际用时 {:.1}s, 已终止)\n",
+                elapsed.as_secs_f32()
+            )
+        }
     };
+
+    let stdout_data = out_reader
+        .join()
+        .map_err(|e| anyhow::anyhow!("读 stdout 线程 panic {e:?}"))??;
+    let stderr_data = err_reader
+        .join()
+        .map_err(|e| anyhow::anyhow!("读 stderr 线程 panic {e:?}"))??;
+
+    let res_out = String::from_utf8_lossy_owned(stdout_data);
+    let res_error = String::from_utf8_lossy_owned(stderr_data);
 
     if !res_out.is_empty() {
         res_str = format!("{res_str}返回结果 : {res_out}\n");
@@ -171,6 +215,52 @@ fn run_command(program: &str, args: &[String], root: &Path) -> anyhow::Result<St
     }
 
     Ok(res_str)
+}
+
+fn wait_with_timeout(
+    child: &mut std::process::Child,
+    secs: u64,
+) -> io::Result<(Option<std::process::ExitStatus>, std::time::Duration)> {
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                return Ok((Some(status), start.elapsed()));
+            }
+            None => {
+                let elapsed = start.elapsed();
+                if elapsed >= std::time::Duration::from_secs(secs) {
+                    return Ok((None, elapsed));
+                }
+
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+fn kill_process_tree(child: &mut std::process::Child) -> io::Result<()> {
+    let pid = child.id();
+
+    #[cfg(windows)]
+    {
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+        let task_kill = format!("{system_root}\\System32\\taskkill.exe");
+        let _ = Command::new(&task_kill)
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = child.kill();
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = child.kill();
+    }
+
+    child.wait().ok();
+    Ok(())
 }
 
 // 参数处理和输出后处理函数
@@ -421,8 +511,14 @@ impl Invocation {
                     );
                 }
 
-                let run_res =
-                    run_command(&args.program, &args.args, &work_dir).with_context(|| {
+                let timeout = if args.timeout == 0 {
+                    120
+                } else {
+                    args.timeout.min(600)
+                };
+
+                let run_res = run_command(&args.program, &args.args, &work_dir, timeout)
+                    .with_context(|| {
                         format!(
                             "无法执行命令 {}, 工作目录 : {}",
                             args.program,
@@ -1059,6 +1155,7 @@ mod test {
             program: "cargo".to_string(),
             args: vec!["test".to_string()],
             workdir: Some("../../".to_string()),
+            timeout: 120,
         }));
         let err = s.unwrap_err();
         assert!(format!("{err:#}").contains("越界"));
@@ -1072,6 +1169,7 @@ mod test {
             program: "cargo".to_string(),
             args: vec!["test".to_string()],
             workdir: Some("prj1".to_string()),
+            timeout: 120,
         }));
         let err = s.unwrap_err();
         assert!(format!("{err:#}").contains("无法解析路径"));
@@ -1086,6 +1184,7 @@ mod test {
             program: "cargo".to_string(),
             args: vec!["test".to_string()],
             workdir: Some("prj1".to_string()),
+            timeout: 120,
         }));
         let err = s.unwrap_err();
         assert!(format!("{err:#}").contains("不是目录"));
@@ -1101,6 +1200,7 @@ mod test {
                 program: "cargo".to_string(),
                 args: vec!["init".to_string(), "test_prj1".to_string()],
                 workdir: Some("prj1".to_string()),
+                timeout: 120,
             }))
             .unwrap();
         assert!(s.contains("命令退出码"));
