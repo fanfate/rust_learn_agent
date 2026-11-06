@@ -153,11 +153,16 @@ fn run_command(program: &str, args: &[String], root: &Path) -> anyhow::Result<St
 
     let output = cmd.args(args).spawn()?.wait_with_output()?;
 
-    let res_code = output.status.code().unwrap_or(-1);
+    let res_code = output.status.code();
     let res_out = String::from_utf8_lossy_owned(output.stdout);
     let res_error = String::from_utf8_lossy_owned(output.stderr);
 
-    let mut res_str = format!("命令退出码 : {res_code}\n");
+    let mut res_str = if let Some(code) = res_code {
+        format!("命令退出码 : {code}\n")
+    } else {
+        "命令退出码 : (无，被信号终止)\n".to_string()
+    };
+
     if !res_out.is_empty() {
         res_str = format!("{res_str}返回结果 : {res_out}\n");
     }
