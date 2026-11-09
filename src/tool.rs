@@ -187,9 +187,8 @@ fn run_command(
             }
         }
         None => {
-            // child_cmd.kill()?;
-            // child_cmd.wait()?;
-            kill_process_tree(&mut child_cmd)?;
+            kill_process_tree(&mut child_cmd)
+                .with_context(|| format!("命令超时({timeout}s)后终止失败"))?;
             format!(
                 "命令退出码 : (无，命令超时({timeout}s), 实际用时 {:.1}s, 已终止)\n",
                 elapsed.as_secs_f32()
@@ -246,20 +245,28 @@ fn kill_process_tree(child: &mut std::process::Child) -> io::Result<()> {
     {
         let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
         let task_kill = format!("{system_root}\\System32\\taskkill.exe");
-        let _ = Command::new(&task_kill)
+        let st = Command::new(&task_kill)
             .args(["/F", "/T", "/PID", &pid.to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
-        let _ = child.kill();
+            .status()?;
+        if !st.success() {
+            return Err(io::Error::other("kill 进程树失败"));
+        }
+        child.kill()?;
     }
 
     #[cfg(not(windows))]
     {
-        let _ = child.kill();
+        // 已知缺口：Unix 需在 spawn 时 `cmd.process_group(0)`（stable 1.64），
+        // 再用 `kill(-pid, SIGKILL)` 或外调 `kill -9 -- -<pid>`；此处仅杀主进程。
+        // 负 pid 不会误杀本进程组：组 id 不存在时返回 ESRCH。
+        child.kill()?;
     }
 
-    child.wait().ok();
+    if wait_with_timeout(child, 5)?.0.is_none() {
+        return Err(io::Error::other("kill 后 5s 仍未收尸，进程树可能仍在运行"));
+    }
     Ok(())
 }
 
