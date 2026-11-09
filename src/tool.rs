@@ -610,6 +610,8 @@ impl Executor {
                     );
                     let (head, tail) = truncation.split(&raw);
 
+                    debug_assert!(truncation.is_truncated());
+
                     let omitted = truncation.omitted_bytes();
                     let spill_info = self.spill_info(&raw, omitted);
                     format!(
@@ -1213,5 +1215,22 @@ mod test {
         assert!(s.contains("命令退出码"));
         assert!(root_file.root().join("prj1/test_prj1/Cargo.toml").exists());
         assert!(!root_file.root().join("test_prj1").exists());
+    }
+
+    #[test]
+    fn test_run_cmd_timeout() {
+        let root_file = FileHelper::new("test_run_cmd_timeout");
+
+        let t0 = std::time::Instant::now();
+        let res = run_command(
+            "ping",
+            &["-n".into(), "60".into(), "127.0.0.1".into()],
+            root_file.root(),
+            1,
+        )
+        .unwrap();
+        assert!(res.contains("命令超时"));
+        assert!(t0.elapsed() >= std::time::Duration::from_secs(1));
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5));
     }
 }

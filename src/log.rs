@@ -132,10 +132,8 @@ impl Logger {
         if let LogKind::ToolResult = kind
             && self.file.is_some()
         {
-            let terminal_record = format!(
-                "{instant_time}Tool Result : {} 字节(详情见log文件)",
-                body.len()
-            );
+            let terminal_record =
+                format!("{instant_time}Tool Result : {} 字节(见log文件)", body.len());
             self.emit(&full_record, &terminal_record);
         } else {
             self.emit(&full_record, &full_record);
