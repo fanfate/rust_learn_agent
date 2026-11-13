@@ -13,7 +13,7 @@
 **TUI 值得做，但「现在把项目移植到 ratatui-kit」不值得。** 三句话拆开：
 
 1. **值得做的理由不在 UI**，在于它是对**已有三条设计**的第一次真实压迫测试：谁拥有 stdout（`plan_v0.md` §3.6.6）、
-   `Executor::run -> String` 还成不成立（`plan_v1.md` §7 待答 #5）、流式「边收边决定要不要继续打」（`plan.md` §5.1）。
+   `Executor::run -> String` 还成不成立（`plan_v1.md` §10 待答 #5）、流式「边收边决定要不要继续打」（`plan.md` §5.1）。
 2. **不值得的是顺序**：V1 阶段 3（流式 + 取消）本来就要动输出的返回/打印路径 ⇒ TUI 先行 = 同一层写两遍。
    ⇒ **TUI 是阶段 3 的验收消费者，不是阶段 0 的前置。**
 3. **不值得的是选型**：ratatui-kit 是「把渲染循环抽象掉」的框架（`#[component]` + hooks + router + atoms，20,271 行），
@@ -129,7 +129,7 @@ Claude Code 的文档自己写：终端没有 DOM、没有 CSS 引擎、没有�
 ## 4. ratatui 给你 / 不给你
 
 **给**：`Buffer` cell 网格 · **diff + flush** · `Layout` 约束 · `Widget` trait · **`TestBackend`（离线渲染到 Buffer，可断言）**。
-最后一条最关键：它决定 **TUI 层能不能进 eval 尺子**（`plan_v1.md` 阶段 1）。
+最后一条最关键：它决定 **TUI 层能不能被测试覆盖**（`TestBackend` 是唯一的离线断言手段）。
 
 **不给**（你必须自己写）：
 
@@ -231,7 +231,7 @@ agent.rs:37   let mut logger = Logger::get_logger(sink)?;          // Logger 活
    瓶颈在**框架 API** 而非 TUI 知识 ⇒ 退到方案 A。
 3. **先问目的**（三选一，选型完全不同）：① 学终端渲染/事件循环/与 async 对齐 → **A**；② 学声明式组件组织界面 → B（但要记账）；
    ③ 让 agent 看起来像个产品 → 现在都不做。
-4. **测试账**：若 UI 层不可断言（`TestBackend` 用不上），阶段 1 的 eval 尺子会被分叉成两套 ⇒ 视为硬伤。
+4. **测试账**：若 UI 层不可断言（`TestBackend` 用不上），它就只剩“人眼看”⇒ 视为硬伤。
 5. **Windows 终端差异**（纯实测项）：crossterm 在 Windows Terminal 与老 console/ConEmu 下行为不同，而本仓库路径层已在跟
    `VerbatimDisk` / junction 打架。动手第一步先跑 `cargo run --example todo_app`（ratatui-kit）或自写最小 alternate-screen 探针，
    确认 alternate screen + raw mode + 中文宽度正常。
@@ -256,7 +256,7 @@ agent.rs:37   let mut logger = Logger::get_logger(sink)?;          // Logger 活
    ⇒ **数据截断恒在生产端**：#6 定稿的「`shown` 8000B 有界」是 (b) 的决策，**阶段 3 不需要重做**。
 4. **测试形态**：`TestBackend` 断言到「屏幕缓冲区某行某列」这个粒度，会不会让 UI 测试变成脆测试（改布局就红）？
    判据：只断言**语义行**（如「最后一行是 prompt」），不断言像素。
-   **触发**：写第一个 UI 测试时；在那之前，`TestBackend` 能不能进尺子要先由 §11 的探针回答（门）。
+   **触发**：写第一个 UI 测试时；在那之前，`TestBackend` 能不能用要先由 §11 的探针回答（门）。
 
 ---
 
