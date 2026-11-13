@@ -732,10 +732,6 @@ mod test {
             let file_path = self.get_path(p);
             fs::write(file_path, content).expect("新建文件失败");
         }
-        fn delete_file(&self, p: &str) {
-            let file_path = self.get_path(p);
-            let _ = fs::remove_file(&file_path);
-        }
     }
 
     impl Drop for FileHelper {
@@ -1015,6 +1011,7 @@ mod test {
 
         let k = MAX_TOOL_OUTPUT - content[..MAX_TOOL_OUTPUT].rfind("\n").map_or(0, |p| p + 1);
         assert!(s.contains(format!("仅前 {k} 字节").as_str()));
+        assert!(!s.contains("完整输出在文件"));
     }
 
     #[test]
@@ -1232,5 +1229,82 @@ mod test {
         assert!(res.contains("命令超时"));
         assert!(t0.elapsed() >= std::time::Duration::from_secs(1));
         assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_spill_long() {
+        let root_file = FileHelper::new("test_spill_long");
+
+        let executor = exec(root_file.root());
+        let contents = "x".repeat(10000);
+        let res_path = executor.spill(&contents).unwrap();
+        assert_eq!(res_path.file_name().unwrap().len(), 20);
+        assert_eq!(res_path.parent().unwrap(), OsStr::new("tmp/agent_output"));
+
+        let res_content = fs::read_to_string(root_file.root().join(&res_path)).unwrap();
+        assert_eq!(res_content, contents);
+
+        let res_path2 = executor.spill(&contents).unwrap();
+        assert_eq!(res_path, res_path2);
+    }
+
+    #[test]
+    fn test_spill_different() {
+        let root_file = FileHelper::new("test_spill_different");
+
+        let executor = exec(root_file.root());
+        let contents = "x".repeat(100);
+        let res_path = executor.spill(&contents).unwrap();
+        let res_path_2 = executor.spill("123").unwrap();
+        assert_ne!(res_path, res_path_2);
+    }
+
+    #[test]
+    fn test_spill_clear() {
+        let root_file = FileHelper::new("test_spill_clear");
+
+        let executor = exec(root_file.root());
+        let res_path = executor.spill("123").unwrap();
+        assert!(root_file.root().join(&res_path).exists());
+
+        let _ = exec(root_file.root());
+        assert!(!root_file.root().join(&res_path).exists());
+    }
+
+    #[test]
+    fn test_spill_command() {
+        let root_file = FileHelper::new("test_spill_command");
+
+        let executor = exec(root_file.root());
+
+        let res = executor
+            .run(&Invocation::RunCommand(RunCommandArg {
+                program: "rg".into(),
+                args: vec!["--help".into()],
+                workdir: None,
+                timeout: 120,
+            }))
+            .unwrap();
+
+        assert!(res.contains("完整输出在文件"));
+    }
+
+    #[test]
+    fn test_spill_command_failed() {
+        let root_file = FileHelper::new("test_spill_command_failed");
+        let executor = exec(root_file.root());
+        root_file.create_dir("tmp");
+        root_file.create_file("tmp/agent_output", "123");
+
+        let res = executor
+            .run(&Invocation::RunCommand(RunCommandArg {
+                program: "rg".into(),
+                args: vec!["--help".into()],
+                workdir: None,
+                timeout: 120,
+            }))
+            .unwrap();
+
+        assert!(res.contains("字节不可取回"));
     }
 }
