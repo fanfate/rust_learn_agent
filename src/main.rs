@@ -6,19 +6,19 @@ use my_agent::{agent::run_agent, config::Config, llm::OpencodeGoClient, log::Log
 async fn main() -> anyhow::Result<()> {
     let config: Config = Config::from_env()?;
     println!("LLM config : {:?}", config);
-    let client = OpencodeGoClient::new("v1-session", &config)?;
+    let mut client = OpencodeGoClient::new("v1-session", &config)?;
 
     let logger_config = LogSink::File("data/run.log");
 
     // run_agent(&client, "看下沙箱根目录'.'有什么文件", 5, &logger_config).await?;
 
-    check_new(&client, &logger_config, &config.sandbox_root).await?;
+    check_new(&mut client, &logger_config, &config.sandbox_root).await?;
 
     Ok(())
 }
 
 async fn check_new(
-    client: &OpencodeGoClient,
+    client: &mut OpencodeGoClient,
     logger_config: &LogSink<'_>,
     sandbox_root: &Path,
 ) -> anyhow::Result<()> {

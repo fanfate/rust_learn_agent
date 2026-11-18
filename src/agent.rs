@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::bail;
 
 use crate::{
-    llm::OpencodeGoClient,
+    llm::LlmClient,
     log::{LogKind, LogSink, Logger},
     model::{Invocation, Message, RunReport, ToolKind},
     tool::Executor,
@@ -15,8 +15,8 @@ const SYSTEM_PROMPT: &str = "你是一个有用的AI助手,遵循以下指令:\n
     3.**行为** : 直接完成任务，不要反复确认、不要问'需要我读吗'\n\
     4.**输出** : 最终答案直接给，不要复述工具原始输出";
 
-pub async fn run_agent(
-    client: &OpencodeGoClient,
+pub async fn run_agent<C: LlmClient>(
+    client: &mut C,
     task: &str,
     max_steps: usize,
     sink: &LogSink<'_>,
@@ -195,5 +195,114 @@ impl RunReport {
             completion,
             reasoning
         )
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::model::{ChatResponse, Choice, FunctionCall};
+    use std::{collections::VecDeque, fs, path::PathBuf};
+
+    struct Scripted {
+        replies: VecDeque<ChatResponse>,
+        seen: Vec<Vec<Message>>,
+    }
+
+    impl LlmClient for Scripted {
+        async fn chat(
+            &mut self,
+            messages: &[Message],
+            _: &[crate::model::WireTool],
+        ) -> anyhow::Result<ChatResponse> {
+            self.seen.push(messages.to_vec());
+            self.replies
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("脚本耗尽于第 {} 次调用", self.seen.len()))
+        }
+    }
+
+    impl Scripted {
+        fn new(replies: VecDeque<ChatResponse>) -> Self {
+            Self {
+                replies,
+                seen: vec![],
+            }
+        }
+    }
+
+    fn resp(finish: &str, message: Message) -> ChatResponse {
+        ChatResponse {
+            id: "t".into(),
+            object: "chat.completion".into(),
+            model: "m".into(),
+            choices: vec![Choice {
+                index: 0,
+                finish_reason: Some(finish.into()),
+                message,
+            }],
+            usage: None,
+        }
+    }
+
+    fn say(text: &str) -> ChatResponse {
+        resp(
+            "stop",
+            Message::Assistant {
+                content: Some(text.into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+            },
+        )
+    }
+
+    fn call(id: &str, name: &str, args: &str) -> ChatResponse {
+        resp(
+            "tool_calls",
+            Message::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![crate::model::ToolCall {
+                    id: id.into(),
+                    kind: "function".into(),
+                    function: Some(FunctionCall {
+                        name: name.into(),
+                        arguments: args.into(),
+                    }),
+                    custom: None,
+                }],
+            },
+        )
+    }
+
+    fn tmp_root(root: &str) -> PathBuf {
+        let p = PathBuf::from("tmp").join(root);
+        clear_tmp(&p);
+        fs::create_dir_all(&p).expect("创建测试目录失败");
+        p
+    }
+
+    fn clear_tmp(root: &Path) {
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn test_loop_answer_only() {
+        let root = tmp_root("test_loop_answer_only");
+
+        let mut client = Scripted::new(VecDeque::from([say("done")]));
+        let report = run_agent(&mut client, "task", 5, &LogSink::Console, &root)
+            .await
+            .unwrap();
+
+        assert_eq!(report.steps, 1);
+        assert!(report.finished);
+        assert_eq!(report.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(report.tool_calls_requested, 0);
+        assert_eq!(report.tool_calls_executed, 0);
+        assert_eq!(client.seen.len(), 1);
+        assert_eq!(client.seen[0].len(), 2);
+
+        clear_tmp(&root);
     }
 }

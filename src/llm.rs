@@ -42,9 +42,19 @@ impl OpencodeGoClient {
                 .build()?,
         })
     }
+}
 
-    pub async fn chat(
-        &self,
+pub trait LlmClient {
+    fn chat(
+        &mut self,
+        messages: &[Message],
+        tools: &[WireTool],
+    ) -> impl Future<Output = anyhow::Result<ChatResponse>> + Send;
+}
+
+impl LlmClient for OpencodeGoClient {
+    async fn chat(
+        &mut self,
         messages: &[Message],
         tools: &[WireTool],
     ) -> anyhow::Result<ChatResponse> {
