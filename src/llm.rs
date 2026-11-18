@@ -1,9 +1,8 @@
-use serde::Serialize;
 use std::fmt::Debug;
 
 use crate::{
     config::Config,
-    model::{ChatResponse, Message, WireTool},
+    model::{ChatRequest, ChatResponse, Message, WireTool},
 };
 
 pub struct OpencodeGoClient {
@@ -49,7 +48,7 @@ impl OpencodeGoClient {
         messages: &[Message],
         tools: &[WireTool],
     ) -> anyhow::Result<ChatResponse> {
-        let chat_request = WireRequest {
+        let chat_request = ChatRequest {
             model: &self.default_model,
             messages,
             tools,
@@ -79,13 +78,4 @@ impl OpencodeGoClient {
         let chat_response: ChatResponse = serde_json::from_str(&body)?;
         Ok(chat_response)
     }
-}
-
-#[derive(Serialize)]
-struct WireRequest<'a> {
-    model: &'a str,
-    messages: &'a [Message],
-    tools: &'a [WireTool],
-    tool_choice: &'static str,
-    parallel_tool_calls: bool,
 }

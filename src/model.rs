@@ -345,12 +345,12 @@ pub enum ToolError {
     Empty,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ChatRequest {
-    pub model: String,
-    pub messages: Vec<Message>,
-    pub tools: Vec<WireTool>,
-    pub tool_choice: String,
+#[derive(Serialize)]
+pub struct ChatRequest<'a> {
+    pub model: &'a str,
+    pub messages: &'a [Message],
+    pub tools: &'a [WireTool],
+    pub tool_choice: &'a str,
     pub parallel_tool_calls: bool,
 }
 
@@ -360,7 +360,26 @@ pub struct ChatResponse {
     pub object: String,
     pub model: String,
     pub choices: Vec<Choice>,
-    // usage和其他项对当前阶段没什么用，先不加
+    pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Usage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompletionTokensDetails {
+    pub reasoning_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -368,4 +387,66 @@ pub struct Choice {
     pub index: i64,
     pub finish_reason: Option<String>,
     pub message: Message,
+}
+
+#[derive(Debug, Default)]
+pub struct RunReport {
+    pub steps: usize,
+    pub tool_calls_requested: usize,
+    pub tool_calls_executed: usize,
+    pub finished: bool,
+    pub finish_reason: Option<String>,
+    pub usage: Vec<Option<Usage>>,
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    const FULL: &str = r#"{"id":"x","object":"chat.completion","model":"m","choices":[],
+         "usage":{"prompt_tokens":308,"completion_tokens":63,"total_tokens":371,
+           "prompt_tokens_details":{"cached_tokens":256},
+           "completion_tokens_details":{"reasoning_tokens":19}}}"#;
+
+    const NO_USAGE: &str = r#"{"id":"x","object":"chat.completion","model":"m","choices":[]}"#;
+
+    const PARTIAL_USAGE: &str = r#"{"id":"x","object":"chat.completion","model":"m","choices":[],
+         "usage":{"prompt_tokens":308,"completion_tokens":63,"total_tokens":371,
+            "completion_tokens_details":{"reasoning_tokens":19}}}"#;
+
+    #[test]
+    fn test_usage_all() {
+        let response: ChatResponse = serde_json::from_str(FULL).unwrap();
+        let usage = response.usage.unwrap();
+        assert_eq!(
+            usage.total_tokens,
+            usage.prompt_tokens + usage.completion_tokens
+        );
+        assert_eq!(usage.prompt_tokens_details.unwrap().cached_tokens, 256);
+        assert_eq!(
+            usage.completion_tokens_details.unwrap().reasoning_tokens,
+            19
+        );
+    }
+
+    #[test]
+    fn test_usage_none() {
+        let response: ChatResponse = serde_json::from_str(NO_USAGE).unwrap();
+        assert!(response.usage.is_none());
+    }
+
+    #[test]
+    fn test_usage_partial() {
+        let response: ChatResponse = serde_json::from_str(PARTIAL_USAGE).unwrap();
+        let usage = response.usage.unwrap();
+        assert_eq!(
+            usage.total_tokens,
+            usage.prompt_tokens + usage.completion_tokens
+        );
+        assert!(usage.prompt_tokens_details.is_none());
+        assert_eq!(
+            usage.completion_tokens_details.unwrap().reasoning_tokens,
+            19
+        );
+    }
 }

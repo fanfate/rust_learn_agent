@@ -5,7 +5,7 @@ use anyhow::bail;
 use crate::{
     llm::OpencodeGoClient,
     log::{LogKind, LogSink, Logger},
-    model::{Invocation, Message, ToolKind},
+    model::{Invocation, Message, RunReport, ToolKind},
     tool::Executor,
 };
 
@@ -21,7 +21,7 @@ pub async fn run_agent(
     max_steps: usize,
     sink: &LogSink<'_>,
     sandbox_root: &Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<RunReport> {
     let system_prompt = Message::System {
         content: SYSTEM_PROMPT.to_string(),
     };
@@ -38,15 +38,20 @@ pub async fn run_agent(
 
     logger.task(task);
 
+    let mut run_report = RunReport::default();
+
     for step in 1..=max_steps {
         logger.step(step);
+        run_report.steps = step;
 
         let mut resp = client.chat(&messages, &tools).await?;
         if resp.choices.is_empty() {
             bail!("返回结果信息为空!");
         }
 
-        let resp_content = &resp.choices[0];
+        run_report.usage.push(resp.usage.take());
+
+        let resp_content = &mut resp.choices[0];
 
         let Message::Assistant {
             content,
@@ -70,6 +75,7 @@ pub async fn run_agent(
                 logger.record(LogKind::Error, "输出被长度限制截断");
             }
             finished = true;
+            run_report.finish_reason = resp_content.finish_reason.take();
             break;
         }
 
@@ -77,6 +83,7 @@ pub async fn run_agent(
 
         for tool_call in tool_calls {
             let tool_id = &tool_call.id;
+            run_report.tool_calls_executed += 1;
             match tool_call.payload() {
                 Ok(func_call) => {
                     let Some(tool_kind) = ToolKind::from_name(&func_call.name) else {
@@ -91,6 +98,8 @@ pub async fn run_agent(
                     match Invocation::parse_kind(&tool_kind, &func_call.arguments) {
                         Ok(inv) => {
                             logger.record(LogKind::ToolCall, &inv.info());
+
+                            run_report.tool_calls_executed += 1;
 
                             let (log_kind, tool_res) = match tool_exec.run(&inv) {
                                 Ok(out) => (LogKind::ToolResult, out),
@@ -124,18 +133,67 @@ pub async fn run_agent(
             }
         }
 
+        run_report.finish_reason = resp_content.finish_reason.take();
+
         messages.push(resp.choices.swap_remove(0).message);
         messages.append(&mut tool_messages);
     }
 
-    if !finished {
-        logger.record(
-            LogKind::TaskResult,
-            &format!("未能在{max_steps}步内完成任务!"),
-        );
-    } else {
-        logger.record(LogKind::TaskResult, "任务完成!");
-    }
+    run_report.finished = finished;
 
-    Ok(())
+    logger.record(LogKind::TaskResult, &run_report.total_info());
+
+    Ok(run_report)
+}
+
+impl RunReport {
+    fn total_info(&self) -> String {
+        let task_res = if self.finished {
+            format!("任务完成！步数 {} 步。", self.steps)
+        } else {
+            format!("未能在 {} 步内完成任务！", self.steps)
+        };
+
+        let tool_calls = if self.tool_calls_executed == self.tool_calls_requested {
+            format!("工具调用 {} 次", self.tool_calls_executed)
+        } else {
+            format!(
+                "工具调用 {} 次（请求 {} 次）",
+                self.tool_calls_executed, self.tool_calls_requested
+            )
+        };
+
+        let reported = self.usage.iter().flatten().count();
+        if reported == 0 {
+            return format!("{task_res} {tool_calls}。 usage 未上报！");
+        }
+
+        let (prompt, completion, cached, reasoning) =
+            self.usage.iter().fold((0, 0, 0, 0), |acc, x| match x {
+                None => acc,
+                Some(usage) => (
+                    acc.0 + usage.prompt_tokens,
+                    acc.1 + usage.completion_tokens,
+                    acc.2
+                        + usage
+                            .prompt_tokens_details
+                            .as_ref()
+                            .map_or(0, |y| y.cached_tokens),
+                    acc.3
+                        + usage
+                            .completion_tokens_details
+                            .as_ref()
+                            .map_or(0, |y| y.reasoning_tokens),
+                ),
+            });
+
+        format!(
+            "{task_res} {tool_calls}，总消耗 {} tok, prompt {} tok (cached {}), completion {} tok (reasoning {}).",
+            prompt + completion,
+            prompt,
+            cached,
+            completion,
+            reasoning
+        )
+    }
 }
