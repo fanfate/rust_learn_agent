@@ -70,12 +70,15 @@ pub async fn run_agent<C: LlmClient>(
             logger.record(LogKind::Answer, ai_content);
         }
 
+        let is_truncated = resp_content.finish_reason.as_deref() == Some("length");
+
         if tool_calls.is_empty() {
-            if resp_content.finish_reason.as_deref() == Some("length") {
+            if is_truncated {
                 logger.record(LogKind::Error, "输出被长度限制截断");
             }
             finished = true;
             run_report.finish_reason = resp_content.finish_reason.take();
+            messages.push(resp.choices.swap_remove(0).message);
             break;
         }
 
@@ -83,7 +86,15 @@ pub async fn run_agent<C: LlmClient>(
 
         for tool_call in tool_calls {
             let tool_id = &tool_call.id;
-            run_report.tool_calls_executed += 1;
+            run_report.tool_calls_requested += 1;
+            if is_truncated {
+                logger.record(LogKind::Error, "截断：跳过工具执行");
+                tool_messages.push(Message::Tool {
+                    tool_call_id: tool_id.clone(),
+                    content: "Error: 输出被长度限制截断，调用未执行，请用完整参数重新发起".into(),
+                });
+                continue;
+            }
             match tool_call.payload() {
                 Ok(func_call) => {
                     let Some(tool_kind) = ToolKind::from_name(&func_call.name) else {
@@ -148,10 +159,13 @@ pub async fn run_agent<C: LlmClient>(
 
 impl RunReport {
     fn total_info(&self) -> String {
-        let task_res = if self.finished {
-            format!("任务完成！步数 {} 步。", self.steps)
+        let is_truncated = self.finish_reason.as_deref() == Some("length");
+        let task_res = if self.finished && !is_truncated {
+            format!("输出结束。步数 {} 步。", self.steps)
+        } else if is_truncated {
+            format!("输出结束，最终结果生成被截断。步数 {} 步。", self.steps)
         } else {
-            format!("未能在 {} 步内完成任务！", self.steps)
+            format!("未能在 {} 步内结束输出！", self.steps)
         };
 
         let tool_calls = if self.tool_calls_executed == self.tool_calls_requested {
@@ -275,6 +289,44 @@ mod test {
         )
     }
 
+    fn calls(tool_calls: &[(&str, &str, &str)]) -> ChatResponse {
+        resp(
+            "tool_calls",
+            Message::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: tool_calls
+                    .iter()
+                    .map(|tool_call| crate::model::ToolCall {
+                        id: tool_call.0.into(),
+                        kind: "function".into(),
+                        function: Some(FunctionCall {
+                            name: tool_call.1.into(),
+                            arguments: tool_call.2.into(),
+                        }),
+                        custom: None,
+                    })
+                    .collect(),
+            },
+        )
+    }
+
+    fn bad_call(id: &str) -> ChatResponse {
+        resp(
+            "tool_calls",
+            Message::Assistant {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![crate::model::ToolCall {
+                    id: id.into(),
+                    kind: "function".into(),
+                    function: None,
+                    custom: None,
+                }],
+            },
+        )
+    }
+
     fn tmp_root(root: &str) -> PathBuf {
         let p = PathBuf::from("tmp").join(root);
         clear_tmp(&p);
@@ -302,6 +354,238 @@ mod test {
         assert_eq!(report.tool_calls_executed, 0);
         assert_eq!(client.seen.len(), 1);
         assert_eq!(client.seen[0].len(), 2);
+
+        clear_tmp(&root);
+    }
+
+    #[tokio::test]
+    async fn test_loop_tool_unknown() {
+        let root = tmp_root("test_loop_tool_unknown");
+
+        let mut client = Scripted::new(VecDeque::from([
+            call("1", "read", r#"{"path":"a.txt", "offset" : 0}"#),
+            say("done"),
+        ]));
+        let report = run_agent(&mut client, "task", 5, &LogSink::Console, &root)
+            .await
+            .unwrap();
+
+        assert_eq!(report.steps, 2);
+        assert!(report.finished);
+        assert_eq!(report.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(report.tool_calls_requested, 1);
+        assert_eq!(report.tool_calls_executed, 0);
+        assert_eq!(client.seen.len(), 2);
+        assert_eq!(client.seen[1].len(), 4);
+        match &client.seen[1][3] {
+            Message::Tool {
+                tool_call_id,
+                content,
+            } => {
+                assert_eq!(tool_call_id, "1");
+                assert!(content.starts_with("Error"));
+                assert!(content.contains("未找到符合的工具"))
+            }
+            other => panic!("末条应该是 Tool 消息，实际上是 {other:?}"),
+        }
+
+        clear_tmp(&root);
+    }
+
+    #[tokio::test]
+    async fn test_loop_tool_arg_err() {
+        let root = tmp_root("test_loop_tool_arg_err");
+
+        let mut client = Scripted::new(VecDeque::from([
+            call("1", "read_file", "a.txt"),
+            say("done"),
+        ]));
+        let report = run_agent(&mut client, "task", 5, &LogSink::Console, &root)
+            .await
+            .unwrap();
+
+        assert_eq!(report.steps, 2);
+        assert!(report.finished);
+        assert_eq!(report.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(report.tool_calls_requested, 1);
+        assert_eq!(report.tool_calls_executed, 0);
+        assert_eq!(client.seen.len(), 2);
+        assert_eq!(client.seen[1].len(), 4);
+        match &client.seen[1][3] {
+            Message::Tool {
+                tool_call_id,
+                content,
+            } => {
+                assert_eq!(tool_call_id, "1");
+                assert!(content.starts_with("Error"));
+            }
+            other => panic!("末条应该是 Tool 消息，实际上是 {other:?}"),
+        }
+
+        clear_tmp(&root);
+    }
+
+    #[tokio::test]
+    async fn test_loop_tool_run_err() {
+        let root = tmp_root("test_loop_tool_run_err");
+
+        let mut client = Scripted::new(VecDeque::from([
+            call("1", "read_file", r#"{"path" : "a.txt", "offset" : 0}"#),
+            say("done"),
+        ]));
+        let report = run_agent(&mut client, "task", 5, &LogSink::Console, &root)
+            .await
+            .unwrap();
+
+        assert_eq!(report.steps, 2);
+        assert!(report.finished);
+        assert_eq!(report.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(report.tool_calls_requested, 1);
+        assert_eq!(report.tool_calls_executed, 1);
+        assert_eq!(client.seen.len(), 2);
+        assert_eq!(client.seen[1].len(), 4);
+        match &client.seen[1][3] {
+            Message::Tool {
+                tool_call_id,
+                content,
+            } => {
+                assert_eq!(tool_call_id, "1");
+                assert!(content.starts_with("Error"));
+            }
+            other => panic!("末条应该是 Tool 消息，实际上是 {other:?}"),
+        }
+
+        clear_tmp(&root);
+    }
+
+    #[tokio::test]
+    async fn test_loop_unsupported_call() {
+        let root = tmp_root("test_loop_unsupported_call");
+
+        let mut client = Scripted::new(VecDeque::from([bad_call("1"), say("done")]));
+        let report = run_agent(&mut client, "task", 5, &LogSink::Console, &root)
+            .await
+            .unwrap();
+
+        assert_eq!(report.steps, 2);
+        assert!(report.finished);
+        assert_eq!(report.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(report.tool_calls_requested, 1);
+        assert_eq!(report.tool_calls_executed, 0);
+        assert_eq!(client.seen.len(), 2);
+        assert_eq!(client.seen[1].len(), 4);
+        match &client.seen[1][3] {
+            Message::Tool {
+                tool_call_id,
+                content,
+            } => {
+                assert_eq!(tool_call_id, "1");
+                assert!(content.starts_with("Error"));
+            }
+            other => panic!("末条应该是 Tool 消息，实际上是 {other:?}"),
+        }
+
+        clear_tmp(&root);
+    }
+
+    #[tokio::test]
+    async fn test_loop_call_success() {
+        let root = tmp_root("test_loop_call_success");
+
+        let mut client = Scripted::new(VecDeque::from([
+            call("1", "list_files", r#"{"path" : "."}"#),
+            say("done"),
+        ]));
+        let report = run_agent(&mut client, "task", 5, &LogSink::Console, &root)
+            .await
+            .unwrap();
+
+        assert_eq!(report.steps, 2);
+        assert!(report.finished);
+        assert_eq!(report.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(report.tool_calls_requested, 1);
+        assert_eq!(report.tool_calls_executed, 1);
+        assert_eq!(client.seen.len(), 2);
+        assert_eq!(client.seen[1].len(), 4);
+        match &client.seen[1][3] {
+            Message::Tool {
+                tool_call_id,
+                content,
+            } => {
+                assert_eq!(tool_call_id, "1");
+                assert!(!content.starts_with("Error"));
+            }
+            other => panic!("末条应该是 Tool 消息，实际上是 {other:?}"),
+        }
+
+        clear_tmp(&root);
+    }
+
+    #[tokio::test]
+    async fn test_loop_multi_calls() {
+        let root = tmp_root("test_loop_multi_calls");
+
+        let mut client = Scripted::new(VecDeque::from([
+            calls(&[
+                ("1", "list_files", r#"{"path" : "."}"#),
+                ("2", "read", r#"{"path" : "a.txt", "offset" : 0 }"#),
+            ]),
+            say("done"),
+        ]));
+        let report = run_agent(&mut client, "task", 5, &LogSink::Console, &root)
+            .await
+            .unwrap();
+
+        assert_eq!(report.steps, 2);
+        assert!(report.finished);
+        assert_eq!(report.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(report.tool_calls_requested, 2);
+        assert_eq!(report.tool_calls_executed, 1);
+        assert_eq!(client.seen.len(), 2);
+        assert_eq!(client.seen[1].len(), 5);
+        match &client.seen[1][3] {
+            Message::Tool {
+                tool_call_id,
+                content,
+            } => {
+                assert_eq!(tool_call_id, "1");
+                assert!(!content.starts_with("Error"));
+            }
+            other => panic!("倒数第二条应该是 Tool 消息，实际上是 {other:?}"),
+        }
+
+        match &client.seen[1][4] {
+            Message::Tool {
+                tool_call_id,
+                content,
+            } => {
+                assert_eq!(tool_call_id, "2");
+                assert!(content.starts_with("Error"));
+            }
+            other => panic!("末条应该是 Tool 消息，实际上是 {other:?}"),
+        }
+
+        clear_tmp(&root);
+    }
+
+    #[tokio::test]
+    async fn test_loop_step_over() {
+        let root = tmp_root("test_loop_step_over");
+
+        let mut client = Scripted::new(VecDeque::from([
+            call("1", "list_files", r#"{"path" : "."}"#),
+            call("2", "list_files", r#"{"path" : "."}"#),
+        ]));
+        let report = run_agent(&mut client, "task", 2, &LogSink::Console, &root)
+            .await
+            .unwrap();
+
+        assert_eq!(report.steps, 2);
+        assert!(!report.finished);
+        assert_eq!(report.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(report.tool_calls_requested, 2);
+        assert_eq!(report.tool_calls_executed, 2);
+        assert_eq!(client.seen.len(), 2);
 
         clear_tmp(&root);
     }
