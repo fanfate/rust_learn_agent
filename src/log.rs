@@ -1,9 +1,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogKind {
@@ -23,7 +23,7 @@ pub enum LogSink<'a> {
 pub struct Logger {
     file: Option<File>,
     start_at: Option<Instant>,
-    start_wall: Option<SystemTime>,
+    start_wall: Option<DateTime<Utc>>,
 }
 
 impl Logger {
@@ -64,7 +64,7 @@ impl Logger {
 
     fn start_timer(&mut self) {
         self.start_at = Some(Instant::now());
-        self.start_wall = Some(SystemTime::now());
+        self.start_wall = Some(Utc::now());
     }
 
     fn end_timer(&mut self) {
@@ -73,11 +73,9 @@ impl Logger {
     }
 
     fn start_time(&self) -> String {
-        if let Some(sys_time) = self.start_wall {
-            DateTime::<Utc>::from(sys_time).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-        } else {
-            "".into()
-        }
+        self.start_wall
+            .map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true))
+            .unwrap_or_default()
     }
 
     fn instant_time(&self) -> String {
@@ -148,12 +146,18 @@ impl Drop for Logger {
                 "[+{:>8.3}s] 未正常结束，启动于 {}",
                 instant.elapsed().as_secs_f64(),
                 self.start_wall
-                    .map(|w| DateTime::<Utc>::from(w)
-                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+                    .map(|w| w.to_rfc3339_opts(SecondsFormat::Millis, true))
                     .unwrap_or_default()
             );
 
             self.emit(&line, &line);
         }
     }
+}
+
+pub fn session_log_path() -> String {
+    format!(
+        "data/session-{}.log",
+        Utc::now().format("%Y%m%d-%H%M%S%.3f")
+    )
 }
