@@ -243,8 +243,9 @@ client / messages / tools / tool_exec        // 只这四个
 | 6 | 自动压缩重试 | 阶段 2 的 turn 分组 + 边界选择落地后 | ⬜ 不做 |
 | 7 | 「外部判据决定继续」 | 出现「模型自称完成但机械判据没过」的实际案例 | ⬜ 不做 |
 | 8 | `Logger` 归属与时间戳语义 | 日志出现第二个消费者 | ⬜ 待定（§3.5） |
-| 9 | REPL 多轮下，某轮 `?` 提前返回时 `TaskResult` 不打 ⇒ `Logger::Drop`（`log.rs:144`）要到会话结束才报「未正常结束」 | 随 #1 | ⬜ |
+| 9 | `Logger::Drop`（`log.rs:144`）的「未正常结束」在 REPL 下会失真：失败轮的 `start_at` 被下一轮 `task()` → `start_timer()`（`log.rs:66`）无条件覆盖 ⇒ 不是「晚响」而是：① 后续轮次成功时**根本不响** ② 只有「最后一轮失败」才响，且「启动于」已是最后一轮起点 ③ 失败轮在日志文件里没有任何 error 记录（错误只走 stderr）。**单次 run 下语义正确，不是 bug** | REPL 落地时在收尾处统一（Ok/Err 都记 `TaskResult`），不是在 `log.rs` 里改 | ⬜ |
 | 10 | **阶段 2 主判据修正**：真跑 `cached 72960 / prompt 76679 = 95%` ⇒ 裁剪收益主要是「防溢出」不是「省钱」；主判据用「是否逼近上限 / 是否 400」，token 降幅降为副判据 | 阶段 2 开始前 | ⬜ |
+| 11 | 工具调用前的人工确认（approval）。**形状已定**：`run()` 收**参数化策略**（`&mut dyn FnMut(&ToolCall) -> Decision`，默认全允许），**绝不在 lib 里读 stdin** —— 否则 `examples/check_new.rs` / 将来 `eval` 的无人值守跑不了。与循环**不冲突**：确认发生在 `tool_calls` 分支、`tool_exec.run` **之前**，是可预期的同步点；冲突的是「中断」（`select!` + `AbortHandle`，阶段 3） | ① `Agent` 首次指向真实项目目录（非 `scratch/`）② 或加入破坏性工具（删除/重命名/git 写操作）。当前：单用户本地 + 沙箱 + `ALLOW_CMD` 白名单，不缺 | ⬜ 不做 |
 
 ---
 
